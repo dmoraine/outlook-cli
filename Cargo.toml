@@ -1,0 +1,24 @@
+[package]
+name = "outlook-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, low-memory CLI to read e-mails from Outlook OST/PST files, even while Outlook is running"
+license = "MIT"
+repository = "https://github.com/dmoraine/outlook-cli"
+readme = "README.md"
+keywords = ["outlook", "ost", "pst", "email", "cli"]
+categories = ["command-line-utilities", "email", "parser-implementations"]
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+memmap2 = "0.9.11"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

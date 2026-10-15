@@ -1,0 +1,8 @@
+/target
+/dist
+# Never commit mailbox data or outputs derived from it
+*.ost
+*.pst
+*.nst
+*.state
+*.jsonl
