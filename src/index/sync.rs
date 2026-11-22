@@ -273,6 +273,10 @@ pub fn sync_with_progress(
         && stored == Some(inc)
         && get_meta(c, "sync_revision")?.as_deref() == Some(revision.as_str())
         && (x.is_none() || attach::pending(c)? == 0)
+        // Legacy NULL signatures (pre-signature index): adopted by a full pass.
+        && !c
+            .query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE signature IS NULL)", [], |r| r.get::<_, bool>(0))
+            .map_err(db_err)?
     {
         let at = get_meta(c, "sync_at")?.and_then(|t| t.parse().ok()).and_then(|t| format_ft(t, false));
         return Ok(json!({
@@ -586,6 +590,13 @@ fn refresh(tx: &Connection, id: i64, e: &Entry, m: &Opened) -> Result<u64> {
     if !has_attachments && tx.execute("DELETE FROM message_attachments WHERE message = ?1", [id]).map_err(db_err)? > 0 {
         attach::gc(tx)?;
     }
+    // Stored contents may have changed: unverified until the attachment
+    // phase reads them (a link kept out of the scope stays so, `set_scope`).
+    tx.execute(
+        "UPDATE message_attachments SET skip = ?2 WHERE message = ?1 AND sha256 IS NOT NULL",
+        params![id, attach::UNVERIFIED],
+    )
+    .map_err(db_err)?;
     tx.execute(
         "UPDATE messages SET received = ?2, sent = ?3, size = ?4, class = ?5, has_attachments = ?6, subject = ?7,
                 sender = ?8, from_name = ?9, from_email = ?10, display_to = ?11, display_cc = ?12, signature = ?13,
@@ -1483,5 +1494,82 @@ mod tests {
         let s = sync(&mut c, &mut f, &Options { allow_mass_delete: true, ..Options::default() }).unwrap();
         assert_eq!((s["refreshed"].as_u64(), s["deleted"].as_u64()), (Some(1), Some(151)), "{s}");
         assert_eq!(fts(&c, "brumwick"), 1);
+    }
+
+    #[test]
+    fn f3_schema6_matching_revision_adopts_before_next_edit() {
+        let (mut c, mut f) = (db(), mailbox());
+        f.edit(0x204, "Original Quorvex body.");
+        run(&mut c, &mut f);
+        embed_all(&c);
+        c.execute_batch(
+            "INSERT INTO attachment_contents(sha256, kind, size, outcome, extracted_at) VALUES ('f3', 'txt', 3, 'ok', 0);
+             INSERT INTO message_attachments(message, idx, name, sha256)
+                SELECT id, 0, 'a.txt', 'f3' FROM messages WHERE ident = 'mid:<a1@fict.invalid>';
+             INSERT INTO attachment_chunks(id, sha256, seq, text) VALUES (1, 'f3', 0, 'one');
+             INSERT INTO attachment_vectors VALUES (1, 'e5-small', 'r', x'0102');
+             ALTER TABLE messages DROP COLUMN signature;",
+        )
+        .unwrap();
+        c.execute("DELETE FROM schema_version WHERE version > 6", []).unwrap();
+        assert_eq!(crate::index::schema_version(&c).unwrap(), 6);
+        let columns = |connection: &Connection| -> Vec<String> {
+            connection
+                .prepare("SELECT name FROM pragma_table_info('messages')")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let schema6 = Connection::open_in_memory().unwrap();
+        schema6.execute_batch(&crate::index::MIGRATIONS[..6].join(";\n")).unwrap();
+        assert_eq!(columns(&c), columns(&schema6));
+        let vectors = |connection: &Connection| {
+            connection
+                .query_row(
+                    "SELECT (SELECT group_concat(chunk || hex(vec)) FROM vectors),
+                            (SELECT group_concat(chunk || hex(vec)) FROM attachment_vectors)",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap()
+        };
+        let before = vectors(&c);
+        let revision = f.revision;
+        let opened = f.opened.len();
+        assert_eq!(get_meta(&c, "sync_complete").unwrap().as_deref(), Some("1"));
+        assert_eq!(get_meta(&c, "sync_revision").unwrap(), Some(revision.to_string()));
+
+        migrate(&mut c).unwrap();
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages WHERE signature IS NULL"), 3);
+        assert_eq!(vectors(&c), before, "migration preserves body and attachment vectors");
+        let adoption = run(&mut c, &mut f);
+        let null_after_adoption = count(&c, "SELECT COUNT(*) FROM messages WHERE signature IS NULL");
+        assert_eq!(f.revision, revision, "first sync must use the already stored revision");
+        assert_eq!(f.opened.len(), opened, "adoption should not open messages: {adoption}");
+        assert_eq!(vectors(&c), before, "adoption preserves body and attachment vectors");
+        assert_eq!((fts(&c, "quorvex"), fts(&c, "zanthorpe")), (1, 0));
+
+        f.edit(0x204, "Replacement Zanthorpe body.");
+        let edited = run(&mut c, &mut f);
+        let text: String = c
+            .query_row(
+                "SELECT group_concat(ch.text, '\n') FROM chunks ch JOIN messages m ON m.id = ch.message
+                 WHERE m.ident = 'mid:<a1@fict.invalid>'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (null_after_adoption, fts(&c, "zanthorpe"), fts(&c, "quorvex")),
+            (0, 1, 0),
+            "expected all NULL signatures adopted at matching revision, then replacement indexed and old text gone; \
+             observed NULLs after adoption={null_after_adoption}, indexed text={text:?}, \
+             opened after edit={:?}, adoption={adoption}, edited={edited}",
+            &f.opened[opened..]
+        );
+        assert!(text.contains("Replacement Zanthorpe body."), "observed indexed text: {text:?}");
+        fts_consistent(&c);
     }
 }

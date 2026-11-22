@@ -26,6 +26,9 @@ pub const MAX_ATTEMPTS: i64 = 3;
 pub const MAX_BYTES_LIMIT: u64 = 100 << 20;
 /// Skip reason of a supported type left out of the scope.
 const EXCLUDED_TYPE: &str = "excluded_type";
+/// `skip` of a stored content kept out of the scope on a changed message:
+/// its data is read and hashed again once the scope allows it.
+pub const UNVERIFIED: &str = "unverified";
 
 /// Persisted attachment scope (meta `attachment_scope`). Default: every
 /// supported type, 20 MB.
@@ -50,8 +53,8 @@ pub fn scope(c: &Connection) -> Result<Scope> {
 }
 
 /// Store the scope. Stored contents outside it are kept, through later
-/// syncs too (`counts`: `out_of_scope`). Messages with an attachment skipped as too large or of
-/// an excluded type are read again by the next sync; returns their number.
+/// syncs too (`counts`: `out_of_scope`). Messages with an attachment skipped as too large, of
+/// an excluded type or kept unverified are read again by the next sync; returns their number.
 pub fn set_scope(c: &Connection, s: &Scope) -> Result<usize> {
     if s.types.is_empty() {
         return Err(Error::Usage("at least one attachment type is needed".into()));
@@ -62,7 +65,7 @@ pub fn set_scope(c: &Connection, s: &Scope) -> Result<usize> {
     set_meta(c, "attachment_scope", &serde_json::to_string(s).map_err(|e| Error::Io(e.to_string()))?)?;
     c.execute(
         "UPDATE messages SET attachments_done = NULL WHERE id IN
-            (SELECT message FROM message_attachments WHERE skip IN ('too_large', 'excluded_type'))",
+            (SELECT message FROM message_attachments WHERE skip IN ('too_large', 'excluded_type', 'unverified'))",
         [],
     )
     .map_err(db_err)
@@ -200,7 +203,8 @@ fn link(tx: &Connection, message: i64, a: &Attachment, sha: Option<&str>, skip: 
 /// Skip `a`. Out of the scope (type, size), a stored content stays linked
 /// while the attachment is the same (properties, and data `sha` when read):
 /// only a changed or removed attachment unlinks it, and `gc` collects a
-/// content with its last link.
+/// content with its last link. Kept without reading, a link keeps its
+/// `UNVERIFIED` mark; read with the same `sha`, it is verified.
 fn skipped(
     tx: &Connection,
     st: &mut Stats,
@@ -223,6 +227,8 @@ fn skipped(
             .is_some();
     if !same {
         link(tx, message, a, None, Some(reason))?;
+    } else if sha.is_some() {
+        link(tx, message, a, sha, None)?;
     }
     Ok(true)
 }
@@ -760,5 +766,111 @@ mod tests {
             }
         }
         assert!(outputs[2].contains("\"attachments\""), "{}", outputs[2]);
+    }
+
+    #[test]
+    fn f3_same_length_replacement_out_of_scope_is_indexed_after_widening() {
+        let (mut c, mut f) = (db(), mailbox());
+        let original = b"Original Quorvex notes";
+        let replacement = b"Replaced Hexwold notes";
+        assert_eq!(original.len(), replacement.len());
+        f.add(0x604, 0x22, Some("<f3@fict.invalid>"), "Files", "See the file.");
+        f.attach(0x604, "notes.txt", Some("text/plain"), false, original);
+        let (_, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!(calls, 1);
+        assert_eq!((fts(&c, "quorvex"), fts(&c, "hexwold")), (1, 0));
+        let link = |connection: &Connection| {
+            connection
+                .query_row(
+                    "SELECT a.sha256, a.skip FROM message_attachments a JOIN messages m ON m.id = a.message
+                     WHERE m.ident = 'mid:<f3@fict.invalid>' AND a.idx = 0",
+                    [],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap()
+        };
+        let before = link(&c);
+        assert!(before.0.is_some());
+        let metadata = f.files[&0x604][0].0.clone();
+        let size = f.entry(0x604).size;
+        let modified = f.entry(0x604).modified;
+        set_scope(&c, &Scope { types: vec![Kind::Pdf], ..Scope::default() }).unwrap();
+        f.replace(0x604, 0, replacement);
+        let after = &f.files[&0x604][0].0;
+        assert_eq!(
+            (&after.name, &after.mime_type, after.index, after.size),
+            (&metadata.name, &metadata.mime_type, metadata.index, metadata.size)
+        );
+        assert_eq!(f.entry(0x604).size, size);
+        assert_eq!(f.entry(0x604).modified, modified + 1, "normal replacement changes the marker");
+        let reads = f.reads.len();
+        let (narrowed, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((narrowed["refreshed"].as_u64(), calls), (Some(1), 0), "{narrowed}");
+        assert_eq!(f.reads.len(), reads, "excluded TXT is not read");
+        let retained = link(&c);
+        let requeued = set_scope(&c, &Scope::default()).unwrap();
+        let pending_after_widening = pending(&c).unwrap();
+        let (widened, calls) = run(&mut c, &mut f, &Options::default());
+        let repeated = run(&mut c, &mut f, &Options::default()).0;
+        let text: String = c
+            .query_row(
+                "SELECT group_concat(ch.text, '\n') FROM attachment_chunks ch
+                 JOIN message_attachments a ON a.sha256 = ch.sha256 JOIN messages m ON m.id = a.message
+                 WHERE m.ident = 'mid:<f3@fict.invalid>'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (fts(&c, "hexwold"), fts(&c, "quorvex")),
+            (1, 0),
+            "expected replacement text indexed and old content gone after widening; observed text={text:?}, \
+             original link={before:?}, retained link={retained:?}, final link={:?}, \
+             requeued={requeued}, pending after widening={pending_after_widening}, \
+             extraction calls={calls}, new reads={:?}, narrowed={narrowed}, widened={widened}, repeated={repeated}",
+            link(&c),
+            &f.reads[reads..]
+        );
+        assert_eq!(text, "Replaced Hexwold notes");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM attachment_contents"), 1);
+    }
+
+    /// R2-2 control: an unchanged attachment kept unverified on an edited
+    /// message is only read and hashed after widening: no extraction, no
+    /// new vector.
+    #[test]
+    fn unverified_unchanged_attachment_only_hashed_after_widening() {
+        let (mut c, mut f) = (db(), mailbox());
+        f.add(0x604, 0x22, Some("<u1@fict.invalid>"), "Files", "See the file.");
+        f.attach(0x604, "notes.txt", Some("text/plain"), false, b"Steady Quorvex notes");
+        run(&mut c, &mut f, &Options::default());
+        let m = crate::index::model::get("e5-small").unwrap();
+        c.execute(
+            "INSERT INTO attachment_vectors SELECT id, ?1, ?2, zeroblob(?3) FROM attachment_chunks",
+            params![m.name, m.revision, (m.dims * 4) as i64],
+        )
+        .unwrap();
+        for (k, v) in [("embed_model", m.name), ("embed_revision", m.revision)] {
+            set_meta(&c, k, v).unwrap();
+        }
+        let vectors = |c: &Connection| {
+            c.query_row("SELECT group_concat(chunk || hex(vec)) FROM attachment_vectors", [], |r| r.get::<_, String>(0))
+                .unwrap()
+        };
+        let before = vectors(&c);
+        set_scope(&c, &Scope { types: vec![Kind::Pdf], ..Scope::default() }).unwrap();
+        f.edit(0x604, "See the file, edited.");
+        let (s, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((s["refreshed"].as_u64(), calls), (Some(1), 0), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM message_attachments WHERE skip = 'unverified'"), 1);
+
+        let reads = f.reads.len();
+        assert_eq!(set_scope(&c, &Scope::default()).unwrap(), 1);
+        let (s, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((calls, s["attachments_extracted"].as_u64()), (0, Some(0)), "{s}");
+        assert_eq!(f.reads[reads..], [(0x604, 0)], "hash check only");
+        assert_eq!((vectors(&c), fts(&c, "quorvex")), (before, 1));
+        assert_eq!(crate::index::vectors::counts(&c).unwrap()["attachment_chunks"]["pending"], 0);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM message_attachments WHERE skip IS NOT NULL"), 0, "verified");
     }
 }

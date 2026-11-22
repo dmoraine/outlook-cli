@@ -265,7 +265,8 @@ seuls les chunks nouveaux ou modifiés sont à embedder. Ses pièces jointes son
 qui ne sont plus référencés supprimés, contenus stockés mais hors portée conservés. Lu/non lu, déplacement et copie
 ne changent pas la signature : rien n'est rouvert. Un message dont une copie a encore la signature stockée n'est pas
 relu. Index créé avant cette version : le premier sync adopte la signature actuelle sans rouvrir les messages ; une
-modification faite avant la mise à jour n'est donc pas reprise (une suivante l'est). Si Outlook change la date de
+modification faite avant la mise à jour n'est donc pas reprise (une suivante l'est). Ce premier sync a lieu même
+si le fichier n'a pas changé depuis le dernier sync. Si Outlook change la date de
 modification sans toucher au texte (indicateur de suivi, catégorie), le message est relu, sans nouvel embedding.
 
 Avant découpage, les citations (en-têtes « De : / From: », « Le … a écrit : », « On … wrote: », lignes `>`) et les
@@ -361,6 +362,9 @@ compris aux syncs suivants (comptés dans `attachments.out_of_scope`) ; seuls la
 qui les porte ou le remplacement de la pièce dans la boîte les effacent. Les pièces écartées en `too_large` ou
 `excluded_type` sont relues au sync suivant après un changement (`requeued_messages`) ; un contenu déjà stocké
 n'est ni réextrait ni réembeddé.
+Une pièce hors portée d'un message modifié garde son contenu stocké mais est marquée non vérifiée (`unverified`) :
+quand la portée l'inclut de nouveau, elle est relue et hachée, puis réextraite et réembeddée seulement si ses
+octets ont changé.
 `--attachment-chunks N` (défaut 30, ~50 000 caractères ; `0` = aucune) : seuls les chunks 0 à N−1 de chaque
 contenu distinct sont embeddés ; la recherche par mots couvre tout le texte. Augmenter N embedde le reste au run
 suivant ; le baisser conserve les vecteurs.
