@@ -60,6 +60,9 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO chunks_fts(chunks_fts, rowid, subject, text)
             SELECT 'delete', old.id, subject, old.text FROM messages WHERE id = old.message;
      END;",
+    // Char range of a chunk in the quote-stripped body; NULL for older rows.
+    "ALTER TABLE chunks ADD COLUMN start_char INTEGER;
+     ALTER TABLE chunks ADD COLUMN end_char INTEGER;",
 ];
 
 /// %LOCALAPPDATA%\outlook-cli\index.sqlite on Windows, the XDG data dir elsewhere.
@@ -167,6 +170,27 @@ mod tests {
         assert_eq!(schema_version(&c).unwrap(), MIGRATIONS.len());
         c.execute("INSERT INTO schema_version(version) VALUES (999)", []).unwrap();
         assert!(migrate(&mut c).is_err(), "a newer schema must be refused");
+    }
+
+    #[test]
+    fn chunk_ranges_migration_keeps_old_rows() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT)").unwrap();
+        for (i, sql) in MIGRATIONS[..2].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.execute("INSERT INTO schema_version(version) VALUES (?1)", [i as i64 + 1]).unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO messages(id, ident, received, has_attachments) VALUES (1, 'mid:x', 0, 0);
+             INSERT INTO chunks(message, seq, text) VALUES (1, 0, 'old');",
+        )
+        .unwrap();
+        migrate(&mut c).unwrap();
+        assert_eq!(schema_version(&c).unwrap(), MIGRATIONS.len());
+        let r: (Option<i64>, Option<i64>, String) = c
+            .query_row("SELECT start_char, end_char, text FROM chunks", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(r, (None, None, "old".into()), "existing rows stay, ranges NULL");
     }
 
     #[test]

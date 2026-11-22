@@ -49,5 +49,7 @@ fn search_and_status_cli() {
     assert!(v["last_sync"].get("revision").is_some() && v["last_sync"].get("at").is_some(), "{v}");
     let o = run(&["sync", "--max-time", "soon", "--file", "/nonexistent.ost"], &idx);
     assert_eq!(o.status.code(), Some(2));
+    let o = run(&["sync", "--allow-mass-delete", "--file", "/nonexistent.ost"], &idx);
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(4), "io"), "flag accepted");
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -154,7 +154,8 @@ outlook-index.exe doctor --sample 1000 --pretty  # more precise, slower
 `doctor` prints aggregate JSON only: machine (OS, arch, CPUs, total RAM bytes), SQLite/FTS5, index location status,
 file kind/size, folder and message counts by class prefix (`IPM.Note`, `IPF.Note`, unknown segments → `other`)/depth/
 year, full-scan time, and for `--sample` messages picked at random: open+text, open and text-extraction times (µs),
-text lengths, a chunk estimate, attachment counts by extension/method and sizes. Distributions are
+text lengths, a chunk estimate, Message-ID coverage of the scanned rows (`messages.with_message_id` /
+`without_message_id`), attachment counts by extension/method and sizes. Distributions are
 `{min, p50, p95, max, sum}`. Errors: counts by kind only; a fatal error prints `{"error":{"kind","message"}}` with a
 fixed message. No subjects, addresses, names, folder or attachment names, body text or paths.
 
@@ -168,23 +169,25 @@ outlook-index.exe sync                    # every mail folder; counts only on st
 outlook-index.exe sync --max-time 30m     # stop after 30 min; the next sync resumes
 outlook-index.exe status --pretty         # counts and size only
 outlook-index.exe search "budget café" -n 5 -F Inbox --since 30d --from alice
-outlook-index.exe search "budget" --jsonl # one hit per line
+outlook-index.exe search "budget" --format jsonl   # one hit per line
 ```
 
 `sync` is a full reconciliation against the folders' contents tables: new, deleted, moved/copied messages and
 read/unread changes. Only new messages are opened. A message is identified by its Internet Message-ID, else by a
 fingerprint (sender, submit time, subject, size); the same message in two folders is indexed once. Nothing is done
 when the file has not changed since the last complete sync. New messages are committed in batches, so `Ctrl-C` or
-`--max-time` lose nothing. One sync at a time per index (lock file `index.sqlite.lock`). Quoted replies, forward
-headers and signature/disclaimer tails (French and English) are stripped; the rest is cut into ~1750-character
-chunks with ~200 characters of overlap.
+`--max-time` lose nothing. A sync that would delete more than max(100, 20%) of the indexed messages aborts with no
+change (usage error, counts only) unless `--allow-mass-delete` is passed. One sync at a time per index (lock file
+`index.sqlite.lock`). Quoted replies, forward headers and signature/disclaimer tails (French and English) are
+stripped; the rest is cut into ~1750-character chunks with ~200 characters of overlap; each chunk keeps its character
+range in the stripped body.
 
 `search` (keyword only for now; `--mode semantic|hybrid` is a usage error until embeddings land) matches every word,
 accent- and case-insensitive (FTS5 `unicode61 remove_diacritics 2`), over subject and body. Query operators and
-quotes are plain words. Filters: `-F` folder path or name (repeatable), `--since`/`--until`, `--from`, `--to`.
-One hit per message (its best chunk): `{id, message_id, folder, received, subject, from, excerpt, source, ranks,
-scores}`; `id` works with `outlook-cli get` until the message moves (then run `sync`). Excerpts are at most 300
-characters.
+quotes are plain words. Filters: `-F` folder name, or path with its subfolders (`Inbox` matches `Inbox/Projects`,
+not `Inboxes`; repeatable), `--since`/`--until`, `--from`, `--to`. One hit per message (its best chunk): `{id,
+message_id, folder, received, subject, from, excerpt, source, ranks, scores}`; `id` works with `outlook-cli get` until
+the message moves (then run `sync`). Excerpts: 300 characters by default, `--excerpt-max` up to 2000.
 
 ## Fonctionnement
 

@@ -131,11 +131,13 @@ pub struct Options {
     pub batch: usize,
     /// Stop (resumable) after the first batch that ends past this budget.
     pub max_time: Option<Duration>,
+    /// Allow deleting more than max(100, 20%) of the indexed messages.
+    pub allow_mass_delete: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { batch: 200, max_time: None }
+        Options { batch: 200, max_time: None, allow_mass_delete: false }
     }
 }
 
@@ -189,6 +191,24 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
     let (mut moved, mut flags_changed) = (0u64, 0u64);
     let mut fresh = Vec::new();
     let tx = c.transaction().map_err(db_err)?;
+    // Mass-deletion guard, before any write: an indexed message is deleted
+    // when its identity is gone from the scan (a vanished folder, a bad read).
+    let (mut indexed, mut gone) = (0usize, 0usize);
+    {
+        let mut st = tx.prepare("SELECT ident FROM messages").map_err(db_err)?;
+        let mut rows = st.query([]).map_err(db_err)?;
+        while let Some(r) = rows.next().map_err(db_err)? {
+            indexed += 1;
+            gone += usize::from(!idx.contains_key(&r.get::<_, String>(0).map_err(db_err)?));
+        }
+    }
+    let limit = (indexed / 5).max(100);
+    if gone > limit && !o.allow_mass_delete {
+        return Err(Error::Usage(format!(
+            "sync would delete {gone} of {indexed} indexed messages (limit {limit}); nothing changed. \
+             Pass --allow-mass-delete if this is expected"
+        )));
+    }
     let deleted = {
         tx.execute("DELETE FROM folders", []).map_err(db_err)?;
         let mut ins = tx.prepare("INSERT INTO folders(nid, path, name) VALUES (?1, ?2, ?3)").map_err(db_err)?;
@@ -298,10 +318,13 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
             let body = m.text.as_deref().map(strip_quotes).unwrap_or_default();
             // At least one (maybe empty) chunk, so the subject is searchable.
             let parts = chunk(&body);
-            let parts = if parts.is_empty() { vec![String::new()] } else { parts };
-            for (seq, t) in parts.iter().enumerate() {
-                tx.execute("INSERT INTO chunks(message, seq, text) VALUES (?1, ?2, ?3)", params![id, seq as i64, t])
-                    .map_err(db_err)?;
+            let parts = if parts.is_empty() { vec![(String::new(), 0..0)] } else { parts };
+            for (seq, (t, r)) in parts.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO chunks(message, seq, text, start_char, end_char) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![id, seq as i64, t, r.start as i64, r.end as i64],
+                )
+                .map_err(db_err)?;
                 chunks += 1;
             }
             new += 1;
@@ -554,7 +577,7 @@ mod tests {
         for i in 0..7u32 {
             f.add(0x1004 + i * 0x20, 0x22, Some(&format!("<b{i}@fict.invalid>")), "Bulk", "Bulk text.");
         }
-        let o = Options { batch: 4, max_time: Some(Duration::ZERO) };
+        let o = Options { batch: 4, max_time: Some(Duration::ZERO), ..Options::default() };
         let s = sync(&mut c, &mut f, &o).unwrap();
         assert_eq!((s["new"].as_u64(), s["complete"].as_bool()), (Some(4), Some(false)), "{s}");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 4, "one committed batch");
@@ -581,6 +604,101 @@ mod tests {
         f.bodies.insert(0x224, "Back again.".into());
         let s = run(&mut c, &mut f);
         assert_eq!((s["new"].as_u64(), s["complete"].as_bool()), (Some(1), Some(true)), "{s}");
+    }
+
+    #[test]
+    fn chunk_ranges_stored() {
+        let (mut c, mut f) = (db(), mailbox());
+        let body = format!("Reply text.\n\n{}\n\nOn Mon, Zed wrote:\n> old", "word ".repeat(800));
+        f.add(0x604, 0x22, Some("<r@fict.invalid>"), "Ranges", &body);
+        run(&mut c, &mut f);
+        let stripped: Vec<char> = strip_quotes(&body).chars().collect();
+        let rows: Vec<(String, i64, i64)> = c
+            .prepare(
+                "SELECT c.text, c.start_char, c.end_char FROM chunks c JOIN messages m ON m.id = c.message
+                 WHERE m.ident = 'mid:<r@fict.invalid>' ORDER BY c.seq",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(rows.len() >= 2, "{}", rows.len());
+        for (t, s, e) in rows {
+            assert_eq!(stripped[s as usize..e as usize].iter().collect::<String>(), t);
+        }
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM chunks WHERE start_char IS NULL OR end_char IS NULL"), 0);
+    }
+
+    /// The mailbox plus `n` messages in the Archive folder.
+    fn bulk(n: u32) -> Fake {
+        let mut f = mailbox();
+        for i in 0..n {
+            f.add(0x10004 + i * 0x20, 0x42, Some(&format!("<m{i}@fict.invalid>")), "Bulk", "Bulk text.");
+        }
+        f
+    }
+
+    fn snapshot(c: &Connection) -> String {
+        let q = |sql: &str| c.query_row(sql, [], |r| r.get::<_, Option<String>>(0)).unwrap().unwrap_or_default();
+        [
+            "SELECT group_concat(id || ident, ',') FROM (SELECT * FROM messages ORDER BY id)",
+            "SELECT group_concat(nid || ':' || folder || ':' || message || ':' || flags, ',')
+             FROM (SELECT * FROM locations ORDER BY nid)",
+            "SELECT group_concat(nid || path, ',') FROM (SELECT * FROM folders ORDER BY nid)",
+            "SELECT group_concat(id || ':' || text, ',') FROM (SELECT * FROM chunks ORDER BY id)",
+            "SELECT group_concat(key || '=' || value, ',') FROM (SELECT * FROM meta ORDER BY key)",
+        ]
+        .map(q)
+        .join("\n")
+    }
+
+    #[test]
+    fn mass_delete_guard_trips_db_unchanged() {
+        let (mut c, mut f) = (db(), bulk(150));
+        run(&mut c, &mut f);
+        // The Archive folder vanishes: 151 of 153 messages would go.
+        f.folders.retain(|x| x.nid != 0x42);
+        f.revision += 1;
+        let (before, writes) = (snapshot(&c), c.total_changes());
+        let e = sync(&mut c, &mut f, &Options::default()).unwrap_err();
+        assert_eq!(e.kind(), "usage");
+        let m = e.to_string();
+        assert!(m.contains("151") && m.contains("153") && m.contains("--allow-mass-delete"), "{m}");
+        for s in ["fict", "Bulk", "Archive", "Inbox", "Zed"] {
+            assert!(!m.contains(s), "guard message leaks {s:?}: {m}");
+        }
+        assert_eq!(c.total_changes(), writes, "no write at all");
+        assert_eq!(snapshot(&c), before, "DB unchanged");
+        assert_eq!(sync(&mut c, &mut f, &Options::default()).unwrap_err().kind(), "usage", "still guarded");
+    }
+
+    #[test]
+    fn mass_delete_allowed_with_flag() {
+        let (mut c, mut f) = (db(), bulk(150));
+        run(&mut c, &mut f);
+        f.folders.retain(|x| x.nid != 0x42);
+        f.revision += 1;
+        let s = sync(&mut c, &mut f, &Options { allow_mass_delete: true, ..Options::default() }).unwrap();
+        assert_eq!((s["deleted"].as_u64(), s["complete"].as_bool()), (Some(151), Some(true)), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 2);
+    }
+
+    #[test]
+    fn small_deletions_pass() {
+        // 603 indexed: limit max(100, 20%) = 120.
+        let (mut c, mut f) = (db(), bulk(600));
+        run(&mut c, &mut f);
+        for i in 0..120 {
+            f.remove(0x10004 + i * 0x20);
+        }
+        assert_eq!(run(&mut c, &mut f)["deleted"], 120, "at the limit");
+        // 483 indexed: limit 100.
+        for i in 120..221 {
+            f.remove(0x10004 + i * 0x20);
+        }
+        assert_eq!(sync(&mut c, &mut f, &Options::default()).unwrap_err().kind(), "usage", "101 > 100");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 483);
     }
 
     #[test]

@@ -74,6 +74,10 @@ enum Cmd {
         /// Stop after this long (90s, 30m, 2h); the next sync resumes.
         #[arg(long)]
         max_time: Option<String>,
+        /// Allow deleting more than max(100, 20%) of the indexed messages in
+        /// one sync (default: abort with no change).
+        #[arg(long)]
+        allow_mass_delete: bool,
     },
     /// Keyword search (FTS5, accent-insensitive). Best chunk per message.
     Search {
@@ -85,7 +89,7 @@ enum Cmd {
         /// Maximum number of hits.
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: usize,
-        /// Folder path or name; repeatable = any.
+        /// Folder name, or path with its subfolders; repeatable = any.
         #[arg(short = 'F', long = "folder")]
         folders: Vec<String>,
         /// Received at or after (2026-10-15, '2026-10-15 08:00', 3d, today...).
@@ -154,9 +158,12 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let f = file().map_err(doctor::sanitize)?;
             doctor::run(&f, &index_path, sample).map_err(doctor::sanitize)?
         }
-        Cmd::Sync { ref max_time } => {
-            let opts =
-                sync::Options { max_time: max_time.as_deref().map(parse_duration).transpose()?, ..Default::default() };
+        Cmd::Sync { ref max_time, allow_mass_delete } => {
+            let opts = sync::Options {
+                max_time: max_time.as_deref().map(parse_duration).transpose()?,
+                allow_mass_delete,
+                ..Default::default()
+            };
             let f = file()?;
             let mut c = index::open(&index_path)?;
             let _lock = sync::lock(&index_path)?;

@@ -15,7 +15,7 @@ use crate::timeutil::format_ft;
 pub struct Query {
     pub text: String,
     pub limit: usize,
-    /// Folder paths or names (case-insensitive); any.
+    /// Folder names or paths with subfolders (case-insensitive); any.
     pub folders: Vec<String>,
     pub since: Option<i64>,
     pub until: Option<i64>,
@@ -64,7 +64,8 @@ const SQL: &str = "
       AND (?5 = 0 OR m.has_attachments = 1)
     ORDER BY bm25(chunks_fts)";
 
-/// Folder ids for -F specs: path or name, case-insensitive.
+/// Folder ids for -F specs, case-insensitive: a name, or a path with its
+/// subfolders ("Inbox" matches "Inbox/Projects", not "Inboxes").
 fn folder_ids(c: &Connection, specs: &[String]) -> Result<Vec<i64>> {
     let all: Vec<(i64, String, String)> = c
         .prepare("SELECT nid, path, name FROM folders")
@@ -77,7 +78,8 @@ fn folder_ids(c: &Connection, specs: &[String]) -> Result<Vec<i64>> {
     for spec in specs {
         let s = spec.trim().trim_matches('/').to_lowercase();
         let n = out.len();
-        out.extend(all.iter().filter(|f| f.1.to_lowercase() == s || f.2.to_lowercase() == s).map(|f| f.0));
+        let under = |p: &str| p.strip_prefix(s.as_str()).is_some_and(|r| r.is_empty() || r.starts_with('/'));
+        out.extend(all.iter().filter(|f| under(&f.1.to_lowercase()) || f.2.to_lowercase() == s).map(|f| f.0));
         if out.len() == n {
             return Err(Error::NotFound(format!("folder '{}' in the index (run `outlook-index sync`)", spec.trim())));
         }
@@ -299,6 +301,29 @@ mod tests {
             Vec::<u64>::new()
         );
         assert_eq!(with(&|x| x.limit = 1).len(), 1);
+    }
+
+    #[test]
+    fn folder_prefix_on_slash_boundaries() {
+        let mut c = Connection::open_in_memory().unwrap();
+        migrate(&mut c).unwrap();
+        let mut f = mailbox();
+        f.folders.extend([folder(0x62, "Inbox/Projects/Alpha"), folder(0x82, "Inboxes")]);
+        f.add(0x604, 0x62, Some("<p@fict.invalid>"), "Plan", "Budget plan alpha.");
+        f.add(0x624, 0x82, Some("<q@fict.invalid>"), "Other", "Budget other box.");
+        sync(&mut c, &mut f, &Options::default()).unwrap();
+        let by = |spec: &str| {
+            let mut v = ids(&c, &Query { folders: vec![spec.into()], ..q("budget") });
+            v.sort();
+            v
+        };
+        assert_eq!(by("Inbox"), [0x204, 0x604], "subfolders, not Inboxes");
+        assert_eq!(by("inbox/"), [0x204, 0x604]);
+        assert_eq!(by("INBOX/projects"), [0x604], "case-insensitive prefix");
+        assert_eq!(by("Inboxes"), [0x624]);
+        assert_eq!(by("alpha"), [0x604], "by name");
+        let x = Query { folders: vec!["Inbox/Proj".into()], ..q("budget") };
+        assert_eq!(search(&c, &x).unwrap_err().kind(), "not_found", "not a / boundary");
     }
 
     #[test]

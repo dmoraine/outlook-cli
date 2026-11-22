@@ -1,6 +1,8 @@
 //! Pure text preparation for the index: quoted-reply / signature stripping
 //! and paragraph chunking.
 
+use std::ops::Range;
+
 pub use super::doctor::{CHUNK_CHARS, CHUNK_OVERLAP};
 
 /// The text written by the sender: quoted replies, forwarded headers and
@@ -58,26 +60,39 @@ fn quote_start(line: &str, next: &str) -> bool {
 }
 
 /// Paragraph-based chunks of at most CHUNK_CHARS characters, consecutive
-/// chunks sharing about CHUNK_OVERLAP characters.
-pub fn chunk(text: &str) -> Vec<String> {
-    let (mut out, mut cur, mut fresh) = (Vec::new(), String::new(), false);
+/// chunks sharing about CHUNK_OVERLAP characters. Each chunk is a slice of
+/// `text`, returned with its char range in `text`.
+pub fn chunk(text: &str) -> Vec<(String, Range<usize>)> {
+    let off = |s: &str| s.as_ptr() as usize - text.as_ptr() as usize;
+    // Byte spans of `text`, start and end both increasing.
+    let (mut spans, mut cur) = (Vec::new(), None);
     for para in text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
         for piece in split_long(para, CHUNK_CHARS - CHUNK_OVERLAP - 2) {
-            if fresh && len(&cur) + 2 + len(piece) > CHUNK_CHARS {
-                let tail = tail(&cur, CHUNK_OVERLAP).to_string();
-                out.push(std::mem::replace(&mut cur, tail));
-            }
-            if !cur.is_empty() {
-                cur.push_str("\n\n");
-            }
-            cur.push_str(piece);
-            fresh = true;
+            let (ps, pe) = (off(piece), off(piece) + piece.len());
+            cur = Some(match cur {
+                Some((s, e)) if len(&text[s..pe]) > CHUNK_CHARS => {
+                    spans.push((s, e));
+                    let t = tail(&text[s..e], CHUNK_OVERLAP);
+                    let ts = if t.is_empty() { ps } else { off(t) };
+                    // No overlap when a long blank gap would overflow the chunk.
+                    if len(&text[ts..pe]) > CHUNK_CHARS { (ps, pe) } else { (ts, pe) }
+                }
+                Some((s, _)) => (s, pe),
+                None => (ps, pe),
+            });
         }
     }
-    if fresh {
-        out.push(cur);
-    }
-    out
+    spans.extend(cur);
+    let (mut b, mut c) = (0, 0);
+    spans
+        .into_iter()
+        .map(|(s, e)| {
+            c += len(&text[b..s]);
+            b = s;
+            let t = &text[s..e];
+            (t.to_string(), c..c + len(t))
+        })
+        .collect()
 }
 
 fn len(s: &str) -> usize {
@@ -152,11 +167,11 @@ mod tests {
     #[test]
     fn chunk_boundaries() {
         assert!(chunk("").is_empty());
-        assert_eq!(chunk("one paragraph"), ["one paragraph"]);
+        assert_eq!(chunk("one paragraph"), [("one paragraph".to_string(), 0..13)]);
         let para = |i: usize| format!("Paragraph {i} {}", "lorem ipsum dolor sit amet ".repeat(20));
         let text: Vec<String> = (0..20).map(para).collect();
         let text = text.join("\n\n");
-        let c = chunk(&text);
+        let c: Vec<String> = chunk(&text).into_iter().map(|c| c.0).collect();
         assert!(c.len() > 4, "{}", c.len());
         for (i, ch) in c.iter().enumerate() {
             let n = ch.chars().count();
@@ -174,8 +189,31 @@ mod tests {
         }
         // One huge paragraph without blank lines, multibyte characters.
         let long = "é".repeat(5000);
-        let c = chunk(&long);
+        let c: Vec<String> = chunk(&long).into_iter().map(|c| c.0).collect();
         assert!(c.iter().all(|ch| ch.chars().count() <= CHUNK_CHARS));
         assert!(c.iter().map(|ch| ch.chars().count()).sum::<usize>() >= 5000);
+    }
+
+    #[test]
+    fn chunk_ranges_match_body() {
+        let para = |i: usize| format!("Paragraphe {i} café {}", "lorem ipsum dolor sit amet ".repeat(15 + i % 7));
+        let mut body = (0..25).map(para).collect::<Vec<_>>().join("\n\n");
+        // Extra blank line, then one huge multibyte paragraph.
+        body.push_str(&format!("\n\n\n{}", "é".repeat(4000)));
+        let chars: Vec<char> = body.chars().collect();
+        let c = chunk(&body);
+        assert!(c.len() > 5, "{}", c.len());
+        assert_eq!(c[0].1.start, 0, "covers the start");
+        assert_eq!(c.last().unwrap().1.end, chars.len(), "covers the end");
+        for (t, r) in &c {
+            assert_eq!(chars[r.clone()].iter().collect::<String>(), *t, "text is body[start..end] in chars");
+            assert!(r.len() <= CHUNK_CHARS, "{r:?}");
+        }
+        for w in c.windows(2) {
+            let (a, b) = (&w[0].1, &w[1].1);
+            assert!(a.start < b.start && a.end < b.end, "monotonic: {a:?} {b:?}");
+            assert!(b.start < a.end, "overlap, no gap: {a:?} {b:?}");
+        }
+        assert_eq!(chunk("  x  "), [("x".to_string(), 2..3)]);
     }
 }

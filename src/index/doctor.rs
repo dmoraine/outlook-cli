@@ -20,6 +20,8 @@ pub struct Row {
     pub class: Option<String>,
     pub received: i64,
     pub flags: i64,
+    /// Non-empty Internet Message-ID (sync identity; else a fingerprint).
+    pub has_message_id: bool,
 }
 
 /// A sampled message.
@@ -205,8 +207,9 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
     }
     let scan_time = t.elapsed();
     let (mut m_class, mut m_year) = (BTreeMap::new(), BTreeMap::new());
-    let (mut unread, mut with_att) = (0, 0);
+    let (mut unread, mut with_att, mut with_mid) = (0, 0, 0);
     for r in &rows {
+        with_mid += u64::from(r.has_message_id);
         bump(&mut m_class, class_prefix(r.class.as_deref()));
         bump(&mut m_year, format_ft(r.received, false).map_or("unknown".into(), |s| s[..4].to_string()));
         unread += u64::from(r.flags & MSGFLAG_READ == 0);
@@ -268,6 +271,8 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
             "total": rows.len(),
             "unread": unread,
             "with_attachments": with_att,
+            "with_message_id": with_mid,
+            "without_message_id": rows.len() as u64 - with_mid,
             "by_class": m_class,
             "by_year": m_year,
         },
@@ -342,7 +347,13 @@ impl Source for StoreSource {
         self.retry(|s| {
             let mut v = Vec::new();
             s.scan_folder(folder, &mut |r| {
-                v.push(Row { nid: r.nid, class: r.class.get(), received: r.received, flags: r.flags });
+                v.push(Row {
+                    nid: r.nid,
+                    class: r.class.get(),
+                    received: r.received,
+                    flags: r.flags,
+                    has_message_id: r.message_id.get().is_some_and(|m| !m.trim().is_empty()),
+                });
                 true
             })?;
             Ok(v)
@@ -444,14 +455,27 @@ mod tests {
             assert_eq!(folder, 1, "only mail folders are scanned");
             // 2026-01-01 and 2025-06-01 (FILETIME).
             Ok(vec![
-                Row { nid: 10, class: Some("IPM.Note".into()), received: 134116992000000000, flags: 0x11 },
+                Row {
+                    nid: 10,
+                    class: Some("IPM.Note".into()),
+                    received: 134116992000000000,
+                    flags: 0x11,
+                    has_message_id: true,
+                },
                 Row {
                     nid: 11,
                     class: Some("IPM.Note.SECRET_Alice_Form".into()),
                     received: 133932960000000000,
                     flags: 0,
+                    has_message_id: false,
                 },
-                Row { nid: 12, class: Some("IPM.Schedule.Meeting.Request".into()), received: 0, flags: 1 },
+                Row {
+                    nid: 12,
+                    class: Some("IPM.Schedule.Meeting.Request".into()),
+                    received: 0,
+                    flags: 1,
+                    has_message_id: true,
+                },
             ])
         }
         fn sample(&mut self, nid: Nid) -> Result<Sample> {
@@ -484,6 +508,8 @@ mod tests {
         assert_eq!(v["messages"]["total"], 3);
         assert_eq!(v["messages"]["unread"], 1);
         assert_eq!(v["messages"]["with_attachments"], 1);
+        assert_eq!(v["messages"]["with_message_id"], 2);
+        assert_eq!(v["messages"]["without_message_id"], 1);
         assert_eq!(v["messages"]["by_class"]["IPM.Note"], 2);
         assert_eq!(v["messages"]["by_class"]["IPM.Schedule"], 1);
         assert_eq!(v["folders"]["by_class"]["IPF.Note"], 1);
