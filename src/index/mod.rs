@@ -1,7 +1,9 @@
 //! Local mail index (cargo feature `index`): database location, schema
-//! migrations, `doctor`, `sync`, `search` and `status`.
+//! migrations, `doctor`, `sync`, `search`, `status` and local embeddings.
 
 pub mod doctor;
+pub mod embed;
+pub mod model;
 pub mod search;
 pub mod sync;
 pub mod text;
@@ -65,8 +67,8 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE chunks ADD COLUMN end_char INTEGER;",
 ];
 
-/// %LOCALAPPDATA%\outlook-cli\index.sqlite on Windows, the XDG data dir elsewhere.
-pub fn default_path() -> Result<PathBuf> {
+/// %LOCALAPPDATA%\outlook-cli on Windows, $XDG_DATA_HOME/outlook-cli elsewhere.
+pub fn data_dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
     } else {
@@ -75,7 +77,13 @@ pub fn default_path() -> Result<PathBuf> {
             .filter(|p| p.is_absolute())
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
     };
-    base.map(|b| b.join("outlook-cli").join("index.sqlite"))
+    base.map(|b| b.join("outlook-cli"))
+}
+
+/// <data dir>/index.sqlite.
+pub fn default_path() -> Result<PathBuf> {
+    data_dir()
+        .map(|d| d.join("index.sqlite"))
         .ok_or_else(|| Error::Usage("no data directory found; pass --index or set OUTLOOK_INDEX_DB".into()))
 }
 

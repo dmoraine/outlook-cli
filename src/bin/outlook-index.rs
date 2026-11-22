@@ -2,12 +2,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value as Json, json};
 
 use outlook_cli::error::{Error, Result};
 use outlook_cli::index::doctor::{self, StoreSource};
-use outlook_cli::index::{self, search, sync};
+use outlook_cli::index::embed::{self, Embedder};
+use outlook_cli::index::{self, model, search, sync};
 use outlook_cli::paths::{default_file, native_path};
 use outlook_cli::timeutil::parse_when;
 
@@ -116,6 +117,62 @@ enum Cmd {
     },
     /// Index counts and size. No content, no names.
     Status,
+    /// Embedding model files: list, or download (opt-in network access).
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
+    },
+    /// Embedding speed on this CPU, on synthetic text (no mail data).
+    BenchEmbed {
+        #[command(flatten)]
+        model: ModelArgs,
+        /// Approximate duration in seconds.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        seconds: u64,
+        /// Compute threads. Default: logical CPUs - 1 (at least 1).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1024))]
+        threads: Option<u64>,
+        /// Passages per batch.
+        #[arg(long, default_value_t = embed::DEFAULT_BATCH as u64, value_parser = clap::value_parser!(u64).range(1..=256))]
+        batch: u64,
+    },
+}
+
+#[derive(Args)]
+struct ModelArgs {
+    /// Embedding model.
+    #[arg(long, default_value = "e5-small", value_parser = model::NAMES)]
+    model: String,
+    /// Directory with the model's config.json, tokenizer.json and
+    /// model.safetensors. Default: <data dir>/models/multilingual-e5-small
+    /// (or -base), next to the default index.
+    #[arg(long, env = "OUTLOOK_INDEX_MODEL_DIR")]
+    model_dir: Option<String>,
+}
+
+impl ModelArgs {
+    fn resolve(&self) -> Result<(&'static model::Model, PathBuf)> {
+        let m = model::get(&self.model)?;
+        let dir = match &self.model_dir {
+            Some(d) => native_path(d),
+            None => model::default_dir(m)?,
+        };
+        Ok((m, dir))
+    }
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// Known models, pinned revisions, and whether their files are in the
+    /// default directories (sizes only; `fetch` checks the hashes).
+    List,
+    /// Download the model files over HTTPS from huggingface.co at the pinned
+    /// revision (needs curl) and check their SHA-256. Resumes an interrupted
+    /// download; files already correct are kept. The only network access.
+    Fetch {
+        #[command(flatten)]
+        model: ModelArgs,
+    },
 }
 
 /// "90s", "30m", "2h".
@@ -197,6 +254,24 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             }
         }
         Cmd::Status => search::status(&index::open(&existing(index_path)?)?)?,
+        Cmd::Model { cmd: ModelCmd::List } => model::list(model::default_dir)?,
+        Cmd::Model { cmd: ModelCmd::Fetch { ref model } } => {
+            let (m, dir) = model.resolve()?;
+            model::fetch(m, &dir, |f| {
+                eprintln!("{}", json!({ "progress": { "kind": "download", "file": f.name, "bytes": f.size } }))
+            })?
+        }
+        Cmd::BenchEmbed { ref model, seconds, threads, batch } => {
+            let (m, dir) = model.resolve()?;
+            let threads = threads.map_or_else(embed::default_threads, |n| n as usize);
+            // SAFETY: no other thread exists yet; candle and rayon read this
+            // variable on first use.
+            unsafe { std::env::set_var("RAYON_NUM_THREADS", threads.to_string()) };
+            let t = std::time::Instant::now();
+            let mut e = Embedder::load(m, &dir)?;
+            e.batch = batch as usize;
+            embed::bench(&e, t.elapsed(), Duration::from_secs(seconds), threads)?
+        }
     };
     let print = |v: &Json, pretty: bool| {
         let s = if pretty { serde_json::to_string_pretty(v) } else { serde_json::to_string(v) };

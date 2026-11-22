@@ -53,3 +53,48 @@ fn search_and_status_cli() {
     assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(4), "io"), "flag accepted");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Model commands without any download: missing files, usage errors, no curl.
+#[test]
+fn model_and_bench_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-model-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cmd = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_outlook-index"));
+        c.args(args).env("XDG_DATA_HOME", &dir).env("LOCALAPPDATA", &dir).env_remove("OUTLOOK_INDEX_MODEL_DIR");
+        c
+    };
+    let o = cmd(&["model", "list"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let names: Vec<&str> = v["models"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["e5-small", "e5-base"]);
+    assert_eq!(v["models"][0]["ready"], false);
+    assert!(v["models"][1]["dir"].as_str().unwrap().ends_with("multilingual-e5-base"), "{v}");
+
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let o = cmd(&["bench-embed", "--seconds", "1", "--model-dir"]).arg(&empty).output().unwrap();
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(3), "not_found"));
+    for bad in [
+        &["bench-embed", "--model", "e5-large"][..],
+        &["bench-embed", "--seconds", "0"],
+        &["bench-embed", "--threads", "0"],
+        &["bench-embed", "--batch", "0"],
+        &["model", "fetch", "--model", "x"],
+    ] {
+        assert_eq!(cmd(bad).output().unwrap().status.code(), Some(2), "{bad:?}");
+    }
+    // No curl on PATH: a clear error, nothing left behind. (Windows would
+    // still find curl.exe in System32, so Unix only.)
+    #[cfg(unix)]
+    {
+        let o = cmd(&["model", "fetch", "--model-dir"]).arg(&empty).env("PATH", "").output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        let last: serde_json::Value = serde_json::from_str(err.lines().last().unwrap()).unwrap();
+        assert_eq!((o.status.code(), last["error"]["kind"].as_str()), (Some(3), Some("not_found")), "{err}");
+        assert!(err.lines().next().unwrap().contains("\"progress\""), "{err}");
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0, "no partial file");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -144,7 +144,8 @@ $r.messages | Select-Object id, received, subject
 ## outlook-index (preview)
 
 Separate binary for a local mailbox index (cargo feature `index`, bundled SQLite with FTS5). Read-only on the OST.
-Built by `scripts/build.sh` as `dist/outlook-index.exe`. Commands: `doctor`, `sync`, `search`, `status`.
+Built by `scripts/build.sh` as `dist/outlook-index.exe`. Commands: `doctor`, `sync`, `search`, `status`, `model`,
+`bench-embed`.
 
 ```powershell
 outlook-index.exe doctor --pretty                # samples 200 messages
@@ -188,6 +189,32 @@ quotes are plain words. Filters: `-F` folder name, or path with its subfolders (
 not `Inboxes`; repeatable), `--since`/`--until`, `--from`, `--to`. One hit per message (its best chunk): `{id,
 message_id, folder, received, subject, from, excerpt, source, ranks, scores}`; `id` works with `outlook-cli get` until
 the message moves (then run `sync`). Excerpts: 300 characters by default, `--excerpt-max` up to 2000.
+
+### Embedding model (local, CPU)
+
+`intfloat/multilingual-e5-small` (default, 384 dims, BERT) or `multilingual-e5-base` (768 dims, XLM-RoBERTa), run on
+the CPU with candle (pure Rust). The model is not in the exe. Its files (`config.json`, `tokenizer.json`,
+`model.safetensors`) are pinned to a Hugging Face revision and checked by SHA-256 before every load.
+
+```powershell
+outlook-index.exe model list --pretty                   # pinned revisions, files present in the default dirs
+outlook-index.exe model fetch                           # e5-small (~490 MB), the only network access
+outlook-index.exe model fetch --model e5-base           # ~1.1 GB
+outlook-index.exe bench-embed --pretty                  # ~30 s of synthetic passages on this CPU
+outlook-index.exe bench-embed --model e5-base --seconds 60 --threads 4 --pretty
+```
+
+`model fetch` downloads over HTTPS from huggingface.co with `curl` (shipped with Windows 10+) into `<name>.part`,
+resumes an interrupted download and installs a file only when its SHA-256 matches. Manual download: put the three
+files of the pinned revision (`model list`) in a directory and pass `--model-dir` (or `OUTLOOK_INDEX_MODEL_DIR`).
+Default directory: `%LOCALAPPDATA%\outlook-cli\models\multilingual-e5-small` (or `-base`; Linux: under
+`$XDG_DATA_HOME/outlook-cli`). Texts get the mandatory e5 prefix (`query: ` / `passage: `), are cut at 512 tokens,
+embedded in length-sorted batches (`--batch`, default 8) and mean-pooled over the tokens, then L2-normalized.
+`--threads` defaults to the logical CPUs minus one. `bench-embed` prints load time (hash check included), query
+latency and passages/s on synthetic text only. **Paste back** its whole JSON for both models.
+
+Parity with sentence-transformers (`scripts/e5_reference.py` → `tests/fixtures/e5_reference.json`):
+`E5_SMALL_DIR=... E5_BASE_DIR=... cargo test --release --features index --test embed_parity -- --ignored --nocapture`.
 
 ## Fonctionnement
 

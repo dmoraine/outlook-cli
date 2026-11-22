@@ -22,8 +22,8 @@ jobs:
       - run: cargo test --release
       - run: cargo clippy --release --all-targets --features index -- -D warnings
       - run: cargo test --release --features index
-      # outlook-cli must not depend on SQLite.
-      - run: "! cargo tree -e normal | grep -i sqlite"
+      # outlook-cli must not depend on SQLite or the embedding stack.
+      - run: "! cargo tree -e normal | grep -iE 'sqlite|candle|tokenizers'"
 
   windows:
     runs-on: windows-latest
