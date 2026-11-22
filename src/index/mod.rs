@@ -1,7 +1,10 @@
 //! Local mail index (cargo feature `index`): database location, schema
-//! migrations and the `doctor` diagnostics.
+//! migrations, `doctor`, `sync`, `search` and `status`.
 
 pub mod doctor;
+pub mod search;
+pub mod sync;
+pub mod text;
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +13,54 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Schema migrations, applied in order. Version = position + 1. Append only.
-const MIGRATIONS: &[&str] = &["CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"];
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    // Mail index. A message (identity: Message-ID or fingerprint) has one
+    // location per copy; the NID changes on a move. FTS5 is external-content
+    // over `chunk_text`, kept in sync by the chunk triggers: delete a
+    // message's chunks before the message.
+    "CREATE TABLE folders (nid INTEGER PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL);
+     CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        ident TEXT NOT NULL UNIQUE,
+        message_id TEXT,
+        received INTEGER NOT NULL,
+        sent INTEGER,
+        size INTEGER,
+        class TEXT,
+        has_attachments INTEGER NOT NULL,
+        subject TEXT,
+        sender TEXT,
+        from_name TEXT,
+        from_email TEXT,
+        display_to TEXT,
+        display_cc TEXT);
+     CREATE INDEX messages_received ON messages(received);
+     CREATE TABLE locations (
+        nid INTEGER PRIMARY KEY,
+        folder INTEGER NOT NULL,
+        message INTEGER NOT NULL REFERENCES messages(id),
+        flags INTEGER NOT NULL);
+     CREATE INDEX locations_message ON locations(message);
+     CREATE TABLE chunks (
+        id INTEGER PRIMARY KEY,
+        message INTEGER NOT NULL REFERENCES messages(id),
+        seq INTEGER NOT NULL,
+        text TEXT NOT NULL);
+     CREATE INDEX chunks_message ON chunks(message);
+     CREATE VIEW chunk_text AS
+        SELECT c.id AS id, m.subject AS subject, c.text AS text FROM chunks c JOIN messages m ON m.id = c.message;
+     CREATE VIRTUAL TABLE chunks_fts USING fts5(subject, text, content = 'chunk_text', content_rowid = 'id',
+        tokenize = 'unicode61 remove_diacritics 2');
+     CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+        INSERT INTO chunks_fts(rowid, subject, text)
+            SELECT new.id, subject, new.text FROM messages WHERE id = new.message;
+     END;
+     CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+        INSERT INTO chunks_fts(chunks_fts, rowid, subject, text)
+            SELECT 'delete', old.id, subject, old.text FROM messages WHERE id = old.message;
+     END;",
+];
 
 /// %LOCALAPPDATA%\outlook-cli\index.sqlite on Windows, the XDG data dir elsewhere.
 pub fn default_path() -> Result<PathBuf> {
@@ -42,6 +92,9 @@ pub fn open(p: &Path) -> Result<Connection> {
         std::fs::create_dir_all(d).map_err(|e| Error::Io(format!("cannot create the index directory: {e}")))?;
     }
     let mut c = Connection::open(p).map_err(db_err)?;
+    c.busy_timeout(std::time::Duration::from_secs(10)).map_err(db_err)?;
+    c.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
+    c.pragma_update(None, "synchronous", "NORMAL").map_err(db_err)?;
     migrate(&mut c)?;
     Ok(c)
 }

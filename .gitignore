@@ -6,3 +6,8 @@
 *.nst
 *.state
 *.jsonl
+# Local index database (WAL, shared-memory and sync lock files)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.lock

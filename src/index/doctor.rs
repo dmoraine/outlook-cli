@@ -317,7 +317,12 @@ impl StoreSource {
         Ok(StoreSource { path: path.to_path_buf(), store: with_retry(|| Store::open(path))? })
     }
 
-    fn retry<T>(&mut self, mut f: impl FnMut(&Store) -> Result<T>) -> Result<T> {
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Run `f`, reopening the file and retrying on inconsistent data.
+    pub(crate) fn retry<T>(&mut self, mut f: impl FnMut(&Store) -> Result<T>) -> Result<T> {
         let mut first = true;
         with_retry(|| {
             if !std::mem::take(&mut first) {

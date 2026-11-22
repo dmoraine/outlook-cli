@@ -246,6 +246,7 @@ impl Store {
             tc.col_id(tag::MESSAGE_CLASS),
             tc.col_id(tag::SENT_REPRESENTING_NAME),
             tc.col_id(tag::INTERNET_MESSAGE_ID),
+            tc.col_id(tag::MESSAGE_SIZE),
         ];
         tc.for_each_row(&mut |r| {
             let received = r.time(c[0]).or_else(|| r.time(c[1])).or_else(|| r.time(c[2])).unwrap_or(0);
@@ -253,6 +254,8 @@ impl Store {
                 nid: r.id(),
                 folder,
                 received,
+                submitted: r.time(c[1]).unwrap_or(0),
+                size: r.int(c[8]).unwrap_or(0),
                 flags: r.int(c[3]).unwrap_or(0),
                 subject: LazyStr(&|| r.str(c[4]).map(clean_subject)),
                 class: LazyStr(&|| r.str(c[5])),
@@ -285,6 +288,10 @@ pub struct RowSummary<'f> {
     pub nid: Nid,
     pub folder: Nid,
     pub received: i64,
+    /// PR_CLIENT_SUBMIT_TIME, 0 when absent.
+    pub submitted: i64,
+    /// PR_MESSAGE_SIZE, 0 when absent.
+    pub size: i64,
     pub flags: i64,
     pub subject: LazyStr<'f>,
     pub class: LazyStr<'f>,

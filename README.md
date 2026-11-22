@@ -144,7 +144,7 @@ $r.messages | Select-Object id, received, subject
 ## outlook-index (preview)
 
 Separate binary for a local mailbox index (cargo feature `index`, bundled SQLite with FTS5). Read-only on the OST.
-Built by `scripts/build.sh` as `dist/outlook-index.exe`. One command so far:
+Built by `scripts/build.sh` as `dist/outlook-index.exe`. Commands: `doctor`, `sync`, `search`, `status`.
 
 ```powershell
 outlook-index.exe doctor --pretty                # samples 200 messages
@@ -162,6 +162,29 @@ fixed message. No subjects, addresses, names, folder or attachment names, body t
 
 Index file: `--index` / `OUTLOOK_INDEX_DB`, default `%LOCALAPPDATA%\outlook-cli\index.sqlite` (Linux:
 `$XDG_DATA_HOME/outlook-cli/index.sqlite`). A path under OneDrive gets a warning. `doctor` does not create it.
+
+```powershell
+outlook-index.exe sync                    # every mail folder; counts only on stdout
+outlook-index.exe sync --max-time 30m     # stop after 30 min; the next sync resumes
+outlook-index.exe status --pretty         # counts and size only
+outlook-index.exe search "budget café" -n 5 -F Inbox --since 30d --from alice
+outlook-index.exe search "budget" --jsonl # one hit per line
+```
+
+`sync` is a full reconciliation against the folders' contents tables: new, deleted, moved/copied messages and
+read/unread changes. Only new messages are opened. A message is identified by its Internet Message-ID, else by a
+fingerprint (sender, submit time, subject, size); the same message in two folders is indexed once. Nothing is done
+when the file has not changed since the last complete sync. New messages are committed in batches, so `Ctrl-C` or
+`--max-time` lose nothing. One sync at a time per index (lock file `index.sqlite.lock`). Quoted replies, forward
+headers and signature/disclaimer tails (French and English) are stripped; the rest is cut into ~1750-character
+chunks with ~200 characters of overlap.
+
+`search` (keyword only for now; `--mode semantic|hybrid` is a usage error until embeddings land) matches every word,
+accent- and case-insensitive (FTS5 `unicode61 remove_diacritics 2`), over subject and body. Query operators and
+quotes are plain words. Filters: `-F` folder path or name (repeatable), `--since`/`--until`, `--from`, `--to`.
+One hit per message (its best chunk): `{id, message_id, folder, received, subject, from, excerpt, source, ranks,
+scores}`; `id` works with `outlook-cli get` until the message moves (then run `sync`). Excerpts are at most 300
+characters.
 
 ## Fonctionnement
 
