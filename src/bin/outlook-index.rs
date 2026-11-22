@@ -53,13 +53,6 @@ enum Format {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Mode {
-    Keyword,
-    Semantic,
-    Hybrid,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Priority {
     /// Below normal (nice 10 on Linux), so the machine stays usable.
     Low,
@@ -123,13 +116,23 @@ enum Cmd {
         #[arg(long, conflicts_with_all = ["embed_since", "embed_until", "folders"])]
         clear: bool,
     },
-    /// Keyword search (FTS5, accent-insensitive). Best chunk per message.
+    /// Search the index. Best chunk per message. keyword: every word (FTS5,
+    /// accent-insensitive); semantic: nearest by meaning (local model);
+    /// hybrid: RRF of any-word keyword and semantic results.
     Search {
-        /// Words to find (all required). Operators are treated as words.
+        /// Text to find. Operators are treated as words.
         query: String,
-        /// semantic and hybrid need embeddings (not available yet).
-        #[arg(long, value_enum, default_value_t = Mode::Keyword)]
-        mode: Mode,
+        /// Default: hybrid when the index has vectors of its model, else
+        /// keyword. semantic/hybrid without vectors fall back to keyword with
+        /// a warning.
+        #[arg(long, value_enum)]
+        mode: Option<search::Mode>,
+        /// Model of the query vector. Default: the model of the stored vectors.
+        #[arg(long, value_parser = model::NAMES)]
+        model: Option<String>,
+        /// Directory with the model files. Default: <data dir>/models/<repository name>.
+        #[arg(long, env = "OUTLOOK_INDEX_MODEL_DIR")]
+        model_dir: Option<String>,
         /// Maximum number of hits.
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: usize,
@@ -391,31 +394,65 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             };
             vectors::counts(&c)?
         }
-        Cmd::Search { query, mode, limit, folders, since, until, from, to, has_attachments, excerpt_max, format } => {
-            if mode != Mode::Keyword {
-                return Err(Error::Usage(
-                    "semantic and hybrid search need embeddings (not available yet); use --mode keyword".into(),
-                ));
-            }
+        Cmd::Search {
+            query,
+            mode,
+            ref model,
+            ref model_dir,
+            limit,
+            folders,
+            since,
+            until,
+            from,
+            to,
+            has_attachments,
+            excerpt_max,
+            format,
+        } => {
             let t = |o: Option<String>| o.as_deref().map(parse_when).transpose();
+            let (since, until) = (t(since)?, t(until)?);
+            search::check_text(&query)?;
+            let c = index::open(&existing(index_path)?)?;
+            let (mut run_mode, m, warn) = search::plan(&c, mode, model.as_deref())?;
+            let warning =
+                |kind: &str, msg: &str| eprintln!("{}", json!({ "warning": { "kind": kind, "message": msg } }));
+            if let Some(w) = warn {
+                warning("keyword_fallback", &w);
+            }
+            let mut vector = None;
+            if let Some(m) = m {
+                set_threads(None);
+                match Embedder::load(m, &self::model_dir(m, model_dir)?) {
+                    Ok(e) => vector = Some(e.embed_queries(&[&query])?.remove(0)),
+                    // Default mode stays usable without the model files.
+                    Err(Error::NotFound(_)) if mode.is_none() => {
+                        warning("keyword_fallback", &format!("{MODEL_MISSING}; keyword search used"));
+                        run_mode = search::Mode::Keyword;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             let q = search::Query {
                 text: query,
                 limit,
                 folders,
-                since: t(since)?,
-                until: t(until)?,
+                since,
+                until,
                 from,
                 to,
                 has_attachments,
                 excerpt_max: excerpt_max as usize,
                 local_time: cli.local_time,
+                mode: run_mode,
+                vector,
+                model: m,
             };
-            let hits = search::search(&index::open(&existing(index_path)?)?, &q)?;
+            let hits = search::search(&c, &q)?;
             if format == Format::Jsonl {
                 lines = Some(hits);
                 Json::Null
             } else {
-                json!({ "count": hits.len(), "hits": hits })
+                json!({ "count": hits.len(), "mode": run_mode, "hits": hits })
             }
         }
         Cmd::Status => search::status(&index::open(&existing(index_path)?)?)?,

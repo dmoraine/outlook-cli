@@ -27,10 +27,6 @@ fn search_and_status_cli() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!((v["messages"].as_u64(), v["chunks"].as_u64()), (Some(0), Some(0)));
 
-    for mode in ["semantic", "hybrid"] {
-        let o = run(&["search", "x", "--mode", mode], &idx);
-        assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(2), "usage"), "{mode}");
-    }
     let o = run(&["search", "\" * ( -"], &idx);
     assert_eq!(o.status.code(), Some(2), "no word");
     let o = run(&["search", "budget \"NEAR(", "--format", "jsonl", "--has-attachments", "--excerpt-max", "50"], &idx);
@@ -141,5 +137,72 @@ fn scope_and_embed_cli() {
     }
     let o = run(&["sync", "--no-embed", "--model", "e5-base", "--file", "/nonexistent.ost"], &idx);
     assert_eq!(o.status.code(), Some(4), "flags accepted");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Search modes without a model: default, keyword fallback with a warning,
+/// model mismatch. Fictitious data only.
+#[test]
+fn search_modes_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-modes-cli-{}", std::process::id()));
+    let idx = dir.join("index.sqlite");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cmd = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_outlook-index"))
+            .args(args)
+            .arg("--index")
+            .arg(&idx)
+            .env("XDG_DATA_HOME", &dir)
+            .env("LOCALAPPDATA", &dir)
+            .env_remove("OUTLOOK_INDEX_MODEL_DIR")
+            .output()
+            .unwrap()
+    };
+    let ok = |o: &Output| -> (serde_json::Value, String) {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        (serde_json::from_slice(&o.stdout).unwrap(), String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+    let c = outlook_cli::index::open(&idx).unwrap();
+    let (v, err) = ok(&cmd(&["search", "budget"]));
+    assert_eq!((v["mode"].as_str(), err.as_str()), (Some("keyword"), ""), "no vectors: keyword, no warning");
+    for mode in ["semantic", "hybrid"] {
+        let (v, err) = ok(&cmd(&["search", "budget", "--mode", mode]));
+        let w: serde_json::Value = serde_json::from_str(err.trim()).unwrap();
+        assert_eq!((v["mode"].as_str(), w["warning"]["kind"].as_str()), (Some("keyword"), Some("keyword_fallback")));
+    }
+
+    // One fictitious message with an e5-small vector.
+    let m = outlook_cli::index::model::get("e5-small").unwrap();
+    c.execute_batch(
+        "INSERT INTO folders VALUES (34, 'SECRET_FOLDER', 'SECRET_FOLDER');
+         INSERT INTO messages(id, ident, received, has_attachments, subject) VALUES (1, 'mid:x', 0, 0, 'SECRET_SUBJECT');
+         INSERT INTO locations VALUES (36, 34, 1, 1);
+         INSERT INTO chunks(message, seq, text) VALUES (1, 0, 'SECRET_BODY budget');",
+    )
+    .unwrap();
+    let blob: Vec<u8> = (0..m.dims).flat_map(|i| f32::from(u8::from(i == 0)).to_le_bytes()).collect();
+    c.execute("INSERT INTO vectors VALUES (1, ?1, ?2, ?3)", rusqlite::params![m.name, m.revision, blob]).unwrap();
+    for (k, v) in [("embed_model", m.name), ("embed_revision", m.revision)] {
+        c.execute("INSERT OR REPLACE INTO meta VALUES (?1, ?2)", [k, v]).unwrap();
+    }
+    drop(c);
+
+    let o = cmd(&["search", "budget", "--model", "e5-base"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(2), "usage"), "{err}");
+    assert!(err.contains("e5-small") && !err.contains("SECRET") && !err.contains("budget"), "{err}");
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let o = cmd(&["search", "budget", "--mode", "semantic", "--model-dir", empty.to_str().unwrap()]);
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(3), "not_found"), "explicit mode needs the model");
+    // Default mode without model files: keyword, with a warning.
+    let (v, err) = ok(&cmd(&["search", "budget", "--model-dir", empty.to_str().unwrap()]));
+    assert_eq!((v["mode"].as_str(), v["count"].as_u64()), (Some("keyword"), Some(1)), "{v}");
+    assert!(err.contains("keyword_fallback") && !err.contains("SECRET"), "{err}");
+    let (v, _) = ok(&cmd(&["search", "budget", "--mode", "keyword", "--model", "e5-base"]));
+    assert_eq!(v["hits"][0]["ranks"], serde_json::json!({ "keyword": 1 }));
+    for bad in [&["search", "budget", "--mode", "fuzzy"][..], &["search", "budget", "--model", "e5-large"]] {
+        assert_eq!(cmd(bad).status.code(), Some(2), "{bad:?}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

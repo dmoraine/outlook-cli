@@ -183,12 +183,46 @@ change (usage error, counts only) unless `--allow-mass-delete` is passed. One sy
 stripped; the rest is cut into ~1750-character chunks with ~200 characters of overlap; each chunk keeps its character
 range in the stripped body.
 
-`search` (keyword only for now; `--mode semantic|hybrid` is a usage error until vector search lands) matches every word,
-accent- and case-insensitive (FTS5 `unicode61 remove_diacritics 2`), over subject and body. Query operators and
-quotes are plain words. Filters: `-F` folder name, or path with its subfolders (`Inbox` matches `Inbox/Projects`,
-not `Inboxes`; repeatable), `--since`/`--until`, `--from`, `--to`. One hit per message (its best chunk): `{id,
-message_id, folder, received, subject, from, excerpt, source, ranks, scores}`; `id` works with `outlook-cli get` until
-the message moves (then run `sync`). Excerpts: 300 characters by default, `--excerpt-max` up to 2000.
+`search` modes (`--mode`):
+
+- `keyword` matches every word, accent- and case-insensitive (FTS5 `unicode61 remove_diacritics 2`), over subject
+  and body. Query operators and quotes are plain words.
+- `semantic` embeds the query locally (`query: ` prefix, model of the stored vectors) and ranks the embedded chunks
+  by cosine similarity (brute force over the vectors, streamed from SQLite; no ANN index). It finds other wordings
+  and the other language (a French query finds an English mail). Only embedded chunks (the embedding scope) are
+  searched.
+- `hybrid` fuses the top 200 of an any-word keyword search (every query word, OR) and the top 200 semantic hits
+  by Reciprocal Rank Fusion (k = 60); each leg stays at 200 whatever `-n`, so at most their union is returned.
+  Messages outside the embedding scope are still found by their words.
+- Default: `hybrid` when the index holds vectors of its model, else `keyword`. `semantic`/`hybrid` with no such
+  vectors run `keyword` and print `{"warning":{"kind":"keyword_fallback",...}}` on stderr; so does the default mode
+  when the model files are missing (an explicit `--mode semantic|hybrid` is then a `not_found` error). `--model`
+  other than the model of the stored vectors is a usage error naming the expected model.
+
+```powershell
+outlook-index.exe search "budget café" -n 5 -F Inbox --since 30d --from alice   # hybrid once embedded
+outlook-index.exe search "facture impayée" --mode keyword                         # every word, exact
+outlook-index.exe search "unpaid invoice" --mode semantic                         # finds "Facture impayée"
+outlook-index.exe search "server outage" --mode hybrid --format jsonl
+```
+
+Filters apply to every mode: `-F` folder name, or path with its subfolders (`Inbox` matches `Inbox/Projects`, not
+`Inboxes`; repeatable), `--since`/`--until`, `--from`, `--to`, `--has-attachments`. Output: `{count, mode, hits}`
+(`--format jsonl`: one hit per line). One hit per message (its best chunk): `{id, message_id, folder, received,
+subject, from, excerpt, source, ranks, scores}`; `ranks`/`scores` hold `keyword` (bm25), `semantic` (cosine) and,
+in hybrid, `hybrid` and `rrf`, for the legs that found the message. Hybrid hits also carry `keyword_rank` and
+`semantic_rank` (`null` when that leg missed the message) and `score` (the RRF score). `id` works with `outlook-cli get` until the
+message moves (then run `sync`). Excerpts: 300 characters by default, `--excerpt-max` up to 2000; a keyword excerpt
+is a snippet around the words, a semantic one the start of the best chunk (without the overlap with the previous
+chunk).
+
+Latency (VPS, 4 vCPU, 3 threads, release build): a semantic or hybrid search loads the model first, which takes
+~1.4 s (SHA-256 check of the files included); the query embedding then takes ~30 ms. The vector scan is ~80 ms per
+50,000 vectors and ~320 ms per 200,000 (e5-small, warm page cache, linear in the number of vectors); a whole hybrid
+search ~0.17 s at 50,000 and ~0.7 s at 200,000 (worst case: every chunk matches a word). Measured with the ignored
+tests `semantic_bench` (synthetic index) and `real_e5_search` (30 fictitious French/English mails, cross-lingual
+hits in the top 3):
+`E5_SMALL_DIR=... cargo test --release --features index --lib -- --ignored --nocapture semantic_bench real_e5_search`.
 
 ### Embedding model (local, CPU)
 
