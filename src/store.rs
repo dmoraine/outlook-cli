@@ -42,6 +42,7 @@ pub mod tag {
     pub const ADDRTYPE: u16 = 0x3002;
     pub const EMAIL_ADDRESS: u16 = 0x3003;
     pub const CREATION_TIME: u16 = 0x3007;
+    pub const LAST_MODIFICATION_TIME: u16 = 0x3008;
     pub const CONTENT_COUNT: u16 = 0x3602;
     pub const CONTENT_UNREAD: u16 = 0x3603;
     pub const CONTAINER_CLASS: u16 = 0x3613;
@@ -438,6 +439,7 @@ impl Store {
             tc.col_id(tag::SENT_REPRESENTING_NAME),
             tc.col_id(tag::INTERNET_MESSAGE_ID),
             tc.col_id(tag::MESSAGE_SIZE),
+            tc.col_id(tag::LAST_MODIFICATION_TIME),
         ];
         tc.for_each_row(&mut |r| {
             let received = r.time(c[0]).or_else(|| r.time(c[1])).or_else(|| r.time(c[2])).unwrap_or(0);
@@ -448,6 +450,7 @@ impl Store {
                 submitted: r.time(c[1]).unwrap_or(0),
                 size: r.int(c[8]).unwrap_or(0),
                 flags: r.int(c[3]).unwrap_or(0),
+                modified: r.time(c[9]).unwrap_or(0),
                 subject: LazyStr(&|| r.str(c[4]).map(clean_subject)),
                 class: LazyStr(&|| r.str(c[5])),
                 from_name: LazyStr(&|| r.str(c[6])),
@@ -484,6 +487,8 @@ pub struct RowSummary<'f> {
     /// PR_MESSAGE_SIZE, 0 when absent.
     pub size: i64,
     pub flags: i64,
+    /// PR_LAST_MODIFICATION_TIME, 0 when absent.
+    pub modified: i64,
     pub subject: LazyStr<'f>,
     pub class: LazyStr<'f>,
     pub from_name: LazyStr<'f>,

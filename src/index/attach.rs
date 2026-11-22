@@ -143,6 +143,14 @@ pub fn phase(
                     continue;
                 }
             };
+            // Links to attachments no longer listed: removed from the source
+            // (`gc` below collects their content).
+            let idx: Vec<usize> = list.iter().map(|a| a.index).collect();
+            tx.execute(
+                "DELETE FROM message_attachments WHERE message = ?1 AND idx NOT IN (SELECT value FROM json_each(?2))",
+                params![id, serde_json::to_string(&idx).unwrap()],
+            )
+            .map_err(db_err)?;
             let mut done = true;
             for a in &list {
                 done &= one(&tx, src, x, &s, (id, nid), a, &mut st, &mut tried)?;
@@ -644,6 +652,87 @@ mod tests {
         run(&mut c, &mut f, &Options::default());
         assert_eq!(stored(&c), [0, 0, 0, 0, 0], "last reference gone");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM attachment_fts"), 0);
+    }
+
+    /// S1: attachments added, replaced and removed on an indexed message
+    /// (same Message-ID) are picked up with the message's refresh; its body
+    /// vector is kept while the body is unchanged; a stored content out of
+    /// the scope stays (B2); a content shared with another message survives.
+    #[test]
+    fn changed_attachments_refreshed() {
+        let (mut c, mut f) = (db(), mailbox());
+        f.add(0x604, 0x22, Some("<c1@fict.invalid>"), "Files", "See the files.");
+        f.add(0x624, 0x42, Some("<c2@fict.invalid>"), "Other", "Other files.");
+        f.attach(0x624, "shared.txt", None, false, b"Shared Frobisher notes");
+        run(&mut c, &mut f, &Options::default());
+        let m = crate::index::model::get("e5-small").unwrap();
+        c.execute(
+            "INSERT INTO vectors SELECT id, ?1, ?2, zeroblob(?3) FROM chunks",
+            params![m.name, m.revision, (m.dims * 4) as i64],
+        )
+        .unwrap();
+        for (k, v) in [("embed_model", m.name), ("embed_revision", m.revision)] {
+            set_meta(&c, k, v).unwrap();
+        }
+        let body_vec = |c: &Connection| {
+            count(
+                c,
+                "SELECT COUNT(*) FROM vectors v JOIN chunks ch ON ch.id = v.chunk JOIN messages m ON m.id = ch.message
+                 WHERE m.ident = 'mid:<c1@fict.invalid>'",
+            )
+        };
+        let links = |c: &Connection| {
+            count(
+                c,
+                "SELECT COUNT(*) FROM message_attachments a JOIN messages m ON m.id = a.message
+                 WHERE m.ident = 'mid:<c1@fict.invalid>'",
+            )
+        };
+        let flag =
+            |c: &Connection| count(c, "SELECT has_attachments FROM messages WHERE ident = 'mid:<c1@fict.invalid>'");
+        assert_eq!((body_vec(&c), links(&c), flag(&c)), (1, 0, 0));
+
+        // Added: a new file and one another message already carries.
+        f.attach(0x604, "plan.txt", None, false, b"Plan Gorblin draft");
+        f.attach(0x604, "shared.txt", None, false, b"Shared Frobisher notes");
+        let (s, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!(
+            (s["refreshed"].as_u64(), calls, s["attachments_deduplicated"].as_u64()),
+            (Some(1), 1, Some(1)),
+            "{s}"
+        );
+        assert_eq!((links(&c), flag(&c), fts(&c, "gorblin")), (2, 1, 1));
+        assert_eq!(body_vec(&c), 1, "unchanged body: its vector is reused");
+
+        // Replaced (same name, other file): the old content goes.
+        f.replace(0x604, 0, b"Plan Hexwold final version");
+        let (s, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((s["refreshed"].as_u64(), calls), (Some(1), 1), "{s}");
+        assert_eq!((fts(&c, "gorblin"), fts(&c, "hexwold"), links(&c)), (0, 1, 2));
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM attachment_contents"), 2);
+
+        // Removed: the shared file stays for the other message.
+        f.detach(0x604, 1);
+        let (s, _) = run(&mut c, &mut f, &Options::default());
+        assert_eq!(s["refreshed"], 1, "{s}");
+        assert_eq!((links(&c), fts(&c, "frobisher"), fts(&c, "hexwold")), (1, 1, 1));
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM attachment_contents"), 2);
+
+        // Body edited under a narrowed scope: the stored TXT is kept (B2).
+        set_scope(&c, &Scope { types: vec![Kind::Pdf], ..Scope::default() }).unwrap();
+        f.edit(0x604, "See the file, edited.");
+        let (s, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((s["refreshed"].as_u64(), calls), (Some(1), 0), "{s}");
+        assert_eq!((links(&c), fts(&c, "hexwold"), body_vec(&c)), (1, 1, 0));
+        assert_eq!(counts(&c).unwrap()["out_of_scope"], 2);
+        set_scope(&c, &Scope::default()).unwrap();
+
+        // Last file removed: the flag clears, the link and content go.
+        f.detach(0x604, 0);
+        let (s, _) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((s["refreshed"].as_u64(), s["complete"].as_bool()), (Some(1), Some(true)), "{s}");
+        assert_eq!((links(&c), flag(&c), fts(&c, "hexwold"), fts(&c, "frobisher")), (0, 0, 0, 1));
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM attachment_contents"), 1);
     }
 
     #[test]

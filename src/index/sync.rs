@@ -27,6 +27,8 @@ pub struct Entry {
     pub submitted: i64,
     pub size: i64,
     pub flags: i64,
+    /// PR_LAST_MODIFICATION_TIME, 0 when absent.
+    pub modified: i64,
     pub class: Option<String>,
     pub subject: Option<String>,
     pub sender: Option<String>,
@@ -81,6 +83,7 @@ impl MailSource for StoreSource {
                     submitted: r.submitted,
                     size: r.size,
                     flags: r.flags,
+                    modified: r.modified,
                     class: r.class.get(),
                     subject: r.subject.get(),
                     sender: r.from_name.get(),
@@ -173,8 +176,28 @@ pub fn identity(e: &Entry) -> String {
     }
 }
 
+/// Change signature of a message, from its contents-table row only:
+/// modification time, size, attachment flag and subject. An edit, an added,
+/// removed or replaced attachment changes it; read/unread, a move or a copy
+/// does not.
+pub fn signature(e: &Entry) -> String {
+    format!(
+        "{:x}:{}:{}:{}",
+        e.modified,
+        e.size,
+        u8::from(e.flags & MSGFLAG_HASATTACH != 0),
+        e.subject.as_deref().unwrap_or("")
+    )
+}
+
+/// A message to open: new (identity, rows) or changed (stored id, row).
+enum Work {
+    New(String, Vec<Entry>),
+    Refresh(i64, Entry),
+}
+
 pub struct Options {
-    /// New messages per transaction.
+    /// New and changed messages per transaction.
     pub batch: usize,
     /// Stop (resumable) after the first batch that ends past this budget.
     pub max_time: Option<Duration>,
@@ -225,13 +248,15 @@ pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut Ex
     sync_with_progress(c, src, x, o, &mut Progress::none())
 }
 
-/// Reconcile the index with `src`: new, deleted, moved/copied messages and
-/// flag changes. Only new messages are opened. New messages are committed in
-/// batches, so an interrupted run resumes where it stopped. Then, with `x`,
-/// the attachment phase (`attach::phase`), in batches too. Returns a
-/// count-only summary (no content, no names). Phases `scan` (folders, not
-/// stored: the mass-deletion guard writes nothing), `index` (new messages)
-/// and `attachments` go to `p`, stored in each batch transaction.
+/// Reconcile the index with `src`: new, changed (`signature`), deleted,
+/// moved/copied messages and flag changes. Only new and changed messages are
+/// opened, committed in batches (a changed one keeps its old content and
+/// signature until its batch commits), so an interrupted run resumes where
+/// it stopped. Then, with `x`, the attachment phase (`attach::phase`), in
+/// batches too. Returns a count-only summary (no content, no names). Phases
+/// `scan` (folders, not stored: the mass-deletion guard writes nothing),
+/// `index` (new and changed messages) and `attachments` go to `p`, stored in
+/// each batch transaction.
 pub fn sync_with_progress(
     c: &mut Connection,
     src: &mut dyn MailSource,
@@ -299,7 +324,7 @@ pub fn sync_with_progress(
 
     // "moved" counts new locations of known messages (moves and copies).
     let (mut moved, mut flags_changed) = (0u64, 0u64);
-    let mut fresh = Vec::new();
+    let mut work = Vec::new();
     let tx = c.transaction().map_err(db_err)?;
     // Mass-deletion guard, before any write: an indexed message is deleted
     // when its identity is gone from the scan (a vanished folder, a bad read).
@@ -334,15 +359,29 @@ pub fn sync_with_progress(
             .collect::<rusqlite::Result<_>>()
             .map_err(db_err)?;
         let mut seen: HashSet<Nid> = HashSet::new();
-        let mut find = tx.prepare("SELECT id FROM messages WHERE ident = ?1").map_err(db_err)?;
+        let mut find = tx.prepare("SELECT id, signature FROM messages WHERE ident = ?1").map_err(db_err)?;
+        let mut adopt = tx.prepare("UPDATE messages SET signature = ?2 WHERE id = ?1").map_err(db_err)?;
         let mut put = tx
             .prepare("INSERT OR REPLACE INTO locations(nid, folder, message, flags) VALUES (?1, ?2, ?3, ?4)")
             .map_err(db_err)?;
         for (ident, group) in groups {
-            let Some(id) = find.query_row([&ident], |r| r.get::<_, i64>(0)).optional().map_err(db_err)? else {
-                fresh.push((ident, group));
+            let found = find
+                .query_row([&ident], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))
+                .optional()
+                .map_err(db_err)?;
+            let Some((id, stored)) = found else {
+                work.push(Work::New(ident, group));
                 continue;
             };
+            // Unchanged while one copy still has the stored signature. NULL
+            // (indexed before signatures): adopted, not opened.
+            match stored {
+                None => {
+                    adopt.execute(params![id, signature(&group[0])]).map_err(db_err)?;
+                }
+                Some(s) if group.iter().any(|e| signature(e) == s) => {}
+                Some(_) => work.push(Work::Refresh(id, group[0].clone())),
+            }
             for e in &group {
                 seen.insert(e.nid);
                 match old.get(&e.nid) {
@@ -383,21 +422,24 @@ pub fn sync_with_progress(
     };
     set_meta(&tx, "include_folders", &serde_json::to_string(&inc).unwrap())?;
     set_meta(&tx, "sync_complete", "0")?;
-    p.phase(Some(&tx), "index", fresh.len() as u64)?;
+    p.phase(Some(&tx), "index", work.len() as u64)?;
     tx.commit().map_err(db_err)?;
 
-    let (mut new, mut chunks, mut errors) = (0u64, 0u64, BTreeMap::<&'static str, u64>::new());
+    let (mut new, mut refreshed, mut chunks, mut errors) = (0u64, 0u64, 0u64, BTreeMap::<&'static str, u64>::new());
     let (mut interrupted, mut batches, mut done) = (false, 0, 0u64);
-    let mut pending = fresh.into_iter().peekable();
+    let mut pending = work.into_iter().peekable();
     while pending.peek().is_some() {
         if batches > 0 && o.max_time.is_some_and(|m| start.elapsed() > m) {
             interrupted = true;
             break;
         }
         let tx = c.transaction().map_err(db_err)?;
-        for (ident, group) in pending.by_ref().take(o.batch.max(1)) {
+        for w in pending.by_ref().take(o.batch.max(1)) {
             done += 1;
-            let e = &group[0];
+            let e = match &w {
+                Work::New(_, group) => &group[0],
+                Work::Refresh(_, e) => e,
+            };
             let m = match src.open(e.nid) {
                 Ok(m) => m,
                 Err(err) => {
@@ -405,48 +447,16 @@ pub fn sync_with_progress(
                     continue;
                 }
             };
-            tx.execute(
-                "INSERT INTO messages(ident, message_id, received, sent, size, class, has_attachments, subject, sender,
-                                      from_name, from_email, display_to, display_cc)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    ident,
-                    e.message_id,
-                    e.received,
-                    (e.submitted > 0).then_some(e.submitted),
-                    e.size,
-                    e.class,
-                    e.flags & MSGFLAG_HASATTACH != 0,
-                    e.subject,
-                    e.sender,
-                    m.from_name,
-                    m.from_email,
-                    m.to,
-                    m.cc
-                ],
-            )
-            .map_err(db_err)?;
-            let id = tx.last_insert_rowid();
-            for l in &group {
-                tx.execute(
-                    "INSERT OR REPLACE INTO locations(nid, folder, message, flags) VALUES (?1, ?2, ?3, ?4)",
-                    params![l.nid, l.folder, id, l.flags],
-                )
-                .map_err(db_err)?;
-            }
-            let body = m.text.as_deref().map(strip_quotes).unwrap_or_default();
-            // At least one (maybe empty) chunk, so the subject is searchable.
-            let parts = chunk(&body);
-            let parts = if parts.is_empty() { vec![(String::new(), 0..0)] } else { parts };
-            for (seq, (t, r)) in parts.iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO chunks(message, seq, text, start_char, end_char) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![id, seq as i64, t, r.start as i64, r.end as i64],
-                )
-                .map_err(db_err)?;
-                chunks += 1;
-            }
-            new += 1;
+            chunks += match &w {
+                Work::New(ident, group) => {
+                    new += 1;
+                    insert(&tx, ident, group, &m)?
+                }
+                Work::Refresh(id, e) => {
+                    refreshed += 1;
+                    refresh(&tx, *id, e, &m)?
+                }
+            };
         }
         p.update(Some(&tx), done)?;
         tx.commit().map_err(db_err)?;
@@ -477,6 +487,7 @@ pub fn sync_with_progress(
         "excluded_folders": excluded.len(),
         "include": inc,
         "new": new,
+        "refreshed": refreshed,
         "deleted": deleted,
         "excluded_removed": excluded_removed,
         "moved": moved,
@@ -506,6 +517,123 @@ pub fn sync_with_progress(
     o.insert("attachments_remaining".into(), json!(att_remaining));
     set_meta(c, "sync_last", &summary.to_string())?;
     Ok(summary)
+}
+
+/// Store a new message, its locations and its body chunks; returns the chunk count.
+fn insert(tx: &Connection, ident: &str, group: &[Entry], m: &Opened) -> Result<u64> {
+    let e = &group[0];
+    tx.execute(
+        "INSERT INTO messages(ident, message_id, received, sent, size, class, has_attachments, subject, sender,
+                              from_name, from_email, display_to, display_cc, signature)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            ident,
+            e.message_id,
+            e.received,
+            (e.submitted > 0).then_some(e.submitted),
+            e.size,
+            e.class,
+            e.flags & MSGFLAG_HASATTACH != 0,
+            e.subject,
+            e.sender,
+            m.from_name,
+            m.from_email,
+            m.to,
+            m.cc,
+            signature(e)
+        ],
+    )
+    .map_err(db_err)?;
+    let id = tx.last_insert_rowid();
+    for l in group {
+        tx.execute(
+            "INSERT OR REPLACE INTO locations(nid, folder, message, flags) VALUES (?1, ?2, ?3, ?4)",
+            params![l.nid, l.folder, id, l.flags],
+        )
+        .map_err(db_err)?;
+    }
+    add_chunks(tx, id, m, &HashMap::new())
+}
+
+/// A stored vector: model, revision, blob.
+type Vector = (String, String, Vec<u8>);
+
+/// Re-read message `id` (signature changed): metadata, body chunks and FTS
+/// rows replaced; a chunk whose passage (subject and text) is unchanged keeps
+/// its vectors, the others wait for `embed`. The attachments are read again
+/// by the attachment phase; with the attachment flag gone, their links go
+/// now (`attach::gc` collects contents left without a link).
+fn refresh(tx: &Connection, id: i64, e: &Entry, m: &Opened) -> Result<u64> {
+    let subject: Option<String> =
+        tx.query_row("SELECT subject FROM messages WHERE id = ?1", [id], |r| r.get(0)).map_err(db_err)?;
+    let mut keep: HashMap<String, Vec<Vector>> = HashMap::new();
+    if subject == e.subject {
+        let mut st = tx
+            .prepare("SELECT c.text, v.model, v.revision, v.vec FROM chunks c JOIN vectors v ON v.chunk = c.id WHERE c.message = ?1")
+            .map_err(db_err)?;
+        let mut rows = st.query([id]).map_err(db_err)?;
+        while let Some(r) = rows.next().map_err(db_err)? {
+            keep.entry(r.get(0).map_err(db_err)?).or_default().push((
+                r.get(1).map_err(db_err)?,
+                r.get(2).map_err(db_err)?,
+                r.get(3).map_err(db_err)?,
+            ));
+        }
+    }
+    // Before the subject changes: the FTS delete needs the indexed values.
+    tx.execute("DELETE FROM chunks WHERE message = ?1", [id]).map_err(db_err)?;
+    let has_attachments = e.flags & MSGFLAG_HASATTACH != 0;
+    if !has_attachments && tx.execute("DELETE FROM message_attachments WHERE message = ?1", [id]).map_err(db_err)? > 0 {
+        attach::gc(tx)?;
+    }
+    tx.execute(
+        "UPDATE messages SET received = ?2, sent = ?3, size = ?4, class = ?5, has_attachments = ?6, subject = ?7,
+                sender = ?8, from_name = ?9, from_email = ?10, display_to = ?11, display_cc = ?12, signature = ?13,
+                attachments_done = NULL
+         WHERE id = ?1",
+        params![
+            id,
+            e.received,
+            (e.submitted > 0).then_some(e.submitted),
+            e.size,
+            e.class,
+            has_attachments,
+            e.subject,
+            e.sender,
+            m.from_name,
+            m.from_email,
+            m.to,
+            m.cc,
+            signature(e)
+        ],
+    )
+    .map_err(db_err)?;
+    add_chunks(tx, id, m, &keep)
+}
+
+/// Chunk the body of message `id` (at least one, maybe empty, chunk: the
+/// subject stays searchable); a chunk whose text is in `keep` gets those
+/// vectors back. Returns the chunk count.
+fn add_chunks(tx: &Connection, id: i64, m: &Opened, keep: &HashMap<String, Vec<Vector>>) -> Result<u64> {
+    let body = m.text.as_deref().map(strip_quotes).unwrap_or_default();
+    let parts = chunk(&body);
+    let parts = if parts.is_empty() { vec![(String::new(), 0..0)] } else { parts };
+    for (seq, (t, r)) in parts.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO chunks(message, seq, text, start_char, end_char) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, seq as i64, t, r.start as i64, r.end as i64],
+        )
+        .map_err(db_err)?;
+        let chunk = tx.last_insert_rowid();
+        for (model, revision, vec) in keep.get(t).into_iter().flatten() {
+            tx.execute(
+                "INSERT OR IGNORE INTO vectors(chunk, model, revision, vec) VALUES (?1, ?2, ?3, ?4)",
+                params![chunk, model, revision, vec],
+            )
+            .map_err(db_err)?;
+        }
+    }
+    Ok(parts.len() as u64)
 }
 
 /// Index-wide counts.
@@ -539,7 +667,12 @@ pub mod fake {
         /// Attachment lists read, and attachment data read (NID, index).
         pub listed: Vec<Nid>,
         pub reads: Vec<(Nid, usize)>,
+        /// Opening this NID panics (a killed sync, mid-batch).
+        pub panic_on: Option<Nid>,
     }
+
+    /// Modification time of a message as added.
+    pub const MODIFIED0: i64 = 134_100_000_000_000_000;
 
     pub fn folder(nid: Nid, path: &str) -> Folder {
         Folder {
@@ -564,6 +697,7 @@ pub mod fake {
                 submitted: 134_000_000_000_000_000 + nid as i64,
                 size: 1000 + body.len() as i64,
                 flags: 1,
+                modified: MODIFIED0,
                 class: Some("IPM.Note".into()),
                 subject: Some(subject.into()),
                 sender: Some("Zed Fict".into()),
@@ -582,7 +716,10 @@ pub mod fake {
             inline: bool,
             data: &[u8],
         ) -> &mut Attachment {
-            self.entries.iter_mut().find(|e| e.nid == nid).unwrap().flags |= MSGFLAG_HASATTACH;
+            let e = self.entries.iter_mut().find(|e| e.nid == nid).unwrap();
+            e.flags |= MSGFLAG_HASATTACH;
+            e.size += data.len() as i64;
+            e.modified += 1;
             let v = self.files.entry(nid).or_default();
             let a = Attachment {
                 index: v.len(),
@@ -616,6 +753,50 @@ pub mod fake {
             self.entries.retain(|e| e.nid != nid);
             self.revision += 1;
         }
+
+        /// The message's row, by NID.
+        pub fn entry(&mut self, nid: Nid) -> &mut Entry {
+            self.entries.iter_mut().find(|e| e.nid == nid).unwrap()
+        }
+
+        /// Edited in place (same NID, same Message-ID): new body, size and
+        /// modification time.
+        pub fn edit(&mut self, nid: Nid, body: &str) {
+            let old = self.bodies.insert(nid, body.into()).unwrap();
+            let e = self.entry(nid);
+            e.size += body.len() as i64 - old.len() as i64;
+            e.modified += 1;
+            self.revision += 1;
+        }
+
+        /// Attachment `index` of `nid` removed; the next ones shift down.
+        pub fn detach(&mut self, nid: Nid, index: usize) {
+            let v = self.files.get_mut(&nid).unwrap();
+            let (_, data) = v.remove(index);
+            for (i, (a, _)) in v.iter_mut().enumerate() {
+                a.index = i;
+            }
+            let empty = v.is_empty();
+            let e = self.entry(nid);
+            e.size -= data.len() as i64;
+            e.modified += 1;
+            if empty {
+                e.flags &= !MSGFLAG_HASATTACH;
+            }
+            self.revision += 1;
+        }
+
+        /// Attachment `index` of `nid` replaced by another file of the same name.
+        pub fn replace(&mut self, nid: Nid, index: usize, data: &[u8]) {
+            let (a, d) = &mut self.files.get_mut(&nid).unwrap()[index];
+            let delta = data.len() as i64 - d.len() as i64;
+            a.size = Some(data.len() as i64);
+            *d = data.to_vec();
+            let e = self.entry(nid);
+            e.size += delta;
+            e.modified += 1;
+            self.revision += 1;
+        }
     }
 
     impl MailSource for Fake {
@@ -629,6 +810,7 @@ pub mod fake {
             Ok(self.entries.iter().filter(|e| e.folder == folder).cloned().collect())
         }
         fn open(&mut self, nid: Nid) -> Result<Opened> {
+            assert_ne!(self.panic_on, Some(nid), "fake: killed while opening");
             self.opened.push(nid);
             let text = self.bodies.get(&nid).cloned().ok_or_else(|| Error::NotFound("message".into()))?;
             let sender = self.entries.iter().find(|e| e.nid == nid).and_then(|e| e.sender.clone());
@@ -1030,5 +1212,276 @@ mod tests {
         for m in ["SECRET", "Zed", "fict", "Budget", "Inbox", "Archive"] {
             assert!(!s.contains(m), "sync summary leaks {m:?}: {s}");
         }
+    }
+
+    // S1: refresh of changed messages.
+
+    /// Four paragraphs, several chunks; paragraph 3 says `last`.
+    fn long_body(last: &str) -> String {
+        let mut p: Vec<String> =
+            (0..3).map(|i| format!("Paragraph {i}. {}", format!("filler{i} ").repeat(110))).collect();
+        p.push(format!("Paragraph 3. {last}"));
+        p.join("\n\n")
+    }
+
+    /// Fake vectors for every body chunk: the blob is the chunk text, so a
+    /// reused vector can be traced to its text.
+    fn embed_all(c: &Connection) {
+        let m = crate::index::model::get("e5-small").unwrap();
+        c.execute(
+            "INSERT OR IGNORE INTO vectors SELECT id, ?1, ?2, CAST(text AS BLOB) FROM chunks",
+            params![m.name, m.revision],
+        )
+        .unwrap();
+        set_meta(c, "embed_model", m.name).unwrap();
+        set_meta(c, "embed_revision", m.revision).unwrap();
+    }
+
+    /// (chunk text, vector blob) of a message, in order.
+    fn chunk_vectors(c: &Connection, ident: &str) -> Vec<(String, Option<Vec<u8>>)> {
+        c.prepare(
+            "SELECT c.text, v.vec FROM chunks c JOIN messages m ON m.id = c.message
+             LEFT JOIN vectors v ON v.chunk = c.id WHERE m.ident = ?1 ORDER BY c.seq",
+        )
+        .unwrap()
+        .query_map([ident], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn fts(c: &Connection, q: &str) -> i64 {
+        count(c, &format!("SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH '{q}'"))
+    }
+
+    fn fts_consistent(c: &Connection) {
+        c.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES ('integrity-check', 1)", []).unwrap();
+        assert_eq!(
+            count(c, "SELECT COUNT(*) FROM chunks c LEFT JOIN messages m ON m.id = c.message WHERE m.id IS NULL"),
+            0
+        );
+    }
+
+    #[test]
+    fn edited_body_refreshes_text_and_reuses_unchanged_vectors() {
+        let (mut c, mut f) = (db(), mailbox());
+        const ID: &str = "mid:<e1@fict.invalid>";
+        f.add(0x604, 0x22, Some("<e1@fict.invalid>"), "Report", &long_body("Original Quorvex ending."));
+        run(&mut c, &mut f);
+        embed_all(&c);
+        let before = chunk_vectors(&c, ID);
+        assert!(before.len() >= 3 && before.iter().all(|(_, v)| v.is_some()), "{before:?}");
+        let id = count(&c, &format!("SELECT id FROM messages WHERE ident = '{ID}'"));
+        let opened = f.opened.len();
+
+        // Same Message-ID, same NID: the last paragraph and the sender change.
+        f.edit(0x604, &long_body("Edited Zanthorpe ending, much longer than before."));
+        f.entry(0x604).sender = Some("Yan Fict".into());
+        let s = run(&mut c, &mut f);
+        assert_eq!(
+            (s["refreshed"].as_u64(), s["new"].as_u64(), s["complete"].as_bool()),
+            (Some(1), Some(0), Some(true)),
+            "{s}"
+        );
+        assert_eq!(f.opened[opened..], [0x604], "the edited message is opened again, alone");
+        assert_eq!(count(&c, &format!("SELECT id FROM messages WHERE ident = '{ID}'")), id, "same message row");
+        let size = f.entries.iter().find(|e| e.nid == 0x604).unwrap().size;
+        assert_eq!(count(&c, &format!("SELECT size FROM messages WHERE id = {id}")), size);
+        let from: String = c.query_row("SELECT from_name FROM messages WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(from, "Yan Fict", "metadata refreshed");
+        assert_eq!((fts(&c, "zanthorpe"), fts(&c, "quorvex")), (1, 0), "FTS follows the new text");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM locations WHERE nid = 0x604"), 1);
+        fts_consistent(&c);
+
+        // Unchanged chunk texts keep their own vector; the changed one is pending.
+        let old: HashMap<String, Vec<u8>> = before.into_iter().map(|(t, v)| (t, v.unwrap())).collect();
+        let after = chunk_vectors(&c, ID);
+        let (mut reused, mut pending) = (0, 0);
+        for (t, v) in &after {
+            match old.get(t) {
+                Some(o) => {
+                    assert_eq!(v.as_ref(), Some(o), "vector of {t:.20}… reused");
+                    reused += 1;
+                }
+                None => {
+                    assert_eq!(v, &None, "changed chunk must be embedded again");
+                    pending += 1;
+                }
+            }
+        }
+        assert!(reused >= 2 && pending == 1, "reused {reused}, pending {pending}");
+        assert_eq!(crate::index::vectors::counts(&c).unwrap()["pending"], 1);
+
+        // Nothing changed since: no refresh, no open.
+        f.revision += 1;
+        let s = run(&mut c, &mut f);
+        assert_eq!((s["refreshed"].as_u64(), f.opened.len()), (Some(0), opened + 1), "{s}");
+
+        // Same length edit: the modification time alone tells.
+        let body = long_body("Edited Zanthorpe ending, much longer than before.").replace("Zanthorpe", "Yelbranx!");
+        f.edit(0x604, &body);
+        assert_eq!(f.entry(0x604).size, size, "same size");
+        assert_eq!(run(&mut c, &mut f)["refreshed"], 1);
+        assert_eq!((fts(&c, "yelbranx"), fts(&c, "zanthorpe")), (1, 0));
+
+        // New subject: in every passage, so no vector of the message is kept.
+        f.entry(0x604).subject = Some("Renamed Wexplod".into());
+        f.revision += 1;
+        assert_eq!(run(&mut c, &mut f)["refreshed"], 1);
+        assert_eq!((fts(&c, "wexplod"), fts(&c, "report")), (chunk_vectors(&c, ID).len() as i64, 0));
+        assert!(chunk_vectors(&c, ID).iter().all(|(_, v)| v.is_none()));
+        fts_consistent(&c);
+    }
+
+    #[test]
+    fn flag_move_and_copy_do_not_reopen() {
+        let (mut c, mut f) = (db(), mailbox());
+        run(&mut c, &mut f);
+        embed_all(&c);
+        let vectors = count(&c, "SELECT COUNT(*) FROM vectors");
+        f.entry(0x224).flags = 0;
+        f.relocate(0x204, 0x284, 0x42);
+        f.add(0x2a4, 0x42, Some("<a2@fict.invalid>"), "Lunch", "Lunch on friday at noon.");
+        let s = run(&mut c, &mut f);
+        assert_eq!(
+            (s["refreshed"].as_u64(), s["new"].as_u64(), s["moved"].as_u64(), s["flags_changed"].as_u64()),
+            (Some(0), Some(0), Some(2), Some(1)),
+            "{s}"
+        );
+        assert_eq!(f.opened.len(), 3, "nothing opened again");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM vectors"), vectors);
+    }
+
+    /// Messages indexed before the signature existed (NULL) adopt the
+    /// current one without being opened: an edit made before the upgrade is
+    /// not picked up; one made after is.
+    #[test]
+    fn null_signature_adopted_without_open() {
+        let (mut c, mut f) = (db(), mailbox());
+        run(&mut c, &mut f);
+        c.execute("UPDATE messages SET signature = NULL", []).unwrap();
+        f.edit(0x204, "Edited before the upgrade.");
+        let s = run(&mut c, &mut f);
+        assert_eq!((s["refreshed"].as_u64(), f.opened.len()), (Some(0), 3), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages WHERE signature IS NULL"), 0, "adopted");
+        assert_eq!(fts(&c, "upgrade"), 0, "documented limitation");
+        f.edit(0x204, "Edited after the upgrade.");
+        assert_eq!(run(&mut c, &mut f)["refreshed"], 1);
+        assert_eq!(fts(&c, "upgrade"), 1);
+    }
+
+    /// An index at the schema before the signature (HEAD 62c4675: 6
+    /// migrations) with body and attachment vectors: the migration adds a
+    /// NULL signature and keeps every vector; the first sync adopts the
+    /// signatures without opening or embedding anything.
+    #[test]
+    fn signature_migration_keeps_vectors() {
+        use crate::index::MIGRATIONS;
+        let (mut c, mut f) = (db(), mailbox());
+        run(&mut c, &mut f);
+        embed_all(&c);
+        c.execute_batch(
+            "INSERT INTO attachment_contents(sha256, kind, size, outcome, extracted_at) VALUES ('s', 'txt', 3, 'ok', 0);
+             INSERT INTO message_attachments(message, idx, name, sha256) VALUES (1, 0, 'a.txt', 's');
+             INSERT INTO attachment_chunks(id, sha256, seq, text) VALUES (1, 's', 0, 'one');
+             INSERT INTO attachment_vectors VALUES (1, 'e5-small', 'r', x'0102');
+             ALTER TABLE messages DROP COLUMN signature;",
+        )
+        .unwrap();
+        c.execute("DELETE FROM schema_version WHERE version > 6", []).unwrap();
+        let cols = |c: &Connection| -> Vec<String> {
+            c.prepare("SELECT name FROM pragma_table_info('messages')")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let v6 = Connection::open_in_memory().unwrap();
+        v6.execute_batch(&MIGRATIONS[..6].join(";\n")).unwrap();
+        assert_eq!(cols(&c), cols(&v6), "the schema of HEAD 62c4675");
+        let vecs = |c: &Connection| {
+            c.query_row(
+                "SELECT (SELECT group_concat(chunk || hex(vec)) FROM vectors),
+                        (SELECT group_concat(chunk || hex(vec)) FROM attachment_vectors)",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap()
+        };
+        let before = vecs(&c);
+        migrate(&mut c).unwrap();
+        assert_eq!(crate::index::schema_version(&c).unwrap(), MIGRATIONS.len());
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages WHERE signature IS NULL"), 3);
+        assert_eq!(vecs(&c), before, "vectors kept by the migration");
+        f.revision += 1;
+        let s = run(&mut c, &mut f);
+        assert_eq!((s["refreshed"].as_u64(), f.opened.len()), (Some(0), 3), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages WHERE signature IS NULL"), 0);
+        assert_eq!(vecs(&c), before, "vectors kept by the first sync");
+    }
+
+    /// Refreshes go in batches: `--max-time` stops between them, a failed
+    /// open or a kill mid-batch leaves the old content and the old
+    /// signature, and the next sync resumes.
+    #[test]
+    fn refresh_interrupted_then_resumed() {
+        let (mut c, mut f) = (db(), mailbox());
+        let nids: Vec<Nid> = (0..7u32).map(|i| 0x1004 + i * 0x20).collect();
+        for (i, n) in nids.iter().enumerate() {
+            f.add(*n, 0x22, Some(&format!("<b{i}@fict.invalid>")), "Bulk", &format!("Bulk text {i}."));
+        }
+        run(&mut c, &mut f);
+        for n in &nids {
+            f.edit(*n, "Quillbrand edit.");
+        }
+        let o = Options { batch: 4, max_time: Some(Duration::ZERO), ..Options::default() };
+        let s = sync(&mut c, &mut f, &o).unwrap();
+        assert_eq!(
+            (s["refreshed"].as_u64(), s["complete"].as_bool(), s["remaining"].as_u64()),
+            (Some(4), Some(false), Some(3)),
+            "{s}"
+        );
+        assert_eq!(fts(&c, "quillbrand"), 4, "one committed batch");
+        fts_consistent(&c);
+
+        // Killed while opening the 2nd message of the next batch: rolled back.
+        f.panic_on = Some(nids[5]);
+        let snap = snapshot(&c);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sync(&mut c, &mut f, &Options::default())));
+        assert!(r.is_err());
+        assert_eq!(snapshot(&c).lines().take(4).collect::<Vec<_>>(), snap.lines().take(4).collect::<Vec<_>>());
+        assert_eq!(fts(&c, "quillbrand"), 4);
+        f.panic_on = None;
+
+        // A failed open: counted, old content kept, retried.
+        let body = f.bodies.remove(&nids[6]).unwrap();
+        let s = run(&mut c, &mut f);
+        assert_eq!(
+            (s["refreshed"].as_u64(), s["failed"].as_u64(), s["complete"].as_bool()),
+            (Some(2), Some(1), Some(false)),
+            "{s}"
+        );
+        assert_eq!((fts(&c, "quillbrand"), fts(&c, "\"text 6\"")), (6, 1));
+        f.bodies.insert(nids[6], body);
+        let s = run(&mut c, &mut f);
+        assert_eq!((s["refreshed"].as_u64(), s["complete"].as_bool()), (Some(1), Some(true)), "{s}");
+        assert_eq!(fts(&c, "quillbrand"), 7);
+        assert_eq!(run(&mut c, &mut f)["unchanged"], true);
+        fts_consistent(&c);
+    }
+
+    #[test]
+    fn mass_delete_guard_blocks_refreshes() {
+        let (mut c, mut f) = (db(), bulk(150));
+        run(&mut c, &mut f);
+        f.edit(0x204, "Edited Brumwick text.");
+        f.folders.retain(|x| x.nid != 0x42);
+        let (before, opened) = (snapshot(&c), f.opened.len());
+        assert_eq!(sync(&mut c, &mut f, &Options::default()).unwrap_err().kind(), "usage");
+        assert_eq!((snapshot(&c), f.opened.len()), (before, opened), "nothing refreshed or opened");
+        let s = sync(&mut c, &mut f, &Options { allow_mass_delete: true, ..Options::default() }).unwrap();
+        assert_eq!((s["refreshed"].as_u64(), s["deleted"].as_u64()), (Some(1), Some(151)), "{s}");
+        assert_eq!(fts(&c, "brumwick"), 1);
     }
 }

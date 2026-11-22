@@ -249,13 +249,24 @@ outlook-index sync --no-embed                         # indexation seule
 outlook-index sync --no-attachments                   # sans les pièces jointes ; un sync ultérieur rattrape
 ```
 
-`sync` réconcilie entièrement l'index avec les tables de contenus des dossiers : messages nouveaux, supprimés,
-déplacés/copiés, changements lu/non lu. Seuls les nouveaux messages sont ouverts. Un message est identifié par son
-Message-ID Internet, sinon par une empreinte (expéditeur, date d'envoi, sujet, taille) ; le même message dans deux
-dossiers est indexé une fois. Rien n'est fait si le fichier n'a pas changé depuis le dernier sync complet. Les
-messages sont validés par lots : `Ctrl-C` ou `--max-time` ne perdent que le lot en cours, le sync suivant reprend.
-Un sync qui supprimerait plus de max(100, 20 %) des messages indexés s'arrête sans rien changer (erreur `usage`),
-sauf avec `--allow-mass-delete`.
+`sync` réconcilie entièrement l'index avec les tables de contenus des dossiers : messages nouveaux, modifiés,
+supprimés, déplacés/copiés, changements lu/non lu. Seuls les messages nouveaux ou modifiés sont ouverts. Un message est
+identifié par son Message-ID Internet, sinon par une empreinte (expéditeur, date d'envoi, sujet, taille) ; le même
+message dans deux dossiers est indexé une fois. Rien n'est fait si le fichier n'a pas changé depuis le dernier sync
+complet. Les messages sont validés par lots : `Ctrl-C` ou `--max-time` ne perdent que le lot en cours, le sync
+suivant reprend. Un sync qui supprimerait plus de max(100, 20 %) des messages indexés s'arrête sans rien changer
+(erreur `usage`), sauf avec `--allow-mass-delete`.
+
+Messages modifiés : chaque message garde une signature lue dans la table de contenus, sans l'ouvrir (date de
+dernière modification, taille, indicateur de pièces jointes, sujet). Si elle change (texte modifié, pièce jointe
+ajoutée, retirée ou remplacée), le message est relu (compteur `refreshed`) : métadonnées, chunks et index plein texte
+remplacés dans la transaction de son lot ; un chunk dont le texte (et le sujet) n'a pas changé garde son vecteur,
+seuls les chunks nouveaux ou modifiés sont à embedder. Ses pièces jointes sont relues : liens mis à jour, contenus
+qui ne sont plus référencés supprimés, contenus stockés mais hors portée conservés. Lu/non lu, déplacement et copie
+ne changent pas la signature : rien n'est rouvert. Un message dont une copie a encore la signature stockée n'est pas
+relu. Index créé avant cette version : le premier sync adopte la signature actuelle sans rouvrir les messages ; une
+modification faite avant la mise à jour n'est donc pas reprise (une suivante l'est). Si Outlook change la date de
+modification sans toucher au texte (indicateur de suivi, catégorie), le message est relu, sans nouvel embedding.
 
 Avant découpage, les citations (en-têtes « De : / From: », « Le … a écrit : », « On … wrote: », lignes `>`) et les
 signatures/mentions légales courantes (français et anglais) sont retirées ; le reste est découpé en chunks
@@ -267,7 +278,7 @@ reconnus par les entry ids bien connus du store, sinon par leur nom localisé au
 messages qui sortent de l'index à cause de l'exclusion sont comptés dans `excluded_removed`, pas dans `deleted`,
 et n'entrent pas dans la limite de suppression massive.
 
-Pièces jointes : `sync` lit ensuite celles des nouveaux messages (et, une fois, celles des messages indexés
+Pièces jointes : `sync` lit ensuite celles des messages nouveaux ou modifiés (et, une fois, celles des messages indexés
 avant, du plus récent au plus ancien, par lots). Pièces inline, images, fichiers trop gros, messages joints, liens
 et extensions inconnues sont écartés d'après leurs propriétés, sans lire les données. Le reste est lu, haché
 (SHA-256) et, pour un contenu inédit, extrait dans un processus fils (`outlook-index extract-worker`, interne ;
@@ -281,7 +292,7 @@ octets magiques, puis du type MIME. Texte limité à 2 000 000 caractères. Moti
 `too_large`, `unsupported_type` (archives, `.doc`/`.xls` anciens, Markdown…), `excluded_type`,
 `embedded_message`, `encrypted`, `empty_text` (PDF scanné), `failed`, `timeout`.
 
-Résumé (stdout, compteurs seulement), notamment : `complete`, `new`, `deleted`, `excluded_removed`, `moved`,
+Résumé (stdout, compteurs seulement), notamment : `complete`, `new`, `refreshed`, `deleted`, `excluded_removed`, `moved`,
 `flags_changed`, `chunks_added`, `failed`, `remaining`, `errors` (par type), `totals`, `attachments_extracted`,
 `attachments_deduplicated`, `attachments_failed`, `attachments_skipped_by_reason`, `attachments_errors`, `attachments_remaining`, puis
 `embedding` (résultat de l'étape `embed`, ou `{"skipped": ...}` avec `--no-embed`, sans fichiers de modèle ou

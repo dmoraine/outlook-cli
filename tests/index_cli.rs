@@ -414,6 +414,7 @@ fn old_index(dir: &std::path::Path) -> std::path::PathBuf {
         "DROP TABLE attachment_vectors; DROP TABLE attachment_fts; DROP TABLE attachment_chunks;
          DROP TABLE message_attachments; DROP TABLE attachment_contents;
          ALTER TABLE messages DROP COLUMN attachments_done;
+         ALTER TABLE messages DROP COLUMN signature;
          DELETE FROM schema_version WHERE version > 4;
          INSERT INTO folders VALUES (34, 'Inbox', 'Inbox');
          INSERT INTO messages(id, ident, received, has_attachments, subject) VALUES (1, 'mid:x', 0, 0, 'Budget');

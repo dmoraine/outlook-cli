@@ -133,6 +133,9 @@ const MIGRATIONS: &[&str] = &[
      CREATE TRIGGER attachment_chunks_vectors_ad AFTER DELETE ON attachment_chunks BEGIN
         DELETE FROM attachment_vectors WHERE chunk = old.id;
      END;",
+    // Change signature of a message (`sync::signature`); a changed one
+    // re-reads the message. NULL for older rows: adopted by the next sync.
+    "ALTER TABLE messages ADD COLUMN signature TEXT;",
 ];
 
 /// %LOCALAPPDATA%\outlook-cli on Windows, $XDG_DATA_HOME/outlook-cli elsewhere.
