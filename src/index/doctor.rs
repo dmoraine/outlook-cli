@@ -11,7 +11,7 @@ use serde_json::{Value as Json, json};
 use crate::body::text_of;
 use crate::error::{Error, Result, with_retry};
 use crate::ndb::Nid;
-use crate::store::{Attachment, Folder, MSGFLAG_HASATTACH, MSGFLAG_READ, Store, is_mail_folder};
+use crate::store::{Attachment, Folder, Found, MSGFLAG_HASATTACH, MSGFLAG_READ, Store, WellKnown, is_mail_folder};
 use crate::timeutil::format_ft;
 
 /// One contents-table row, reduced to what doctor needs.
@@ -36,6 +36,8 @@ pub trait Source {
     fn folders(&mut self) -> Result<Vec<Folder>>;
     fn rows(&mut self, folder: Nid) -> Result<Vec<Row>>;
     fn sample(&mut self, nid: Nid) -> Result<Sample>;
+    /// Inbox, Deleted Items and Junk E-mail among `folders`.
+    fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown>;
 }
 
 /// Chunking assumed for the chunk estimate (characters).
@@ -195,17 +197,30 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
         bump(&mut f_class, class_prefix(f.class.as_deref()));
         bump(&mut f_depth, f.depth);
     }
-    let mail: Vec<&Folder> = folders.iter().filter(|f| is_mail_folder(f)).collect();
+    let mail: Vec<Folder> = folders.iter().filter(|f| is_mail_folder(f)).cloned().collect();
+    // As sync sees them.
+    let wk = src.well_known(&mail).unwrap_or_else(|e| {
+        bump(&mut errors, e.kind());
+        WellKnown::default()
+    });
 
     let t = Instant::now();
-    let mut rows = Vec::new();
+    let (mut rows, mut per_folder) = (Vec::new(), BTreeMap::new());
     for f in &mail {
         match src.rows(f.nid) {
-            Ok(r) => rows.extend(r),
+            Ok(r) => {
+                per_folder.insert(f.nid, r.len());
+                rows.extend(r)
+            }
             Err(e) => bump(&mut errors, e.kind()),
         }
     }
     let scan_time = t.elapsed();
+    // No name, no id: found, method, message count.
+    let well_known = |w: Found| {
+        let messages = w.nid.map(|n| per_folder.get(&n).copied().unwrap_or(0));
+        json!({ "found": w.nid.is_some(), "method": w.method, "messages": messages })
+    };
     let (mut m_class, mut m_year) = (BTreeMap::new(), BTreeMap::new());
     let (mut unread, mut with_att, mut with_mid) = (0, 0, 0);
     for r in &rows {
@@ -266,6 +281,11 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
             "mail": mail.len(),
             "by_class": f_class,
             "by_depth": f_depth,
+        },
+        "well_known": {
+            "inbox": well_known(wk.inbox),
+            "deleted_items": well_known(wk.deleted_items),
+            "junk": well_known(wk.junk),
         },
         "messages": {
             "total": rows.len(),
@@ -369,6 +389,10 @@ impl Source for StoreSource {
             Ok(Sample { text, text_time, attachments: m.attachments()? })
         })
     }
+
+    fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown> {
+        self.retry(|s| s.well_known(folders))
+    }
 }
 
 /// Keep the kind, replace the message with a fixed one: messages may hold
@@ -413,6 +437,7 @@ pub fn run(file: &Path, index: &Path, sample: usize) -> Result<Json> {
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::store::{DELETED_ITEMS_NAMES, JUNK_NAMES, locate};
 
     const MARKERS: &[&str] = &["SECRET", "Alice", "bob@example.org", "Quarterly"];
 
@@ -493,6 +518,59 @@ mod tests {
                 _ => Ok(Sample { text: None, text_time: Duration::ZERO, attachments: vec![] }),
             }
         }
+        fn well_known(&mut self, _: &[Folder]) -> Result<WellKnown> {
+            Err(Error::NotFound("SECRET_ERR".into()))
+        }
+    }
+
+    /// Inbox, Deleted Items (French name), its subfolder and Junk (by source
+    /// key); folder `n` holds `n` messages.
+    struct WellKnownFake;
+
+    impl Source for WellKnownFake {
+        fn folders(&mut self) -> Result<Vec<Folder>> {
+            Ok(vec![
+                folder(1, "Inbox", Some("IPF.Note"), 0),
+                folder(2, "Éléments supprimés", Some("IPF.Note"), 0),
+                folder(3, "SECRET_SUB", Some("IPF.Note"), 1),
+                folder(4, "SECRET_JUNK", Some("IPF.Note"), 0),
+            ])
+        }
+        fn rows(&mut self, folder: Nid) -> Result<Vec<Row>> {
+            let row = |nid| Row { nid, class: None, received: 0, flags: 1, has_message_id: true };
+            Ok((0..folder).map(|i| row(folder * 100 + i)).collect())
+        }
+        fn sample(&mut self, _: Nid) -> Result<Sample> {
+            Ok(Sample { text: None, text_time: Duration::ZERO, attachments: vec![] })
+        }
+        fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown> {
+            let mut junk_id = vec![0u8; 22];
+            junk_id.extend([5; 22]);
+            junk_id.extend([0, 0]);
+            let mut key = |n: Nid| Ok((n == 4).then(|| vec![5u8; 22]));
+            Ok(WellKnown {
+                inbox: Found { nid: Some(1), method: "name" },
+                deleted_items: locate(folders, None, DELETED_ITEMS_NAMES, &mut key)?,
+                junk: locate(folders, Some(&junk_id), JUNK_NAMES, &mut key)?,
+            })
+        }
+    }
+
+    #[test]
+    fn well_known_counts_without_names() {
+        let v = report(&mut WellKnownFake, 0, 0);
+        let w = &v["well_known"];
+        assert_eq!(w["inbox"], json!({ "found": true, "method": "name", "messages": 1 }), "{v}");
+        assert_eq!(w["deleted_items"], json!({ "found": true, "method": "name", "messages": 2 }), "{v}");
+        assert_eq!(w["junk"], json!({ "found": true, "method": "entry_id_source_key", "messages": 4 }), "{v}");
+        let s = v.to_string();
+        for m in ["SECRET", "Inbox", "Éléments", "supprimés"] {
+            assert!(!s.contains(m), "doctor output leaks {m:?}: {s}");
+        }
+        // A failed detection: counted as an error, every entry not found.
+        let v = report(&mut Fake, 0, 0);
+        assert_eq!(v["well_known"]["junk"], json!({ "found": false, "method": "not_found", "messages": null }), "{v}");
+        assert_eq!(v["errors"]["not_found"], 1, "{v}");
     }
 
     #[test]

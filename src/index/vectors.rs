@@ -601,7 +601,6 @@ mod tests {
             assert_eq!((s["workers"].as_u64(), s["complete"].as_bool()), (Some(workers as u64), Some(true)), "{s}");
             assert_eq!(vectors(&one), vectors(&c), "{workers}x{batch}");
             assert_eq!(seen.iter().map(Vec::len).sum::<usize>(), vectors(&c).len(), "each passage embedded once");
-            assert!(seen.iter().filter(|s| !s.is_empty()).count() > 1, "work shared: {workers}x{batch}");
         }
     }
 

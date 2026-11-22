@@ -47,6 +47,9 @@ pub mod tag {
     pub const CONTAINER_CLASS: u16 = 0x3613;
     pub const IPM_APPOINTMENT_ENTRYID: u16 = 0x36D0;
     pub const IPM_SUBTREE_ENTRYID: u16 = 0x35E0;
+    pub const IPM_WASTEBASKET_ENTRYID: u16 = 0x35E3;
+    pub const ADDITIONAL_REN_ENTRYIDS: u16 = 0x36D8;
+    pub const SOURCE_KEY: u16 = 0x65E0;
     pub const ATTACH_DATA: u16 = 0x3701;
     pub const ATTACH_FILENAME: u16 = 0x3704;
     pub const ATTACH_METHOD: u16 = 0x3705;
@@ -93,6 +96,96 @@ pub struct Store {
     pub ndb: Ndb,
 }
 
+/// A well-known folder and how it was found: `entry_id_nid`,
+/// `entry_id_source_key`, `name` or `not_found` (the Inbox: `entry_ids` when
+/// it carries the well-known folder entry ids).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub nid: Option<Nid>,
+    pub method: &'static str,
+}
+
+impl Default for Found {
+    fn default() -> Self {
+        Found { nid: None, method: "not_found" }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WellKnown {
+    pub inbox: Found,
+    pub deleted_items: Found,
+    pub junk: Found,
+}
+
+/// Default localized names (lowercase), the last resort.
+pub const DELETED_ITEMS_NAMES: &[&str] = &[
+    "deleted items",
+    "éléments supprimés",
+    "elements supprimes",
+    "gelöschte elemente",
+    "verwijderde items",
+    "elementos eliminados",
+    "elementos borrados",
+    "posta eliminata",
+    "itens excluídos",
+    "itens eliminados",
+];
+pub const JUNK_NAMES: &[&str] = &[
+    "junk email",
+    "junk e-mail",
+    "courrier indésirable",
+    "courrier indesirable",
+    "junk-e-mail",
+    "ongewenste e-mail",
+    "correo no deseado",
+    "posta indesiderata",
+    "lixo eletrônico",
+    "lixo eletrónico",
+    "correio eletrónico de lixo",
+];
+
+/// Folder NID of a PST-style entry id (flags 4, provider UID 16, NID 4).
+pub fn entry_id_nid(e: &[u8]) -> Option<Nid> {
+    (e.len() == 24)
+        .then(|| u32::from_le_bytes(e[20..24].try_into().unwrap()))
+        .filter(|n| n & 0x1F == NID_TYPE_NORMAL_FOLDER)
+}
+
+/// Source key (PidTagSourceKey: database GUID 16 + global counter 6) of an
+/// Exchange folder entry id (flags 4, provider UID 16, folder type 2,
+/// database GUID 16, global counter 6, pad 2).
+pub fn entry_id_source_key(e: &[u8]) -> Option<&[u8]> {
+    (e.len() == 46).then(|| &e[22..44])
+}
+
+/// The folder of `entry_id`, by NID then by source key (`source_key` reads a
+/// folder's PidTagSourceKey), else a top-level folder named one of `names`.
+pub fn locate(
+    folders: &[Folder],
+    entry_id: Option<&[u8]>,
+    names: &[&str],
+    source_key: &mut dyn FnMut(Nid) -> Result<Option<Vec<u8>>>,
+) -> Result<Found> {
+    let found = |nid, method| Ok(Found { nid: Some(nid), method });
+    if let Some(e) = entry_id {
+        if let Some(n) = entry_id_nid(e).filter(|n| folders.iter().any(|f| f.nid == *n)) {
+            return found(n, "entry_id_nid");
+        }
+        if let Some(k) = entry_id_source_key(e) {
+            for f in folders {
+                if source_key(f.nid)?.as_deref() == Some(k) {
+                    return found(f.nid, "entry_id_source_key");
+                }
+            }
+        }
+    }
+    match folders.iter().find(|f| f.depth == 0 && names.contains(&f.name.to_lowercase().as_str())) {
+        Some(f) => found(f.nid, "name"),
+        None => Ok(Found::default()),
+    }
+}
+
 /// Remove the subject-prefix marker MAPI may put in front of PT_UNICODE
 /// subjects ("\u{1}" followed by the prefix length).
 pub fn clean_subject(s: String) -> String {
@@ -131,11 +224,7 @@ impl Store {
     /// entry id; their subtree is found by name ("IPM_SUBTREE").
     fn ipm_subtree(&self) -> Result<Option<Nid>> {
         let pc = self.pc(NID_MESSAGE_STORE)?;
-        Ok(pc
-            .bytes(tag::IPM_SUBTREE_ENTRYID)
-            .filter(|e| e.len() == 24)
-            .map(|e| u32::from_le_bytes(e[20..24].try_into().unwrap()))
-            .filter(|n| n & 0x1F == NID_TYPE_NORMAL_FOLDER))
+        Ok(pc.bytes(tag::IPM_SUBTREE_ENTRYID).and_then(|e| entry_id_nid(&e)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -205,6 +294,10 @@ impl Store {
     /// The Inbox: the mail folder carrying the well-known folder entry ids
     /// (PR_IPM_APPOINTMENT_ENTRYID...), else the usual localized names.
     pub fn inbox(&self, folders: &[Folder]) -> Option<Nid> {
+        self.find_inbox(folders).nid
+    }
+
+    fn find_inbox(&self, folders: &[Folder]) -> Found {
         let mail = |f: &&Folder| {
             f.depth == 0 && f.class.as_deref().is_none_or(|c| c.starts_with("IPF.Note") || c.starts_with("IPF.Imap"))
         };
@@ -212,7 +305,7 @@ impl Store {
             if let Ok(pc) = self.pc(f.nid)
                 && pc.has(tag::IPM_APPOINTMENT_ENTRYID)
             {
-                return Some(f.nid);
+                return Found { nid: Some(f.nid), method: "entry_ids" };
             }
         }
         const NAMES: &[&str] = &[
@@ -229,7 +322,44 @@ impl Store {
             "innboks",
             "saapuneet",
         ];
-        folders.iter().filter(mail).find(|f| NAMES.contains(&f.name.to_lowercase().as_str())).map(|f| f.nid)
+        match folders.iter().filter(mail).find(|f| NAMES.contains(&f.name.to_lowercase().as_str())) {
+            Some(f) => Found { nid: Some(f.nid), method: "name" },
+            None => Found::default(),
+        }
+    }
+
+    /// Inbox, Deleted Items and Junk E-mail among `folders`. Deleted Items:
+    /// PidTagIpmWastebasketEntryId of the store; Junk: entry 4 of
+    /// PidTagAdditionalRenEntryIds of the Inbox, else of the root folder;
+    /// see `locate`.
+    pub fn well_known(&self, folders: &[Folder]) -> Result<WellKnown> {
+        let inbox = self.find_inbox(folders);
+        let waste = self.pc(NID_MESSAGE_STORE)?.bytes(tag::IPM_WASTEBASKET_ENTRYID);
+        let mut junk = None;
+        for nid in inbox.nid.into_iter().chain([NID_ROOT_FOLDER]) {
+            if let Some(pc) = self.pc_opt(nid)?
+                && let Some(Value::MultiBin(mut ids)) = pc.get(tag::ADDITIONAL_REN_ENTRYIDS)
+                && ids.get(4).is_some_and(|e| !e.is_empty())
+            {
+                junk = Some(ids.swap_remove(4));
+                break;
+            }
+        }
+        let mut key = |nid| Ok(self.pc_opt(nid)?.and_then(|p| p.bytes(tag::SOURCE_KEY)));
+        Ok(WellKnown {
+            inbox,
+            deleted_items: locate(folders, waste.as_deref(), DELETED_ITEMS_NAMES, &mut key)?,
+            junk: locate(folders, junk.as_deref(), JUNK_NAMES, &mut key)?,
+        })
+    }
+
+    /// The node's property context, None when the node is missing.
+    fn pc_opt(&self, nid: Nid) -> Result<Option<Pc<'_>>> {
+        match self.pc(nid) {
+            Ok(p) => Ok(Some(p)),
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Visit the rows of a folder's contents table.
@@ -538,4 +668,86 @@ pub fn parse_id(s: &str) -> Result<Nid> {
         None => s.parse(),
     };
     r.map_err(|_| Error::Usage(format!("invalid message id '{s}'")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn folder(nid: Nid, name: &str, depth: usize) -> Folder {
+        Folder {
+            nid,
+            parent: None,
+            name: name.into(),
+            path: name.into(),
+            class: Some("IPF.Note".into()),
+            count: 0,
+            unread: 0,
+            depth,
+        }
+    }
+
+    fn pst_id(nid: Nid) -> Vec<u8> {
+        let mut e = vec![0u8; 20];
+        e.extend(nid.to_le_bytes());
+        e
+    }
+
+    /// Exchange folder entry id whose source key is `key` (22 bytes).
+    fn exchange_id(key: &[u8]) -> Vec<u8> {
+        let mut e = vec![0u8; 20];
+        e.extend([1, 0]);
+        e.extend(key);
+        e.extend([0, 0]);
+        e
+    }
+
+    const KEY: [u8; 22] = [7; 22];
+
+    #[test]
+    fn entry_id_shapes() {
+        assert_eq!(entry_id_nid(&pst_id(0x8062)), Some(0x8062));
+        assert_eq!(entry_id_nid(&pst_id(0x8064)), None, "a message NID is not a folder");
+        assert_eq!(entry_id_nid(&pst_id(0x8062)[..23]), None);
+        let e = exchange_id(&KEY);
+        assert_eq!(e.len(), 46);
+        assert_eq!(entry_id_source_key(&e), Some(&KEY[..]));
+        assert_eq!(entry_id_nid(&e), None);
+        assert_eq!(entry_id_source_key(&pst_id(0x8062)), None);
+        assert_eq!(entry_id_source_key(&e[..45]), None);
+    }
+
+    #[test]
+    fn locate_order() {
+        let fs = [
+            folder(0x22, "Inbox", 0),
+            folder(0x42, "Éléments supprimés", 0),
+            folder(0x62, "Archive", 0),
+            folder(0x82, "Deleted Items", 1),
+            folder(0xA2, "Courrier indésirable", 0),
+        ];
+        let mut keys = |n: Nid| Ok((n == 0x62).then(|| KEY.to_vec()));
+        let l = |id: Option<Vec<u8>>, names: &[&str], keys: &mut dyn FnMut(Nid) -> Result<Option<Vec<u8>>>| {
+            locate(&fs, id.as_deref(), names, keys).unwrap()
+        };
+        let f = |n: Nid, method| Found { nid: Some(n), method };
+        // NID first, even when the name points elsewhere.
+        assert_eq!(l(Some(pst_id(0x62)), DELETED_ITEMS_NAMES, &mut keys), f(0x62, "entry_id_nid"));
+        // Source key next.
+        assert_eq!(l(Some(exchange_id(&KEY)), DELETED_ITEMS_NAMES, &mut keys), f(0x62, "entry_id_source_key"));
+        // An id matching no folder falls back to the name (FR); depth 0 only.
+        assert_eq!(l(Some(pst_id(0x1002)), DELETED_ITEMS_NAMES, &mut keys), f(0x42, "name"));
+        assert_eq!(l(Some(exchange_id(&[9; 22])), DELETED_ITEMS_NAMES, &mut keys), f(0x42, "name"));
+        assert_eq!(l(None, JUNK_NAMES, &mut keys), f(0xA2, "name"));
+        assert_eq!(l(None, &["nothing"], &mut keys), Found::default());
+        assert_eq!(Found::default().method, "not_found");
+        // EN, case-insensitive; the nested "Deleted Items" is ignored.
+        let en = [folder(0x22, "DELETED ITEMS", 0), folder(0x42, "Junk E-mail", 0), folder(0x62, "Deleted Items", 2)];
+        let mut none = |_| Ok(None);
+        assert_eq!(locate(&en, None, DELETED_ITEMS_NAMES, &mut none).unwrap(), f(0x22, "name"));
+        assert_eq!(locate(&en, None, JUNK_NAMES, &mut none).unwrap(), f(0x42, "name"));
+        // A source-key read error is returned (retried by the caller), not hidden.
+        let mut bad = |_| Err(Error::Corrupt("x".into()));
+        assert!(locate(&fs, Some(&exchange_id(&KEY)), DELETED_ITEMS_NAMES, &mut bad).is_err());
+    }
 }

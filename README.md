@@ -156,7 +156,9 @@ outlook-index.exe doctor --sample 1000 --pretty  # more precise, slower
 file kind/size, folder and message counts by class prefix (`IPM.Note`, `IPF.Note`, unknown segments → `other`)/depth/
 year, full-scan time, and for `--sample` messages picked at random: open+text, open and text-extraction times (µs),
 text lengths, a chunk estimate, Message-ID coverage of the scanned rows (`messages.with_message_id` /
-`without_message_id`), attachment counts by extension/method and sizes. Distributions are
+`without_message_id`), attachment counts by extension/method and sizes, and `well_known`: for the Inbox, Deleted
+Items and Junk E-mail, `found`, `method` (`entry_ids`, `entry_id_nid`, `entry_id_source_key`, `name`, `not_found`)
+and the message count. Distributions are
 `{min, p50, p95, max, sum}`. Errors: counts by kind only; a fatal error prints `{"error":{"kind","message"}}` with a
 fixed message. No subjects, addresses, names, folder or attachment names, body text or paths.
 
@@ -166,7 +168,8 @@ Index file: `--index` / `OUTLOOK_INDEX_DB`, default `%LOCALAPPDATA%\outlook-cli\
 `$XDG_DATA_HOME/outlook-cli/index.sqlite`). A path under OneDrive gets a warning. `doctor` does not create it.
 
 ```powershell
-outlook-index.exe sync                    # every mail folder; counts only on stdout
+outlook-index.exe sync                    # mail folders but Deleted Items and Junk; counts only on stdout
+outlook-index.exe sync --include-folders deleted,junk   # index them too (stored; `none` = the default)
 outlook-index.exe sync --max-time 30m     # stop after 30 min; the next sync resumes
 outlook-index.exe status --pretty         # counts and size only
 outlook-index.exe search "budget café" -n 5 -F Inbox --since 30d --from alice
@@ -182,6 +185,13 @@ change (usage error, counts only) unless `--allow-mass-delete` is passed. One sy
 `index.sqlite.lock`). Quoted replies, forward headers and signature/disclaimer tails (French and English) are
 stripped; the rest is cut into ~1750-character chunks with ~200 characters of overlap; each chunk keeps its character
 range in the stripped body.
+
+Deleted Items and Junk E-mail (with their subfolders) are not indexed by default. They are found by the store's
+well-known entry ids (Deleted Items: wastebasket entry id; Junk: additional REN entry ids, by NID or source key),
+else by their default localized name at the top level. `--include-folders deleted,junk` (or `deleted`, `junk`,
+`none`) changes the choice; it is stored in the index and reused by later syncs (`status.include`). A changed choice
+forces a full reconciliation. Messages leaving the index because of the exclusion are reported as
+`excluded_removed`, not `deleted`, and do not count for the mass-deletion limit.
 
 `search` modes (`--mode`):
 
@@ -226,22 +236,23 @@ hits in the top 3):
 
 ### Embedding model (local, CPU)
 
-`intfloat/multilingual-e5-small` (default, 384 dims, BERT) or `multilingual-e5-base` (768 dims, XLM-RoBERTa), run on
+`intfloat/multilingual-e5-base` (default for a new index, 768 dims, XLM-RoBERTa) or `multilingual-e5-small` (384
+dims, BERT), run on
 the CPU with candle (pure Rust). The model is not in the exe. Its files (`config.json`, `tokenizer.json`,
 `model.safetensors`) are pinned to a Hugging Face revision and checked by SHA-256 before every load.
 
 ```powershell
 outlook-index.exe model list --pretty                   # pinned revisions, files present in the default dirs
-outlook-index.exe model fetch                           # e5-small (~490 MB), the only network access
-outlook-index.exe model fetch --model e5-base           # ~1.1 GB
+outlook-index.exe model fetch                           # model of the index, else e5-base (~1.1 GB); the only network access
+outlook-index.exe model fetch --model e5-small          # ~490 MB
 outlook-index.exe bench-embed --pretty                  # ~30 s of synthetic passages on this CPU
-outlook-index.exe bench-embed --model e5-base --seconds 60 --workers 4 --threads 3 --pretty
+outlook-index.exe bench-embed --model e5-small --seconds 60 --workers 4 --threads 3 --pretty
 ```
 
 `model fetch` downloads over HTTPS from huggingface.co with `curl` (shipped with Windows 10+) into `<name>.part`,
 resumes an interrupted download and installs a file only when its SHA-256 matches. Manual download: put the three
 files of the pinned revision (`model list`) in a directory and pass `--model-dir` (or `OUTLOOK_INDEX_MODEL_DIR`).
-Default directory: `%LOCALAPPDATA%\outlook-cli\models\multilingual-e5-small` (or `-base`; Linux: under
+Default directory: `%LOCALAPPDATA%\outlook-cli\models\multilingual-e5-base` (or `-small`; Linux: under
 `$XDG_DATA_HOME/outlook-cli`). Texts get the mandatory e5 prefix (`query: ` / `passage: `), are cut at 512 tokens,
 embedded in length-sorted batches (`--batch`, default 8) and mean-pooled over the tokens, then L2-normalized.
 `bench-embed` prints load time (hash check included), query latency and passages/s on synthetic text only (with
@@ -260,14 +271,15 @@ model in one process with 2 workers sharing the weights reached 3.5–3.6 passag
 
 ### Embeddings: scope and runs
 
-Search covers every mail folder; embeddings are limited by a scope stored in the index and reused by every run.
+Search covers every indexed mail folder; embeddings are limited by a scope (default: the whole index) stored in
+the index and reused by every run.
 
 ```powershell
 outlook-index.exe scope --pretty                                   # scope + counts
 outlook-index.exe scope --embed-since 2025-01-01 --embed-until "2026-03-31" -F Inbox -F "Archive/2026"
 outlook-index.exe scope --clear                                    # back to everything
 outlook-index.exe embed --max-time 30m                             # newest first; resumable
-outlook-index.exe embed --model e5-base --reembed                  # change model: drops the e5-small vectors
+outlook-index.exe embed --model e5-small --reembed                 # change model: drops the e5-base vectors
 outlook-index.exe sync --max-time 1h                               # index, then embed in the time left
 outlook-index.exe sync --no-embed                                  # index only
 ```
@@ -286,7 +298,7 @@ newest-first order; `Ctrl-C` loses at most the batches in flight (one per worker
 once reached (batches in flight finish); the next run resumes. A failing worker stores nothing of its batch: the
 run stops dispatching, commits the batches still in flight and exits with the error. It runs at below-normal
 priority (Windows `BELOW_NORMAL_PRIORITY_CLASS`, Linux nice 10, inherited by worker processes; `--priority normal`
-to opt out) with `--workers` × `--threads`. The model defaults to the one of the stored vectors (else e5-small); another model is refused unless
+to opt out) with `--workers` × `--threads`. The model defaults to the one of the index (else e5-base; also for `model fetch` and `bench-embed`); another model is refused unless
 `--reembed`, which drops the old vectors. Missing model files are a `not_found` error. Output: `embedded`, `pending`,
 `complete`, `interrupted`, `passages_per_s`, `load_ms`, `elapsed_ms`, model, workers, threads, priority.
 

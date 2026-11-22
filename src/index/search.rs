@@ -148,7 +148,7 @@ pub fn plan(
             "the index vectors are {s}; search with --model {s}, or embed again with --model {want} --reembed"
         )));
     }
-    let m = model::get(model.or(stored.as_deref()).unwrap_or(model::NAMES[0]))?;
+    let m = model::choose(model, stored.as_deref())?;
     if has(m.name, Some(m.revision))? {
         return Ok((requested.unwrap_or(Mode::Hybrid), Some(m), None));
     }
@@ -459,6 +459,7 @@ pub fn status(c: &Connection) -> Result<Json> {
     let o = v.as_object_mut().unwrap();
     o.insert("schema".into(), json!(super::schema_version(c)?));
     o.insert("embedding".into(), super::vectors::counts(c)?);
+    o.insert("include".into(), json!(super::sync::include(c)?.unwrap_or_default()));
     let bytes = c.query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |r| {
         r.get::<_, i64>(0)
     });
@@ -950,7 +951,7 @@ mod tests {
         for m in [Mode::Semantic, Mode::Hybrid] {
             let (mode, model, w) = p(Some(m), None).unwrap();
             let w = w.expect("warning");
-            assert!((mode, model.is_none()) == (Mode::Keyword, true) && w.contains("e5-small"), "{w}");
+            assert!((mode, model.is_none()) == (Mode::Keyword, true) && w.contains("e5-base"), "new index: {w}");
             texts.push(w);
         }
         let (_, _, w) = p(Some(Mode::Hybrid), Some("e5-base")).unwrap();

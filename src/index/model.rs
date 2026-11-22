@@ -80,6 +80,15 @@ pub const MODELS: [Model; 2] = [
 
 pub const NAMES: [&str; 2] = [MODELS[0].name, MODELS[1].name];
 
+/// Model of a new index.
+pub const DEFAULT: &str = "e5-base";
+
+/// `requested`, else the index's `stored` model, else DEFAULT. A model other
+/// than the stored one is then refused by `vectors::check_model` unless reembed.
+pub fn choose(requested: Option<&str>, stored: Option<&str>) -> Result<&'static Model> {
+    get(requested.or(stored).unwrap_or(DEFAULT))
+}
+
 pub fn get(name: &str) -> Result<&'static Model> {
     MODELS.iter().find(|m| m.name == name).ok_or_else(|| Error::Usage(format!("unknown model '{name}'")))
 }
@@ -226,6 +235,17 @@ mod tests {
         }
         assert!(matches!(get("e5-large"), Err(Error::Usage(_))));
         assert!(default_dir(&MODELS[0]).unwrap().ends_with(Path::new("models").join("multilingual-e5-small")));
+    }
+
+    #[test]
+    fn default_and_remembered_model() {
+        let c = |r, s| choose(r, s).unwrap().name;
+        assert_eq!(c(None, None), "e5-base", "new index");
+        assert_eq!(c(None, Some("e5-small")), "e5-small", "remembered");
+        assert_eq!(c(None, Some("e5-base")), "e5-base");
+        assert_eq!(c(Some("e5-small"), None), "e5-small");
+        assert_eq!(c(Some("e5-small"), Some("e5-base")), "e5-small", "explicit; check_model decides");
+        assert!(matches!(choose(None, Some("e5-large")), Err(Error::Usage(_))));
     }
 
     #[test]

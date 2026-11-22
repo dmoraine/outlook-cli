@@ -84,6 +84,13 @@ enum Cmd {
         /// Index only; skip the embedding step.
         #[arg(long)]
         no_embed: bool,
+        /// Also index these well-known folders with their subfolders
+        /// (deleted = Deleted Items, junk = Junk E-mail; none = neither, the
+        /// default). Stored in the index: later syncs keep the choice.
+        /// Messages that leave the index this way are reported as
+        /// excluded_removed, outside the mass-deletion limit.
+        #[arg(long, value_delimiter = ',', value_parser = ["deleted", "junk", "none"])]
+        include_folders: Option<Vec<String>>,
         #[command(flatten)]
         embed: EmbedArgs,
     },
@@ -197,19 +204,24 @@ enum Cmd {
 
 #[derive(Args)]
 struct ModelArgs {
-    /// Embedding model.
-    #[arg(long, default_value = "e5-small", value_parser = model::NAMES)]
-    model: String,
+    /// Embedding model. Default: the model of the index, else e5-base.
+    #[arg(long, value_parser = model::NAMES)]
+    model: Option<String>,
     /// Directory with the model's config.json, tokenizer.json and
-    /// model.safetensors. Default: <data dir>/models/multilingual-e5-small
-    /// (or -base), next to the default index.
+    /// model.safetensors. Default: <data dir>/models/multilingual-e5-base
+    /// (or -small), next to the default index.
     #[arg(long, env = "OUTLOOK_INDEX_MODEL_DIR")]
     model_dir: Option<String>,
 }
 
 impl ModelArgs {
-    fn resolve(&self) -> Result<(&'static model::Model, PathBuf)> {
-        let m = model::get(&self.model)?;
+    /// --model, else the model of `index` when it exists (not created), else e5-base.
+    fn resolve(&self, index: Option<&std::path::Path>) -> Result<(&'static model::Model, PathBuf)> {
+        let stored = match index.filter(|p| p.exists()) {
+            Some(p) => vectors::current_model(&index::open(p)?)?,
+            None => None,
+        };
+        let m = model::choose(self.model.as_deref(), stored.as_deref())?;
         Ok((m, model_dir(m, &self.model_dir)?))
     }
 }
@@ -223,7 +235,8 @@ fn model_dir(m: &model::Model, dir: &Option<String>) -> Result<PathBuf> {
 
 #[derive(Args)]
 struct EmbedArgs {
-    /// Embedding model. Default: the model of the stored vectors, else e5-small.
+    /// Embedding model. Default: the model of the index, else e5-base. Another
+    /// model than the one of the stored vectors needs --reembed.
     #[arg(long, value_parser = model::NAMES)]
     model: Option<String>,
     /// Directory with the model files. Default: <data dir>/models/<repository name>.
@@ -243,14 +256,10 @@ struct EmbedArgs {
 }
 
 impl EmbedArgs {
-    /// The requested model, else the stored one, else e5-small; refused if
+    /// The requested model, else the stored one, else e5-base; refused if
     /// vectors of another model exist and --reembed is not given.
     fn model(&self, c: &rusqlite::Connection) -> Result<&'static model::Model> {
-        let name = match &self.model {
-            Some(n) => n.clone(),
-            None => vectors::current_model(c)?.unwrap_or_else(|| model::NAMES[0].into()),
-        };
-        let m = model::get(&name)?;
+        let m = model::choose(self.model.as_deref(), vectors::current_model(c)?.as_deref())?;
         vectors::check_model(c, m, self.reembed)?;
         Ok(m)
     }
@@ -379,7 +388,7 @@ fn existing(p: PathBuf) -> Result<PathBuf> {
 fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
     if let Cmd::EmbedWorker { ref model, threads, batch } = cli.cmd {
         set_threads(threads as usize);
-        let e = model.resolve().and_then(|(m, dir)| {
+        let e = model.resolve(None).and_then(|(m, dir)| {
             let mut e = Embedder::load(m, &dir)?;
             e.batch = batch as usize;
             Ok(e)
@@ -405,10 +414,14 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let f = file().map_err(doctor::sanitize)?;
             doctor::run(&f, &index_path, sample).map_err(doctor::sanitize)?
         }
-        Cmd::Sync { ref max_time, allow_mass_delete, no_embed, ref embed } => {
+        Cmd::Sync { ref max_time, allow_mass_delete, no_embed, ref include_folders, ref embed } => {
             let start = Instant::now();
             let max_time = max_time.as_deref().map(parse_duration).transpose()?;
-            let opts = sync::Options { max_time, allow_mass_delete, ..Default::default() };
+            let include = include_folders.as_ref().map(|v| sync::Include {
+                deleted: v.iter().any(|x| x == "deleted"),
+                junk: v.iter().any(|x| x == "junk"),
+            });
+            let opts = sync::Options { max_time, allow_mass_delete, include, ..Default::default() };
             let f = file()?;
             let mut c = index::open(&index_path)?;
             let _lock = sync::lock(&index_path)?;
@@ -521,13 +534,15 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         Cmd::Status => search::status(&index::open(&existing(index_path)?)?)?,
         Cmd::Model { cmd: ModelCmd::List } => model::list(model::default_dir)?,
         Cmd::Model { cmd: ModelCmd::Fetch { ref model } } => {
-            let (m, dir) = model.resolve()?;
+            let (m, dir) = model.resolve(Some(&index_path))?;
             model::fetch(m, &dir, |f| {
-                eprintln!("{}", json!({ "progress": { "kind": "download", "file": f.name, "bytes": f.size } }))
+                let p = json!({ "kind": "download", "model": m.name, "file": f.name, "bytes": f.size });
+                eprintln!("{}", json!({ "progress": p }))
             })?
         }
+        // Same default as sync: what the index will embed with.
         Cmd::BenchEmbed { ref model, seconds, ref par, batch } => {
-            let (m, dir) = model.resolve()?;
+            let (m, dir) = model.resolve(Some(&index_path))?;
             let (workers, threads) = par.apply();
             let (t, time) = (Instant::now(), Duration::from_secs(seconds));
             if workers <= 1 {

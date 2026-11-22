@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 
 use super::db_err;
@@ -12,7 +13,7 @@ use super::text::{chunk, strip_quotes};
 use crate::body::text_of;
 use crate::error::{Error, Result};
 use crate::ndb::Nid;
-use crate::store::{Folder, MSGFLAG_HASATTACH, is_mail_folder, tag};
+use crate::store::{Folder, MSGFLAG_HASATTACH, WellKnown, is_mail_folder, tag};
 use crate::timeutil::{format_ft, now_ft};
 
 /// One contents-table row: everything sync needs without opening the message.
@@ -48,6 +49,8 @@ pub trait MailSource {
     fn folders(&mut self) -> Result<Vec<Folder>>;
     fn entries(&mut self, folder: Nid) -> Result<Vec<Entry>>;
     fn open(&mut self, nid: Nid) -> Result<Opened>;
+    /// Inbox, Deleted Items and Junk E-mail among `folders`.
+    fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown>;
 }
 
 /// The real file, with the doctor's retry/reopen on inconsistent reads.
@@ -96,6 +99,10 @@ impl MailSource for StoreSource {
             })
         })
     }
+
+    fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown> {
+        self.retry(|s| s.well_known(folders))
+    }
 }
 
 /// Exclusive lock for one sync per index, released when the file is
@@ -133,11 +140,30 @@ pub struct Options {
     pub max_time: Option<Duration>,
     /// Allow deleting more than max(100, 20%) of the indexed messages.
     pub allow_mass_delete: bool,
+    /// Change the stored choice of well-known folders to index.
+    pub include: Option<Include>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { batch: 200, max_time: None, allow_mass_delete: false }
+        Options { batch: 200, max_time: None, allow_mass_delete: false, include: None }
+    }
+}
+
+/// Well-known folders indexed with their subfolders (meta `include_folders`).
+/// Default: neither, Deleted Items and Junk E-mail are skipped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Include {
+    pub deleted: bool,
+    pub junk: bool,
+}
+
+/// The stored choice; None for an index synced before it existed.
+pub fn include(c: &Connection) -> Result<Option<Include>> {
+    match get_meta(c, "include_folders")? {
+        Some(s) => serde_json::from_str(&s).map(Some).map_err(|e| Error::Format(format!("stored folder choice: {e}"))),
+        None => Ok(None),
     }
 }
 
@@ -156,8 +182,10 @@ pub fn set_meta(c: &Connection, key: &str, value: &str) -> Result<()> {
 pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result<Json> {
     let start = Instant::now();
     let revision = src.revision()?;
+    let stored = include(c)?;
+    let inc = o.include.or(stored).unwrap_or_default();
     let complete_before = get_meta(c, "sync_complete")?.as_deref() == Some("1");
-    if complete_before && get_meta(c, "sync_revision")?.as_deref() == Some(revision.as_str()) {
+    if complete_before && stored == Some(inc) && get_meta(c, "sync_revision")?.as_deref() == Some(revision.as_str()) {
         let at = get_meta(c, "sync_at")?.and_then(|t| t.parse().ok()).and_then(|t| format_ft(t, false));
         return Ok(json!({
             "unchanged": true,
@@ -169,10 +197,26 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
         }));
     }
 
-    let folders = src.folders()?;
+    // Deleted Items and Junk E-mail with their subfolders, unless included.
+    let all = src.folders()?;
+    let wk = src.well_known(&all)?;
+    let roots: Vec<String> = [(wk.deleted_items, inc.deleted), (wk.junk, inc.junk)]
+        .iter()
+        .filter(|(_, included)| !included)
+        .filter_map(|(w, _)| all.iter().find(|f| Some(f.nid) == w.nid))
+        .map(|f| format!("{}/", f.path))
+        .collect();
+    let (excluded, folders): (Vec<Folder>, Vec<Folder>) =
+        all.into_iter().partition(|f| roots.iter().any(|r| format!("{}/", f.path).starts_with(r.as_str())));
     let mut entries = Vec::new();
     for f in &folders {
         entries.extend(src.entries(f.nid)?);
+    }
+    // Identities still in the file, in excluded folders: leaving the index
+    // because of the exclusion, not deleted.
+    let mut kept_out = HashSet::new();
+    for f in &excluded {
+        kept_out.extend(src.entries(f.nid)?.iter().map(identity));
     }
 
     // Group rows by identity, in scan order.
@@ -199,7 +243,8 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
         let mut rows = st.query([]).map_err(db_err)?;
         while let Some(r) = rows.next().map_err(db_err)? {
             indexed += 1;
-            gone += usize::from(!idx.contains_key(&r.get::<_, String>(0).map_err(db_err)?));
+            let ident: String = r.get(0).map_err(db_err)?;
+            gone += usize::from(!idx.contains_key(&ident) && !kept_out.contains(&ident));
         }
     }
     let limit = (indexed / 5).max(100);
@@ -209,7 +254,7 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
              Pass --allow-mass-delete if this is expected"
         )));
     }
-    let deleted = {
+    let (deleted, excluded_removed) = {
         tx.execute("DELETE FROM folders", []).map_err(db_err)?;
         let mut ins = tx.prepare("INSERT INTO folders(nid, path, name) VALUES (?1, ?2, ?3)").map_err(db_err)?;
         for f in &folders {
@@ -251,20 +296,22 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
         for nid in old.keys().filter(|n| !seen.contains(n)) {
             drop_loc.execute([nid]).map_err(db_err)?;
         }
-        let orphans = "SELECT id FROM messages WHERE id NOT IN (SELECT message FROM locations)";
-        let gone: Vec<i64> = tx
+        let orphans = "SELECT id, ident FROM messages WHERE id NOT IN (SELECT message FROM locations)";
+        let gone: Vec<(i64, String)> = tx
             .prepare(orphans)
             .map_err(db_err)?
-            .query_map([], |r| r.get(0))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(db_err)?
             .collect::<rusqlite::Result<_>>()
             .map_err(db_err)?;
-        for id in &gone {
+        for (id, _) in &gone {
             tx.execute("DELETE FROM chunks WHERE message = ?1", [id]).map_err(db_err)?;
             tx.execute("DELETE FROM messages WHERE id = ?1", [id]).map_err(db_err)?;
         }
-        gone.len() as u64
+        let out = gone.iter().filter(|(_, ident)| kept_out.contains(ident)).count() as u64;
+        (gone.len() as u64 - out, out)
     };
+    set_meta(&tx, "include_folders", &serde_json::to_string(&inc).unwrap())?;
     set_meta(&tx, "sync_complete", "0")?;
     tx.commit().map_err(db_err)?;
 
@@ -346,8 +393,11 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
         "revision": revision,
         "synced_at": format_ft(now, false),
         "folders": folders.len(),
+        "excluded_folders": excluded.len(),
+        "include": inc,
         "new": new,
         "deleted": deleted,
+        "excluded_removed": excluded_removed,
         "moved": moved,
         "flags_changed": flags_changed,
         "chunks_added": chunks,
@@ -377,6 +427,7 @@ pub mod fake {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::store::{DELETED_ITEMS_NAMES, JUNK_NAMES, locate};
 
     /// In-memory mailbox. Fictional content only.
     #[derive(Default)]
@@ -456,6 +507,15 @@ pub mod fake {
                 from_email: Some("zed@fict.invalid".into()),
                 to: Some("Ann Fict".into()),
                 cc: Some("Cy Fict".into()),
+            })
+        }
+        /// By name, as a file without well-known entry ids.
+        fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown> {
+            let mut no_key = |_| Ok(None);
+            Ok(WellKnown {
+                inbox: Default::default(),
+                deleted_items: locate(folders, None, DELETED_ITEMS_NAMES, &mut no_key)?,
+                junk: locate(folders, None, JUNK_NAMES, &mut no_key)?,
             })
         }
     }
@@ -711,6 +771,113 @@ mod tests {
         let mut l = p.into_os_string();
         l.push(".lock");
         std::fs::remove_file(l).unwrap();
+    }
+
+    /// The mailbox plus Deleted Items (0x62) with a subfolder (0x82) and Junk
+    /// (0xA2, French name), one message each, and a copy of 0x204 in Deleted Items.
+    fn with_well_known() -> Fake {
+        let mut f = mailbox();
+        f.folders.extend([
+            folder(0x62, "Deleted Items"),
+            folder(0x82, "Deleted Items/Old"),
+            folder(0xA2, "Courrier indésirable"),
+        ]);
+        f.add(0x404, 0x62, Some("<d1@fict.invalid>"), "Trash", "Deleted text.");
+        f.add(0x424, 0x82, Some("<d2@fict.invalid>"), "Old trash", "Older deleted text.");
+        f.add(0x444, 0xA2, Some("<j1@fict.invalid>"), "Spam", "Junk text.");
+        f.add(0x464, 0x62, Some("<a1@fict.invalid>"), "Budget café", "Le budget du café est validé.");
+        f
+    }
+
+    fn inc(deleted: bool, junk: bool) -> Options {
+        Options { include: Some(Include { deleted, junk }), ..Options::default() }
+    }
+
+    #[test]
+    fn well_known_folders_excluded_by_default() {
+        let (mut c, mut f) = (db(), with_well_known());
+        let s = run(&mut c, &mut f);
+        assert_eq!((s["new"].as_u64(), s["excluded_folders"].as_u64()), (Some(3), Some(3)), "{s}");
+        assert_eq!(s["include"], json!({ "deleted": false, "junk": false }), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 3);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM locations WHERE folder IN (0x62, 0x82, 0xA2)"), 0);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM folders WHERE nid IN (0x62, 0x82, 0xA2)"), 0, "not searchable");
+        assert!(!f.opened.iter().any(|n| [0x404, 0x424, 0x444, 0x464].contains(n)), "excluded: never opened");
+        assert_eq!(include(&c).unwrap(), Some(Include::default()), "default stored");
+        let t = s.to_string();
+        assert!(!t.contains("Deleted") && !t.contains("indésirable"), "{t}");
+    }
+
+    #[test]
+    fn include_choice_persisted_and_changed() {
+        let (mut c, mut f) = (db(), with_well_known());
+        run(&mut c, &mut f);
+        let budget = |c: &Connection| count(c, "SELECT id FROM messages WHERE ident = 'mid:<a1@fict.invalid>'");
+        let id = budget(&c);
+        // Same revision, new choice: a full reconciliation.
+        let s = sync(&mut c, &mut f, &inc(true, false)).unwrap();
+        assert_eq!((s["unchanged"].as_bool(), s["new"].as_u64()), (Some(false), Some(2)), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 5);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM locations WHERE folder = 0x82"), 1, "subfolder included");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM locations WHERE folder = 0xA2"), 0, "junk still excluded");
+        assert_eq!(budget(&c), id, "the copy joins the same message");
+        // No flag: the stored choice is kept.
+        f.revision += 1;
+        let s = run(&mut c, &mut f);
+        assert_eq!((s["include"]["deleted"].as_bool(), s["excluded_removed"].as_u64()), (Some(true), Some(0)), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 5);
+        assert_eq!(run(&mut c, &mut f)["unchanged"], true);
+        assert_eq!(sync(&mut c, &mut f, &inc(true, true)).unwrap()["new"], 1);
+        // Back to the default: removed by the reconciliation, reported apart.
+        let s = sync(&mut c, &mut f, &inc(false, false)).unwrap();
+        assert_eq!((s["excluded_removed"].as_u64(), s["deleted"].as_u64()), (Some(3), Some(0)), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 3);
+        assert_eq!(budget(&c), id, "a copy in a kept folder keeps its identity");
+        assert_eq!(
+            count(
+                &c,
+                "SELECT COUNT(*) FROM locations l JOIN messages m ON m.id = l.message WHERE m.id = (SELECT id FROM messages WHERE ident = 'mid:<a1@fict.invalid>')"
+            ),
+            1
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM chunks c LEFT JOIN messages m ON m.id = c.message WHERE m.id IS NULL"),
+            0
+        );
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'spam OR trash'"), 0);
+    }
+
+    #[test]
+    fn index_without_stored_choice_is_reconciled() {
+        // An index synced before the choice existed held every folder.
+        let (mut c, mut f) = (db(), with_well_known());
+        sync(&mut c, &mut f, &inc(true, true)).unwrap();
+        c.execute("DELETE FROM meta WHERE key = 'include_folders'", []).unwrap();
+        let s = run(&mut c, &mut f);
+        assert_eq!((s["unchanged"].as_bool(), s["excluded_removed"].as_u64()), (Some(false), Some(3)), "{s}");
+        assert_eq!(include(&c).unwrap(), Some(Include::default()));
+    }
+
+    #[test]
+    fn exclusion_is_not_a_mass_deletion() {
+        let mut f = mailbox();
+        f.folders.push(folder(0x62, "Deleted Items"));
+        for i in 0..150 {
+            f.add(0x10004 + i * 0x20, 0x62, Some(&format!("<t{i}@fict.invalid>")), "Bulk", "Bulk text.");
+        }
+        let mut c = db();
+        sync(&mut c, &mut f, &inc(true, false)).unwrap();
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 153);
+        // 150 of 153 leave, plus one real deletion: the guard counts the deletion only.
+        f.remove(0x224);
+        let s = sync(&mut c, &mut f, &inc(false, false)).unwrap();
+        assert_eq!((s["excluded_removed"].as_u64(), s["deleted"].as_u64()), (Some(150), Some(1)), "{s}");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM messages"), 2);
+        // A vanished folder is still guarded.
+        sync(&mut c, &mut f, &inc(true, false)).unwrap();
+        f.folders.retain(|x| x.nid != 0x62);
+        f.revision += 1;
+        assert_eq!(sync(&mut c, &mut f, &Options::default()).unwrap_err().kind(), "usage");
     }
 
     #[test]

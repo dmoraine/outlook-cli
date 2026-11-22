@@ -47,6 +47,11 @@ fn search_and_status_cli() {
     assert_eq!(o.status.code(), Some(2));
     let o = run(&["sync", "--allow-mass-delete", "--file", "/nonexistent.ost"], &idx);
     assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(4), "io"), "flag accepted");
+    for ok in [&["sync", "--include-folders", "deleted,junk"][..], &["sync", "--include-folders", "none"]] {
+        let o = run(&[ok, &["--file", "/nonexistent.ost"][..]].concat(), &idx);
+        assert_eq!(o.status.code(), Some(4), "{ok:?} accepted");
+    }
+    assert_eq!(run(&["sync", "--include-folders", "trash"], &idx).status.code(), Some(2));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -210,5 +215,61 @@ fn search_modes_cli() {
     for bad in [&["search", "budget", "--mode", "fuzzy"][..], &["search", "budget", "--model", "e5-large"]] {
         assert_eq!(cmd(bad).status.code(), Some(2), "{bad:?}");
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Model choice without model files: e5-base for a new index, else the
+/// index's model; another model needs --reembed. Same rule for `model fetch`
+/// and `bench-embed`.
+#[test]
+fn model_default_and_memory_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-default-cli-{}", std::process::id()));
+    let (idx, empty) = (dir.join("index.sqlite"), dir.join("empty"));
+    std::fs::create_dir_all(&empty).unwrap();
+    let cmd = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_outlook-index"));
+        c.args(args).arg("--index").arg(&idx).env("XDG_DATA_HOME", &dir).env("LOCALAPPDATA", &dir);
+        c.env_remove("OUTLOOK_INDEX_MODEL_DIR").arg("--model-dir").arg(&empty);
+        c
+    };
+    let fails = |args: &[&str], code: i32, model: &str| {
+        let o = cmd(args).output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.code() == Some(code) && err.contains(model), "{args:?}: {err}");
+    };
+    // No index yet: e5-base.
+    fails(&["bench-embed", "--seconds", "1"], 3, "e5-base");
+    #[cfg(unix)]
+    let fetched = |model: &str| {
+        let o = cmd(&["model", "fetch"]).env("PATH", "").output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        let first: serde_json::Value = serde_json::from_str(err.lines().next().unwrap()).unwrap();
+        assert_eq!(first["progress"]["model"], model, "{err}");
+    };
+    #[cfg(unix)]
+    fetched("e5-base");
+    assert!(!idx.exists(), "model commands do not create the index");
+    let c = outlook_cli::index::open(&idx).unwrap();
+    fails(&["embed"], 3, "e5-base");
+    fails(&["sync", "--file", "/nonexistent.ost"], 4, "");
+    // The index remembers its model.
+    c.execute("INSERT OR REPLACE INTO meta VALUES ('embed_model', 'e5-small')", []).unwrap();
+    fails(&["embed"], 3, "e5-small");
+    fails(&["bench-embed", "--seconds", "1"], 3, "e5-small");
+    #[cfg(unix)]
+    fetched("e5-small");
+    // Vectors of e5-small: another model needs --reembed.
+    let m = outlook_cli::index::model::get("e5-small").unwrap();
+    c.execute_batch(
+        "INSERT INTO messages(id, ident, received, has_attachments) VALUES (1, 'mid:x', 0, 0);
+         INSERT INTO chunks(message, seq, text) VALUES (1, 0, 'x');",
+    )
+    .unwrap();
+    let blob = vec![0u8; m.dims * 4];
+    c.execute("INSERT INTO vectors VALUES (1, ?1, ?2, ?3)", rusqlite::params![m.name, m.revision, blob]).unwrap();
+    fails(&["embed", "--model", "e5-base"], 2, "--reembed");
+    fails(&["embed", "--model", "e5-base", "--reembed"], 3, "e5-base");
+    fails(&["embed"], 3, "e5-small");
+    drop(c);
     std::fs::remove_dir_all(&dir).unwrap();
 }
