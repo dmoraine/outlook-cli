@@ -8,7 +8,7 @@ use serde_json::{Value as Json, json};
 use outlook_cli::error::{Error, Result};
 use outlook_cli::index::doctor::{self, StoreSource};
 use outlook_cli::index::embed::{self, Embedder};
-use outlook_cli::index::{self, extract, model, search, sync, vectors, worker};
+use outlook_cli::index::{self, attach, extract, model, search, sync, vectors, worker};
 use outlook_cli::paths::{default_file, native_path};
 use outlook_cli::timeutil::parse_when;
 
@@ -76,9 +76,10 @@ enum Cmd {
         attachments: bool,
     },
     /// Bring the index up to date with the file (every mail folder): new,
-    /// deleted, moved and read/unread changes, then embed pending chunks of
-    /// the embedding scope when the model files are present. Prints counts
-    /// only. Resumable: an interrupted sync continues where it stopped.
+    /// deleted, moved and read/unread changes, then attachment text (see
+    /// `scope`), then embed pending chunks of the embedding scope when the
+    /// model files are present. Prints counts only. Resumable: an
+    /// interrupted sync continues where it stopped.
     Sync {
         /// Stop after this long (90s, 30m, 2h), embedding included; the next
         /// sync resumes.
@@ -91,6 +92,10 @@ enum Cmd {
         /// Index only; skip the embedding step.
         #[arg(long)]
         no_embed: bool,
+        /// Skip the attachment step (no attachment is listed or read); a
+        /// later sync without it catches up.
+        #[arg(long)]
+        no_attachments: bool,
         /// Also index these well-known folders with their subfolders
         /// (deleted = Deleted Items, junk = Junk E-mail; none = neither, the
         /// default). Stored in the index: later syncs keep the choice.
@@ -112,9 +117,10 @@ enum Cmd {
         #[command(flatten)]
         embed: EmbedArgs,
     },
-    /// Show the persisted embedding scope with counts, or change it. Search
-    /// covers every folder; only embeddings are limited. Vectors that fall
-    /// out of scope are kept. Folder specs are counted, not printed.
+    /// Show the persisted embedding and attachment scopes with counts, or
+    /// change them. Search covers every folder; only embeddings are limited.
+    /// Vectors and attachment texts that fall out of scope are kept. Folder
+    /// specs are counted, not printed.
     Scope {
         /// Embed messages received at or after (2026-01-01, 90d, ...),
         /// stored as an absolute time.
@@ -127,8 +133,14 @@ enum Cmd {
         /// `search -F`); repeatable = any. Replaces the stored folders.
         #[arg(short = 'F', long = "folder")]
         folders: Vec<String>,
-        /// Reset the scope to everything.
-        #[arg(long, conflicts_with_all = ["embed_since", "embed_until", "folders"])]
+        /// Attachment types to index (comma-separated); replaces the stored list.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        attachment_types: Option<Vec<extract::Kind>>,
+        /// Largest attachment to read, in MB (default 20).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=100))]
+        attachment_max_mb: Option<u64>,
+        /// Reset both scopes to their defaults (everything; every attachment type, 20 MB).
+        #[arg(long, conflicts_with_all = ["embed_since", "embed_until", "folders", "attachment_types", "attachment_max_mb"])]
         clear: bool,
     },
     /// Search the index. Best chunk per message. keyword: every word (FTS5,
@@ -436,7 +448,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 doctor::run(&f, &index_path, sample.unwrap_or(200)).map_err(doctor::sanitize)?
             }
         }
-        Cmd::Sync { ref max_time, allow_mass_delete, no_embed, ref include_folders, ref embed } => {
+        Cmd::Sync { ref max_time, allow_mass_delete, no_embed, no_attachments, ref include_folders, ref embed } => {
             let start = Instant::now();
             let max_time = max_time.as_deref().map(parse_duration).transpose()?;
             let include = include_folders.as_ref().map(|v| sync::Include {
@@ -449,7 +461,14 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let _lock = sync::lock(&index_path)?;
             // Model choice is checked before indexing.
             let m = if no_embed { None } else { Some(embed.model(&c)?) };
-            let mut v = sync::sync(&mut c, &mut StoreSource::open(&f)?, &opts)?;
+            // Each attachment is parsed in a child process (30 s timeout, restarted after a failure).
+            let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| Error::Io(e.to_string()))?);
+            cmd.arg("extract-worker");
+            let limits = extract::Limits { max_bytes: attach::scope(&c)?.max_bytes as usize, ..Default::default() };
+            let mut x = extract::Isolated::new(cmd, extract::TIMEOUT, limits);
+            let mut extract = |b: &[u8], n: Option<&str>, m: Option<&str>| x.extract(b, n, m);
+            let extract: Option<&mut doctor::ExtractFn> = if no_attachments { None } else { Some(&mut extract) };
+            let mut v = sync::sync_with(&mut c, &mut StoreSource::open(&f)?, extract, &opts)?;
             let e = match m {
                 None => json!({ "skipped": "--no-embed" }),
                 Some(_) if max_time.is_some_and(|t| start.elapsed() >= t) => {
@@ -468,28 +487,49 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let m = embed.model(&c)?;
             embed_step(&mut c, embed, m, start, max_time, false)?
         }
-        Cmd::Scope { embed_since, embed_until, folders, clear } => {
-            let c = if clear || embed_since.is_some() || embed_until.is_some() || !folders.is_empty() {
+        Cmd::Scope { embed_since, embed_until, folders, attachment_types, attachment_max_mb, clear } => {
+            let embedding = clear || embed_since.is_some() || embed_until.is_some() || !folders.is_empty();
+            let attachments = clear || attachment_types.is_some() || attachment_max_mb.is_some();
+            let mut requeued = None;
+            let c = if embedding || attachments {
                 let c = index::open(&index_path)?;
                 let _lock = sync::lock(&index_path)?;
-                let mut s = if clear { vectors::Scope::default() } else { vectors::scope(&c)? };
-                if let Some(t) = embed_since {
-                    s.since = Some(parse_when(&t)?);
-                    s.since_input = Some(t);
+                if embedding {
+                    let mut s = if clear { vectors::Scope::default() } else { vectors::scope(&c)? };
+                    if let Some(t) = embed_since {
+                        s.since = Some(parse_when(&t)?);
+                        s.since_input = Some(t);
+                    }
+                    if let Some(t) = embed_until {
+                        s.until = Some(parse_when(&t)?);
+                        s.until_input = Some(t);
+                    }
+                    if !folders.is_empty() {
+                        s.folders = folders;
+                    }
+                    vectors::set_scope(&c, &s)?;
                 }
-                if let Some(t) = embed_until {
-                    s.until = Some(parse_when(&t)?);
-                    s.until_input = Some(t);
+                if attachments {
+                    let mut a = if clear { attach::Scope::default() } else { attach::scope(&c)? };
+                    if let Some(t) = attachment_types {
+                        a.types = t;
+                    }
+                    if let Some(mb) = attachment_max_mb {
+                        a.max_bytes = mb << 20;
+                    }
+                    requeued = Some(attach::set_scope(&c, &a)?);
                 }
-                if !folders.is_empty() {
-                    s.folders = folders;
-                }
-                vectors::set_scope(&c, &s)?;
                 c
             } else {
                 index::open(&existing(index_path)?)?
             };
-            vectors::counts(&c)?
+            let mut v = vectors::counts(&c)?;
+            v["attachments"] = attach::counts(&c)?;
+            if let Some(n) = requeued {
+                // Messages whose skipped attachments the next sync reads again.
+                v["attachments"]["requeued_messages"] = json!(n);
+            }
+            v
         }
         Cmd::Search {
             query,

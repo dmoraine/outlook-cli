@@ -158,7 +158,9 @@ year, full-scan time, and for `--sample` messages picked at random: open+text, o
 text lengths, a chunk estimate, Message-ID coverage of the scanned rows (`messages.with_message_id` /
 `without_message_id`), attachment counts by extension/method and sizes, and `well_known`: for the Inbox, Deleted
 Items and Junk E-mail, `found`, `method` (`entry_ids`, `entry_id_nid`, `entry_id_source_key`, `name`, `not_found`)
-and the message count. Distributions are
+and the message count; Deleted Items and Junk add `entry_id` facts on the entry-id path (`present`, `length`,
+`tail_nid_exists`, `tail_nid_is_folder`, `folders_with_source_key`, `source_key_match`, `source_key_in_entry_id`;
+booleans and counts only). Distributions are
 `{min, p50, p95, max, sum}`. Errors: counts by kind only; a fatal error prints `{"error":{"kind","message"}}` with a
 fixed message. No subjects, addresses, names, folder or attachment names, body text or paths.
 
@@ -166,8 +168,7 @@ fixed message. No subjects, addresses, names, folder or attachment names, body t
 
 ### Attachment text (diagnostic)
 
-Attachment text extraction exists as a library and a diagnostic only; `sync` and `search` do not use it yet.
-Supported: PDF (text layer, pages separated by a blank line; no OCR), DOCX (paragraphs), PPTX (slides in number
+Used by `sync` (see *Attachments in the index*) and by this diagnostic. Supported: PDF (text layer, pages separated by a blank line; no OCR), DOCX (paragraphs), PPTX (slides in number
 order), XLSX (sheet name line, one line per row, cells tab-separated; at most 20,000 rows per sheet and 200,000
 cells), TXT and CSV (UTF-8, UTF-16 with BOM, else Windows-1252), HTML. The type comes from the extension, then the
 magic bytes, then the MIME type. Text is whitespace-normalised and capped at 2,000,000 characters (`truncated`).
@@ -219,10 +220,33 @@ else by their default localized name at the top level. `--include-folders delete
 forces a full reconciliation. Messages leaving the index because of the exclusion are reported as
 `excluded_removed`, not `deleted`, and do not count for the mass-deletion limit.
 
+### Attachments in the index
+
+`sync` then reads the attachments of new messages (and, once, of messages indexed before attachments existed: a
+backfill, newest first, in batches, resumable with `--max-time`). Inline attachments, images, files over the max
+size, embedded messages, links and unknown extensions are skipped from their properties, without reading the data;
+the rest is read, hashed (SHA-256) and, for a content not seen before, extracted in the child process (30 s
+timeout, restarted after a failure). A content is stored and chunked once, shared by every message carrying it, and
+deleted with its last message. A `failed` or `timeout` extraction is retried by the next syncs, 3 attempts in
+all. FTS covers the whole extracted text; attachment chunks are not embedded yet. `--no-attachments` skips the step.
+Summary: `attachments_extracted`, `attachments_deduplicated`, `attachments_failed`,
+`attachments_skipped_by_reason` (`inline`, `image`, `too_large`, `unsupported_type`, `excluded_type`,
+`embedded_message`, `encrypted`, `empty_text`), `attachments_errors`, `attachments_remaining` (messages).
+
+```powershell
+outlook-index.exe scope --attachment-types pdf,docx,xlsx,pptx,txt,csv,html --attachment-max-mb 20   # the defaults
+outlook-index.exe sync --no-attachments                            # bodies only; a later sync catches up
+```
+
+The attachment scope is stored in the index. Narrowing it keeps stored texts (`attachments.out_of_scope`);
+attachments skipped as `too_large` or `excluded_type` are read again by the next sync after a change
+(`requeued_messages`). `status` and `scope` print `attachments`: links, `contents` (hashed), `distinct`, `chunks`,
+`by_outcome`, `skipped_by_reason`, `pending_messages`, `scope`.
+
 `search` modes (`--mode`):
 
 - `keyword` matches every word, accent- and case-insensitive (FTS5 `unicode61 remove_diacritics 2`), over subject
-  and body. Query operators and quotes are plain words.
+  and body, or within one attachment chunk. Query operators and quotes are plain words.
 - `semantic` embeds the query locally (`query: ` prefix, model of the stored vectors) and ranks the embedded chunks
   by cosine similarity (brute force over the vectors, streamed from SQLite; no ANN index). It finds other wordings
   and the other language (a French query finds an English mail). Only embedded chunks (the embedding scope) are
@@ -245,7 +269,8 @@ outlook-index.exe search "server outage" --mode hybrid --format jsonl
 Filters apply to every mode: `-F` folder name, or path with its subfolders (`Inbox` matches `Inbox/Projects`, not
 `Inboxes`; repeatable), `--since`/`--until`, `--from`, `--to`, `--has-attachments`. Output: `{count, mode, hits}`
 (`--format jsonl`: one hit per line). One hit per message (its best chunk): `{id, message_id, folder, received,
-subject, from, excerpt, source, ranks, scores}`; `ranks`/`scores` hold `keyword` (bm25), `semantic` (cosine) and,
+subject, from, excerpt, source, ranks, scores}`; `source` is `"body"` or `{"kind": "attachment", "index", "name",
+"type"}` with the excerpt from the attachment; `ranks`/`scores` hold `keyword` (bm25), `semantic` (cosine) and,
 in hybrid, `hybrid` and `rrf`, for the legs that found the message. Hybrid hits also carry `keyword_rank` and
 `semantic_rank` (`null` when that leg missed the message) and `score` (the RRF score). `id` works with `outlook-cli get` until the
 message moves (then run `sync`). Excerpts: 300 characters by default, `--excerpt-max` up to 2000; a keyword excerpt

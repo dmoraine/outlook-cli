@@ -273,3 +273,35 @@ fn model_default_and_memory_cli() {
     drop(c);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Attachment scope and `--no-attachments` on the command line. Counts only.
+#[test]
+fn attachments_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-att-cli-{}", std::process::id()));
+    let idx = dir.join("index.sqlite");
+    let json = |o: &Output| -> serde_json::Value {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    let v = json(&run(&["scope", "--attachment-types", "pdf,docx", "--attachment-max-mb", "5"], &idx));
+    let a = &v["attachments"];
+    assert_eq!(a["scope"], serde_json::json!({ "types": ["pdf", "docx"], "max_bytes": 5 << 20 }), "{v}");
+    assert_eq!((a["distinct"].as_u64(), a["out_of_scope"].as_u64()), (Some(0), Some(0)), "{v}");
+    let v = json(&run(&["scope", "--embed-since", "2026-01-01"], &idx));
+    assert_eq!(v["attachments"]["scope"]["max_bytes"], 5 << 20, "kept: {v}");
+    let v = json(&run(&["status"], &idx));
+    assert_eq!(v["attachments"]["scope"]["types"], serde_json::json!(["pdf", "docx"]), "{v}");
+    let v = json(&run(&["scope", "--clear"], &idx));
+    assert_eq!(v["attachments"]["scope"]["types"].as_array().map(Vec::len), Some(7), "{v}");
+    for bad in [
+        &["scope", "--attachment-max-mb", "0"][..],
+        &["scope", "--attachment-max-mb", "101"],
+        &["scope", "--attachment-types", "zip"],
+        &["scope", "--clear", "--attachment-types", "pdf"],
+    ] {
+        assert_eq!(run(bad, &idx).status.code(), Some(2), "{bad:?}");
+    }
+    let o = run(&["sync", "--no-attachments", "--no-embed", "--file", "/nonexistent.ost"], &idx);
+    assert_eq!(o.status.code(), Some(4), "flag accepted");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

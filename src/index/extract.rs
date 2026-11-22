@@ -19,7 +19,7 @@ use crate::body::{decode_text, html_to_text, tidy, truncate};
 use crate::error::{Error, Result};
 use crate::store::Attachment;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Pdf,
@@ -32,6 +32,8 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub const ALL: [Kind; 7] = [Kind::Pdf, Kind::Docx, Kind::Xlsx, Kind::Pptx, Kind::Txt, Kind::Csv, Kind::Html];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Pdf => "pdf",
@@ -169,6 +171,18 @@ fn by_magic(b: &[u8]) -> Option<Typed> {
     Some(Ok(k.1))
 }
 
+/// Kind from the name, then the MIME type, without the data: None when
+/// neither tells.
+pub fn declared(name: Option<&str>, mime: Option<&str>) -> Option<std::result::Result<Kind, Skip>> {
+    by_ext(name).or_else(|| by_mime(mime))
+}
+
+/// Kind of read data (extension, magic bytes, MIME type), or why to skip it;
+/// a panic is `failed`.
+pub fn kind(b: &[u8], name: Option<&str>, mime: Option<&str>) -> std::result::Result<Kind, Skip> {
+    catch_unwind(|| detect(b, name, mime)).unwrap_or(Err(Skip::Failed))
+}
+
 /// Type from the extension first, then magic bytes, then the MIME type.
 fn detect(b: &[u8], name: Option<&str>, mime: Option<&str>) -> Typed {
     by_ext(name).or_else(|| by_magic(b)).or_else(|| by_mime(mime)).unwrap_or(Err(Skip::UnsupportedType))
@@ -181,7 +195,7 @@ pub fn skip_attachment(a: &Attachment, l: &Limits) -> Option<Skip> {
         Some(Skip::EmbeddedMessage)
     } else if a.inline {
         Some(Skip::Inline)
-    } else if let Some(Err(s)) = by_ext(name).or_else(|| by_mime(mime)) {
+    } else if let Some(Err(s)) = declared(name, mime) {
         Some(s)
     } else if a.size.is_some_and(|s| s > l.max_bytes as i64) {
         Some(Skip::TooLarge)
@@ -195,7 +209,7 @@ pub fn skip_attachment(a: &Attachment, l: &Limits) -> Option<Skip> {
 /// Kind from the name and MIME type only ("image", "other" when unknown);
 /// a fixed label, never part of the name.
 pub fn label(name: Option<&str>, mime: Option<&str>) -> &'static str {
-    match by_ext(name).or_else(|| by_mime(mime)) {
+    match declared(name, mime) {
         Some(Ok(k)) => k.as_str(),
         Some(Err(_)) => "image",
         None => "other",
@@ -216,7 +230,7 @@ fn check(bytes: &[u8], name: Option<&str>, mime: Option<&str>, l: &Limits) -> Ty
     if bytes.len() > l.max_bytes {
         return Err(Skip::TooLarge);
     }
-    catch_unwind(|| detect(bytes, name, mime)).unwrap_or(Err(Skip::Failed))
+    kind(bytes, name, mime)
 }
 
 /// Parse as `kind`, normalise, cap.

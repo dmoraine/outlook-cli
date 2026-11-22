@@ -14,7 +14,9 @@ use super::text;
 use crate::body::text_of;
 use crate::error::{Error, Result, with_retry};
 use crate::ndb::Nid;
-use crate::store::{Attachment, Folder, Found, MSGFLAG_HASATTACH, MSGFLAG_READ, Store, WellKnown, is_mail_folder};
+use crate::store::{
+    Attachment, EntryIdFacts, Folder, Found, MSGFLAG_HASATTACH, MSGFLAG_READ, Store, WellKnown, is_mail_folder,
+};
 use crate::timeutil::format_ft;
 
 /// One contents-table row, reduced to what doctor needs.
@@ -43,6 +45,10 @@ pub trait Source {
     fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown>;
     /// Content of a by-value attachment of message `nid`.
     fn attachment_data(&mut self, nid: Nid, a: &Attachment) -> Result<Vec<u8>>;
+    /// Entry-id facts for Deleted Items and Junk E-mail; None when unknown.
+    fn well_known_facts(&mut self, _folders: &[Folder]) -> Result<Option<[EntryIdFacts; 2]>> {
+        Ok(None)
+    }
 }
 
 /// Chunking assumed for the chunk estimate (characters).
@@ -208,6 +214,10 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
         bump(&mut errors, e.kind());
         WellKnown::default()
     });
+    let facts = src.well_known_facts(&mail).unwrap_or_else(|e| {
+        bump(&mut errors, e.kind());
+        None
+    });
 
     let t = Instant::now();
     let (mut rows, mut per_folder) = (Vec::new(), BTreeMap::new());
@@ -221,10 +231,14 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
         }
     }
     let scan_time = t.elapsed();
-    // No name, no id: found, method, message count.
-    let well_known = |w: Found| {
+    // No name, no id: found, method, message count; entry-id facts when known.
+    let well_known = |w: Found, f: Option<EntryIdFacts>| {
         let messages = w.nid.map(|n| per_folder.get(&n).copied().unwrap_or(0));
-        json!({ "found": w.nid.is_some(), "method": w.method, "messages": messages })
+        let mut v = json!({ "found": w.nid.is_some(), "method": w.method, "messages": messages });
+        if let Some(f) = f {
+            v["entry_id"] = json!(f);
+        }
+        v
     };
     let (mut m_class, mut m_year) = (BTreeMap::new(), BTreeMap::new());
     let (mut unread, mut with_att, mut with_mid) = (0, 0, 0);
@@ -288,9 +302,9 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
             "by_depth": f_depth,
         },
         "well_known": {
-            "inbox": well_known(wk.inbox),
-            "deleted_items": well_known(wk.deleted_items),
-            "junk": well_known(wk.junk),
+            "inbox": well_known(wk.inbox, None),
+            "deleted_items": well_known(wk.deleted_items, facts.map(|f| f[0])),
+            "junk": well_known(wk.junk, facts.map(|f| f[1])),
         },
         "messages": {
             "total": rows.len(),
@@ -401,6 +415,10 @@ impl Source for StoreSource {
 
     fn attachment_data(&mut self, nid: Nid, a: &Attachment) -> Result<Vec<u8>> {
         self.retry(|s| s.message(nid)?.attachment_data(a))
+    }
+
+    fn well_known_facts(&mut self, folders: &[Folder]) -> Result<Option<[EntryIdFacts; 2]>> {
+        self.retry(|s| s.well_known_facts(folders)).map(Some)
     }
 }
 
@@ -588,7 +606,7 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use crate::index::extract;
-    use crate::store::{DELETED_ITEMS_NAMES, JUNK_NAMES, locate};
+    use crate::store::{DELETED_ITEMS_NAMES, EntryIdFacts, JUNK_NAMES, entry_id_facts, locate};
 
     const MARKERS: &[&str] = &["SECRET", "Alice", "bob@example.org", "Quarterly"];
 
@@ -708,6 +726,17 @@ mod tests {
                 junk: locate(folders, Some(&junk_id), JUNK_NAMES, &mut key)?,
             })
         }
+        fn well_known_facts(&mut self, folders: &[Folder]) -> Result<Option<[EntryIdFacts; 2]>> {
+            let mut junk_id = vec![0u8; 22];
+            junk_id.extend([5; 22]);
+            junk_id.extend([0, 0]);
+            let mut key = |n: Nid| Ok((n == 4).then(|| vec![5u8; 22]));
+            let mut exists = |_| Ok(false);
+            Ok(Some([
+                entry_id_facts(folders, None, &mut exists, &mut key)?,
+                entry_id_facts(folders, Some(&junk_id), &mut exists, &mut key)?,
+            ]))
+        }
         fn attachment_data(&mut self, _: Nid, _: &Attachment) -> Result<Vec<u8>> {
             Err(Error::NotFound("SECRET_ERR".into()))
         }
@@ -821,8 +850,20 @@ mod tests {
         let v = report(&mut WellKnownFake, 0, 0);
         let w = &v["well_known"];
         assert_eq!(w["inbox"], json!({ "found": true, "method": "name", "messages": 1 }), "{v}");
-        assert_eq!(w["deleted_items"], json!({ "found": true, "method": "name", "messages": 2 }), "{v}");
-        assert_eq!(w["junk"], json!({ "found": true, "method": "entry_id_source_key", "messages": 4 }), "{v}");
+        let d = &w["deleted_items"];
+        assert_eq!((&d["found"], &d["method"], &d["messages"]), (&json!(true), &json!("name"), &json!(2)), "{v}");
+        let j = &w["junk"];
+        assert_eq!((&j["method"], &j["messages"]), (&json!("entry_id_source_key"), &json!(4)), "{v}");
+        // Entry-id facts for Deleted Items and Junk only, aggregates.
+        assert!(w["inbox"].get("entry_id").is_none(), "{v}");
+        assert_eq!(
+            d["entry_id"],
+            json!({ "present": false, "length": null, "tail_nid_exists": false, "tail_nid_is_folder": false,
+                    "folders_with_source_key": 1, "source_key_match": false, "source_key_in_entry_id": false }),
+            "{v}"
+        );
+        let e = &j["entry_id"];
+        assert_eq!((&e["present"], &e["length"], &e["source_key_match"]), (&json!(true), &json!(46), &json!(true)));
         let s = v.to_string();
         for m in ["SECRET", "Inbox", "Éléments", "supprimés"] {
             assert!(!s.contains(m), "doctor output leaks {m:?}: {s}");

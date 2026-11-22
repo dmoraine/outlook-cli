@@ -159,10 +159,13 @@ pub fn plan(
 /// Best chunk of a message in one leg.
 struct Leg {
     message: i64,
+    /// A body chunk, or an attachment chunk when `attachment` is set.
     chunk: i64,
     score: f64,
     /// Keyword snippet; else the chunk start.
     excerpt: Option<String>,
+    /// Index of the message attachment the chunk comes from.
+    attachment: Option<i64>,
 }
 
 /// Sender/recipient filters (case-insensitive contains, any), checked in Rust.
@@ -193,17 +196,25 @@ impl People {
 
 const PEOPLE: &str = "m.from_name, m.from_email, m.sender, m.display_to, m.display_cc";
 
-/// Keyword leg: FTS5 `expr`, best chunk per message by bm25, at most `limit` messages.
+/// Keyword leg: FTS5 `expr` over body and attachment chunks (an attachment
+/// chunk counts for every message carrying it), best chunk per message by
+/// bm25, at most `limit` messages.
 // ponytail: walks every matching chunk to group; fine for one mailbox, add a
-// per-message MIN(bm25) pass if very common words get slow.
+// per-message MIN(bm25) pass if very common words get slow. bm25 of the two
+// FTS tables are compared as is (separate corpus statistics).
 fn keyword_leg(c: &Connection, q: &Query, expr: &str, folders: &str, limit: usize) -> Result<Vec<Leg>> {
     // snippet() counts tokens (FTS5 caps at 64); the char bound is applied after.
     let tokens = (excerpt_max(q) / 6).clamp(4, 64) as i64;
     let sql = format!(
-        "SELECT m.id, c.id, bm25(chunks_fts), {PEOPLE}
+        "SELECT m.id, c.id, bm25(chunks_fts), {PEOPLE}, NULL
          FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid JOIN messages m ON m.id = c.message
          WHERE chunks_fts MATCH ?1 AND {FILTER}
-         ORDER BY bm25(chunks_fts)"
+         UNION ALL
+         SELECT m.id, a.id, bm25(attachment_fts), {PEOPLE}, ma.idx
+         FROM attachment_fts JOIN attachment_chunks a ON a.id = attachment_fts.rowid
+         JOIN message_attachments ma ON ma.sha256 = a.sha256 JOIN messages m ON m.id = ma.message
+         WHERE attachment_fts MATCH ?1 AND {FILTER}
+         ORDER BY 3"
     );
     let people = People::new(q);
     let mut st = c.prepare(&sql).map_err(db_err)?;
@@ -221,15 +232,17 @@ fn keyword_leg(c: &Connection, q: &Query, expr: &str, folders: &str, limit: usiz
             chunk: r.get(1).map_err(db_err)?,
             score: -r.get::<_, f64>(2).map_err(db_err)?,
             excerpt: None,
+            attachment: r.get(8).map_err(db_err)?,
         });
     }
     // Snippets for the kept chunks only (costly on every match).
-    let mut st = c
-        .prepare(
-            "SELECT snippet(chunks_fts, 1, '', '', '...', ?3) FROM chunks_fts WHERE chunks_fts MATCH ?1 AND rowid = ?2",
-        )
-        .map_err(db_err)?;
+    let snippet = |t: &str, col: i64| {
+        c.prepare(&format!("SELECT snippet({t}, {col}, '', '', '...', ?3) FROM {t} WHERE {t} MATCH ?1 AND rowid = ?2"))
+            .map_err(db_err)
+    };
+    let (mut body, mut att) = (snippet("chunks_fts", 1)?, snippet("attachment_fts", 0)?);
     for l in &mut out {
+        let st = if l.attachment.is_some() { &mut att } else { &mut body };
         l.excerpt = Some(st.query_row(params![expr, l.chunk, tokens], |r| r.get(0)).map_err(db_err)?);
     }
     Ok(out)
@@ -310,7 +323,10 @@ fn semantic_leg(c: &Connection, q: &Query, m: &Model, v: &[f32], folders: &str, 
     push(best);
     let mut out = heap.into_sorted_vec();
     out.truncate(limit);
-    Ok(out.into_iter().map(|Reverse(b)| Leg { message: b.1, chunk: b.2, score: b.0 as f64, excerpt: None }).collect())
+    Ok(out
+        .into_iter()
+        .map(|Reverse(b)| Leg { message: b.1, chunk: b.2, score: b.0 as f64, excerpt: None, attachment: None })
+        .collect())
 }
 
 /// Reciprocal Rank Fusion of ranked message lists: sum of 1 / (k + rank).
@@ -358,6 +374,20 @@ fn hit(c: &Connection, q: &Query, folders: &str, leg: &Leg, ranks: Json, scores:
             if rest.trim().is_empty() { text } else { rest.trim_start().to_string() }
         }
     };
+    let source = match leg.attachment {
+        None => json!("body"),
+        Some(i) => c
+            .query_row(
+                "SELECT ma.name, ac.kind FROM message_attachments ma
+                 LEFT JOIN attachment_contents ac ON ac.sha256 = ma.sha256 WHERE ma.message = ?1 AND ma.idx = ?2",
+                params![leg.message, i],
+                |r| {
+                    let s = |k| r.get::<_, Option<String>>(k);
+                    Ok(json!({ "kind": "attachment", "index": i, "name": s(0)?, "type": s(1)? }))
+                },
+            )
+            .map_err(db_err)?,
+    };
     c.query_row(
         "SELECT l.nid, m.message_id, f.path, m.received, m.sent, m.subject, m.from_name, m.sender, m.from_email,
                 m.display_to, m.display_cc, m.size, m.class, m.has_attachments, l.flags
@@ -385,7 +415,7 @@ fn hit(c: &Connection, q: &Query, folders: &str, leg: &Leg, ranks: Json, scores:
                 "has_attachments": r.get::<_, bool>(13)?,
                 "read": r.get::<_, i64>(14)? & MSGFLAG_READ != 0,
                 "excerpt": crate::body::truncate(excerpt, excerpt_max(q)).0,
-                "source": "body",
+                "source": source,
                 "ranks": ranks,
                 "scores": scores,
             }))
@@ -460,6 +490,7 @@ pub fn status(c: &Connection) -> Result<Json> {
     o.insert("schema".into(), json!(super::schema_version(c)?));
     o.insert("embedding".into(), super::vectors::counts(c)?);
     o.insert("include".into(), json!(super::sync::include(c)?.unwrap_or_default()));
+    o.insert("attachments".into(), super::attach::counts(c)?);
     let bytes = c.query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |r| {
         r.get::<_, i64>(0)
     });
@@ -705,6 +736,72 @@ mod tests {
         for m in ["Zed", "Ann", "fict", "Budget", "budget", "Inbox", "Archive", "Lunch", "kickoff"] {
             assert!(!t.contains(m), "status leaks {m:?}: {t}");
         }
+    }
+
+    // --- attachments ---
+
+    /// indexed() plus 0x704 (body "See the offer.", a PDF and a DOCX) and
+    /// 0x724 (Archive) whose body and attachment both say "budget".
+    fn with_attachments() -> (Connection, Fake) {
+        use crate::index::extract::tests::{docx, pdf};
+        let (mut c, mut f) = indexed();
+        f.add(0x704, 0x22, Some("<o@fict.invalid>"), "Offer", "See the offer.");
+        f.attach(0x704, "offer.pdf", None, false, &pdf(&["Zorbulex pricing table"]));
+        f.attach(0x704, "notes.docx", None, false, &docx(&["Plimsoll minutes", "budget zorbulex"]));
+        f.add(0x724, 0x42, Some("<p@fict.invalid>"), "Plan", "The budget plan.");
+        f.attach(0x724, "plan.txt", None, false, b"Budget plan details, budget again.");
+        let mut x = |b: &[u8], n: Option<&str>, m: Option<&str>| crate::index::extract::extract(b, n, m);
+        crate::index::sync::sync_with(&mut c, &mut f, Some(&mut x), &Options::default()).unwrap();
+        (c, f)
+    }
+
+    #[test]
+    fn attachment_hits_attributed() {
+        let (mut c, mut f) = with_attachments();
+        let hits = search(&c, &q("plimsoll")).unwrap();
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!((h["id"].as_u64(), h["subject"].as_str()), (Some(0x704), Some("Offer")));
+        assert_eq!(h["source"], json!({ "kind": "attachment", "index": 1, "name": "notes.docx", "type": "docx" }));
+        assert!(h["excerpt"].as_str().unwrap().contains("Plimsoll"), "{h}");
+        // Words spread over two attachments of one message: no hit (every word in one chunk).
+        assert_eq!(ids(&c, &q("pricing minutes")), Vec::<u64>::new());
+        // Body and attachment both match: one hit.
+        let mut v = ids(&c, &q("budget"));
+        v.sort();
+        assert_eq!(v, [0x204, 0x304, 0x704, 0x724], "one hit per message");
+        let h = &search(&c, &q("zorbulex")).unwrap()[0];
+        assert_eq!(h["source"]["kind"], "attachment");
+        assert_eq!(search(&c, &q("lunch")).unwrap()[0]["source"], "body", "body hits unchanged");
+        // Filters as for bodies.
+        assert_eq!(ids(&c, &Query { folders: vec!["Archive".into()], ..q("zorbulex") }), Vec::<u64>::new());
+        assert_eq!(ids(&c, &Query { has_attachments: true, ..q("plimsoll") }), [0x704]);
+        assert_eq!(
+            ids(&c, &Query { since: Some(134_000_000_000_000_000 + 0x705 * 10_000_000), ..q("plimsoll") }),
+            Vec::<u64>::new()
+        );
+        // Current location after a move.
+        f.relocate(0x704, 0x744, 0x42);
+        sync(&mut c, &mut f, &Options::default()).unwrap();
+        let h = &search(&c, &q("plimsoll")).unwrap()[0];
+        assert_eq!((h["id"].as_u64(), h["folder"].as_str()), (Some(0x744), Some("Archive/2026")));
+        assert_eq!(h["source"]["name"], "notes.docx");
+    }
+
+    #[test]
+    fn attachment_chunks_not_embedded() {
+        let (mut c, _) = with_attachments();
+        let body: i64 = c.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+        assert_eq!(status(&c).unwrap()["embedding"]["pending"], body, "attachments are not in the embedding scope");
+        embed(&mut c);
+        let v: i64 = c.query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, body);
+        // Hybrid: the keyword leg still finds attachment words.
+        let h = search(&c, &sem("plimsoll", Mode::Hybrid)).unwrap();
+        let hit = h.iter().find(|h| h["id"] == 0x704).unwrap();
+        assert!(hit["keyword_rank"].is_u64() && hit["source"]["kind"] == "attachment", "{hit}");
+        let s = status(&c).unwrap();
+        assert_eq!((s["attachments"]["distinct"].as_u64(), s["attachments"]["chunks"].as_u64()), (Some(3), Some(3)));
     }
 
     // --- semantic and hybrid ---

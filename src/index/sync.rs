@@ -7,13 +7,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 
+use super::attach;
 use super::db_err;
-use super::doctor::{Source, StoreSource};
+use super::doctor::{ExtractFn, Source, StoreSource};
 use super::text::{chunk, strip_quotes};
 use crate::body::text_of;
 use crate::error::{Error, Result};
 use crate::ndb::Nid;
-use crate::store::{Folder, MSGFLAG_HASATTACH, WellKnown, is_mail_folder, tag};
+use crate::store::{Attachment, Folder, MSGFLAG_HASATTACH, WellKnown, is_mail_folder, tag};
 use crate::timeutil::{format_ft, now_ft};
 
 /// One contents-table row: everything sync needs without opening the message.
@@ -51,6 +52,10 @@ pub trait MailSource {
     fn open(&mut self, nid: Nid) -> Result<Opened>;
     /// Inbox, Deleted Items and Junk E-mail among `folders`.
     fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown>;
+    /// Attachments of message `nid`: properties only, no data.
+    fn attachments(&mut self, nid: Nid) -> Result<Vec<Attachment>>;
+    /// Data of attachment `a` of message `nid`.
+    fn attachment_data(&mut self, nid: Nid, a: &Attachment) -> Result<Vec<u8>>;
 }
 
 /// The real file, with the doctor's retry/reopen on inconsistent reads.
@@ -102,6 +107,14 @@ impl MailSource for StoreSource {
 
     fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown> {
         self.retry(|s| s.well_known(folders))
+    }
+
+    fn attachments(&mut self, nid: Nid) -> Result<Vec<Attachment>> {
+        self.retry(|s| s.message(nid)?.attachments())
+    }
+
+    fn attachment_data(&mut self, nid: Nid, a: &Attachment) -> Result<Vec<u8>> {
+        Source::attachment_data(self, nid, a)
     }
 }
 
@@ -175,17 +188,27 @@ pub fn set_meta(c: &Connection, key: &str, value: &str) -> Result<()> {
     c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)", [key, value]).map(drop).map_err(db_err)
 }
 
+/// `sync_with` without the attachment phase (`--no-attachments`).
+pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result<Json> {
+    sync_with(c, src, None, o)
+}
+
 /// Reconcile the index with `src`: new, deleted, moved/copied messages and
 /// flag changes. Only new messages are opened. New messages are committed in
-/// batches, so an interrupted run resumes where it stopped. Returns a
+/// batches, so an interrupted run resumes where it stopped. Then, with `x`,
+/// the attachment phase (`attach::phase`), in batches too. Returns a
 /// count-only summary (no content, no names).
-pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result<Json> {
+pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut ExtractFn>, o: &Options) -> Result<Json> {
     let start = Instant::now();
     let revision = src.revision()?;
     let stored = include(c)?;
     let inc = o.include.or(stored).unwrap_or_default();
     let complete_before = get_meta(c, "sync_complete")?.as_deref() == Some("1");
-    if complete_before && stored == Some(inc) && get_meta(c, "sync_revision")?.as_deref() == Some(revision.as_str()) {
+    if complete_before
+        && stored == Some(inc)
+        && get_meta(c, "sync_revision")?.as_deref() == Some(revision.as_str())
+        && (x.is_none() || attach::pending(c)? == 0)
+    {
         let at = get_meta(c, "sync_at")?.and_then(|t| t.parse().ok()).and_then(|t| format_ft(t, false));
         return Ok(json!({
             "unchanged": true,
@@ -306,7 +329,11 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
             .map_err(db_err)?;
         for (id, _) in &gone {
             tx.execute("DELETE FROM chunks WHERE message = ?1", [id]).map_err(db_err)?;
+            tx.execute("DELETE FROM message_attachments WHERE message = ?1", [id]).map_err(db_err)?;
             tx.execute("DELETE FROM messages WHERE id = ?1", [id]).map_err(db_err)?;
+        }
+        if !gone.is_empty() {
+            attach::gc(&tx)?;
         }
         let out = gone.iter().filter(|(_, ident)| kept_out.contains(ident)).count() as u64;
         (gone.len() as u64 - out, out)
@@ -380,9 +407,17 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
         batches += 1;
     }
 
+    let over = || o.max_time.is_some_and(|m| start.elapsed() > m);
+    let with_attachments = x.is_some();
+    let att = match x {
+        Some(x) if !interrupted => Some(attach::phase(c, src, x, o.batch, batches > 0, &over)?),
+        _ => None,
+    };
+    let att_remaining = attach::pending(c)?;
+
     // Failed opens are retried by the next sync (never skipped: incomplete).
     let failed: u64 = errors.values().sum();
-    let complete = !interrupted && failed == 0;
+    let complete = !interrupted && failed == 0 && (!with_attachments || att_remaining == 0);
     let now = now_ft();
     set_meta(c, "sync_revision", &revision)?;
     set_meta(c, "sync_complete", if complete { "1" } else { "0" })?;
@@ -407,6 +442,22 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
         "totals": totals(c)?,
         "elapsed_ms": start.elapsed().as_millis() as u64,
     });
+    let mut summary = summary;
+    let o = summary.as_object_mut().unwrap();
+    match att {
+        Some(a) => {
+            o.insert("attachments_extracted".into(), json!(a.extracted));
+            o.insert("attachments_deduplicated".into(), json!(a.deduplicated));
+            o.insert("attachments_failed".into(), json!(a.failed));
+            o.insert("attachments_skipped_by_reason".into(), json!(a.skipped));
+            o.insert("attachments_errors".into(), json!(a.errors));
+        }
+        None => {
+            o.insert("attachments".into(), json!(if with_attachments { "not_started" } else { "skipped" }));
+        }
+    }
+    // Messages whose attachments are still to read (new, backfill, retries).
+    o.insert("attachments_remaining".into(), json!(att_remaining));
     set_meta(c, "sync_last", &summary.to_string())?;
     Ok(summary)
 }
@@ -437,6 +488,11 @@ pub mod fake {
         pub entries: Vec<Entry>,
         pub bodies: BTreeMap<Nid, String>,
         pub opened: Vec<Nid>,
+        /// Attachments with their data, by message NID.
+        pub files: BTreeMap<Nid, Vec<(Attachment, Vec<u8>)>>,
+        /// Attachment lists read, and attachment data read (NID, index).
+        pub listed: Vec<Nid>,
+        pub reads: Vec<(Nid, usize)>,
     }
 
     pub fn folder(nid: Nid, path: &str) -> Folder {
@@ -471,6 +527,32 @@ pub mod fake {
             self.entries.last_mut().unwrap()
         }
 
+        /// A by-value attachment of `nid`; sets the message's attachment flag.
+        pub fn attach(
+            &mut self,
+            nid: Nid,
+            name: &str,
+            mime: Option<&str>,
+            inline: bool,
+            data: &[u8],
+        ) -> &mut Attachment {
+            self.entries.iter_mut().find(|e| e.nid == nid).unwrap().flags |= MSGFLAG_HASATTACH;
+            let v = self.files.entry(nid).or_default();
+            let a = Attachment {
+                index: v.len(),
+                name: (!name.is_empty()).then(|| name.into()),
+                size: Some(data.len() as i64),
+                mime_type: mime.map(str::to_string),
+                content_id: None,
+                method: "by_value",
+                inline,
+                nid: 0,
+            };
+            v.push((a, data.to_vec()));
+            self.revision += 1;
+            &mut v.last_mut().unwrap().0
+        }
+
         /// Move: new NID in another folder, same content.
         pub fn relocate(&mut self, nid: Nid, new_nid: Nid, folder: Nid) {
             let e = self.entries.iter_mut().find(|e| e.nid == nid).unwrap();
@@ -478,6 +560,9 @@ pub mod fake {
             e.folder = folder;
             let b = self.bodies.remove(&nid).unwrap();
             self.bodies.insert(new_nid, b);
+            if let Some(a) = self.files.remove(&nid) {
+                self.files.insert(new_nid, a);
+            }
             self.revision += 1;
         }
 
@@ -508,6 +593,15 @@ pub mod fake {
                 to: Some("Ann Fict".into()),
                 cc: Some("Cy Fict".into()),
             })
+        }
+        fn attachments(&mut self, nid: Nid) -> Result<Vec<Attachment>> {
+            self.listed.push(nid);
+            Ok(self.files.get(&nid).map(|v| v.iter().map(|x| x.0.clone()).collect()).unwrap_or_default())
+        }
+        fn attachment_data(&mut self, nid: Nid, a: &Attachment) -> Result<Vec<u8>> {
+            self.reads.push((nid, a.index));
+            let v = self.files.get(&nid).and_then(|v| v.get(a.index));
+            v.map(|x| x.1.clone()).ok_or_else(|| Error::NotFound("attachment".into()))
         }
         /// By name, as a file without well-known entry ids.
         fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown> {

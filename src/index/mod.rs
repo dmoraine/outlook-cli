@@ -2,6 +2,7 @@
 //! migrations, `doctor`, `sync`, `search`, `status`, local embeddings and
 //! stored vectors.
 
+pub mod attach;
 pub mod doctor;
 pub mod embed;
 pub mod extract;
@@ -78,6 +79,47 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (chunk, model));
      CREATE TRIGGER chunks_vectors_ad AFTER DELETE ON chunks BEGIN
         DELETE FROM vectors WHERE chunk = old.id;
+     END;",
+    // Attachments. A content (SHA-256 of the data) is extracted and chunked
+    // once, shared by every message attachment carrying it; it goes with
+    // its last link (`attach::gc`). Failed/timeout contents are retried up
+    // to `attach::MAX_ATTEMPTS`. `messages.attachments_done` NULL = the
+    // message's attachments are still to be read (new or backfill).
+    "ALTER TABLE messages ADD COLUMN attachments_done INTEGER;
+     CREATE TABLE attachment_contents (
+        sha256 TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        outcome TEXT NOT NULL,
+        chars INTEGER,
+        truncated INTEGER NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 1,
+        extracted_at INTEGER NOT NULL);
+     CREATE TABLE message_attachments (
+        message INTEGER NOT NULL REFERENCES messages(id),
+        idx INTEGER NOT NULL,
+        name TEXT,
+        size INTEGER,
+        mime TEXT,
+        sha256 TEXT,
+        skip TEXT,
+        PRIMARY KEY (message, idx));
+     CREATE INDEX message_attachments_sha ON message_attachments(sha256);
+     CREATE TABLE attachment_chunks (
+        id INTEGER PRIMARY KEY,
+        sha256 TEXT NOT NULL REFERENCES attachment_contents(sha256),
+        seq INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        start_char INTEGER,
+        end_char INTEGER);
+     CREATE INDEX attachment_chunks_sha ON attachment_chunks(sha256);
+     CREATE VIRTUAL TABLE attachment_fts USING fts5(text, content = 'attachment_chunks', content_rowid = 'id',
+        tokenize = 'unicode61 remove_diacritics 2');
+     CREATE TRIGGER attachment_chunks_ai AFTER INSERT ON attachment_chunks BEGIN
+        INSERT INTO attachment_fts(rowid, text) VALUES (new.id, new.text);
+     END;
+     CREATE TRIGGER attachment_chunks_ad AFTER DELETE ON attachment_chunks BEGIN
+        INSERT INTO attachment_fts(attachment_fts, rowid, text) VALUES ('delete', old.id, old.text);
      END;",
 ];
 
@@ -213,6 +255,19 @@ mod tests {
             .query_row("SELECT start_char, end_char, text FROM chunks", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap();
         assert_eq!(r, (None, None, "old".into()), "existing rows stay, ranges NULL");
+    }
+
+    #[test]
+    fn attachment_migration_queues_old_messages() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT)").unwrap();
+        for (i, sql) in MIGRATIONS[..4].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.execute("INSERT INTO schema_version(version) VALUES (?1)", [i as i64 + 1]).unwrap();
+        }
+        c.execute("INSERT INTO messages(id, ident, received, has_attachments) VALUES (1, 'mid:x', 0, 1)", []).unwrap();
+        migrate(&mut c).unwrap();
+        assert_eq!(attach::pending(&c).unwrap(), 1, "indexed before attachments: to backfill");
     }
 
     #[test]
