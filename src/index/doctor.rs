@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value as Json, json};
+use sha2::{Digest, Sha256};
 
+use super::extract::{Isolated, Limits, Outcome, Skip, label, skip_attachment};
+use super::text;
 use crate::body::text_of;
 use crate::error::{Error, Result, with_retry};
 use crate::ndb::Nid;
@@ -38,6 +41,8 @@ pub trait Source {
     fn sample(&mut self, nid: Nid) -> Result<Sample>;
     /// Inbox, Deleted Items and Junk E-mail among `folders`.
     fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown>;
+    /// Content of a by-value attachment of message `nid`.
+    fn attachment_data(&mut self, nid: Nid, a: &Attachment) -> Result<Vec<u8>>;
 }
 
 /// Chunking assumed for the chunk estimate (characters).
@@ -393,6 +398,151 @@ impl Source for StoreSource {
     fn well_known(&mut self, folders: &[Folder]) -> Result<WellKnown> {
         self.retry(|s| s.well_known(folders))
     }
+
+    fn attachment_data(&mut self, nid: Nid, a: &Attachment) -> Result<Vec<u8>> {
+        self.retry(|s| s.message(nid)?.attachment_data(a))
+    }
+}
+
+/// Extraction of (bytes, name, MIME type).
+pub type ExtractFn<'a> = dyn FnMut(&[u8], Option<&str>, Option<&str>) -> Outcome + 'a;
+
+/// Distinct SHA-256 among the hashed attachments.
+pub fn dedupe(hashes: &[[u8; 32]]) -> Json {
+    let distinct = hashes.iter().collect::<std::collections::HashSet<_>>().len();
+    let ratio = (!hashes.is_empty()).then(|| round2(distinct as f64 / hashes.len() as f64));
+    json!({ "hashed": hashes.len(), "distinct": distinct, "distinct_ratio": ratio })
+}
+
+/// `doctor --attachments`: whole messages, chosen at random among those
+/// with attachments, until `sample` attachments are seen; each read
+/// attachment is hashed and its content extracted once. Aggregates only:
+/// fixed kind labels and skip reasons, counts, sizes, durations.
+pub fn attachments_report(
+    src: &mut dyn Source,
+    sample: usize,
+    seed: u64,
+    limits: &Limits,
+    extract: &mut ExtractFn,
+) -> Json {
+    let mut errors: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let t = Instant::now();
+    let folders = src.folders().unwrap_or_else(|e| {
+        bump(&mut errors, e.kind());
+        Vec::new()
+    });
+    let mut nids = Vec::new();
+    for f in folders.iter().filter(|f| is_mail_folder(f)) {
+        match src.rows(f.nid) {
+            Ok(r) => nids.extend(r.into_iter().filter(|r| r.flags & MSGFLAG_HASATTACH != 0).map(|r| r.nid)),
+            Err(e) => bump(&mut errors, e.kind()),
+        }
+    }
+    let scan_time = t.elapsed();
+
+    let mut by_kind: BTreeMap<&str, BTreeMap<&str, u64>> = BTreeMap::new();
+    let (mut by_outcome, mut chunks_by_kind) = (BTreeMap::new(), BTreeMap::<&str, usize>::new());
+    let (mut hashes, mut done) = (Vec::new(), std::collections::HashMap::new());
+    let (mut chars, mut time_us, mut truncated) = (Vec::new(), Vec::new(), 0u64);
+    let (mut messages, mut seen) = (0u64, 0usize);
+    let t = Instant::now();
+    for i in pick(nids.len(), nids.len(), seed) {
+        if seen >= sample {
+            break;
+        }
+        let m = match src.sample(nids[i]) {
+            Ok(m) => m,
+            Err(e) => {
+                bump(&mut errors, e.kind());
+                continue;
+            }
+        };
+        messages += 1;
+        for a in &m.attachments {
+            seen += 1;
+            let (name, mime) = (a.name.as_deref(), a.mime_type.as_deref());
+            let r = match skip_attachment(a, limits) {
+                Some(s) => Err(s),
+                None => match src.attachment_data(nids[i], a) {
+                    Err(e) => {
+                        bump(&mut errors, e.kind());
+                        Err(Skip::Failed)
+                    }
+                    Ok(d) => {
+                        let h: [u8; 32] = Sha256::digest(&d).into();
+                        hashes.push(h);
+                        *done.entry(h).or_insert_with(|| {
+                            let t = Instant::now();
+                            let r = extract(&d, name, mime);
+                            time_us.push(t.elapsed().as_micros() as u64);
+                            r.map(|e| {
+                                chars.push(e.text.chars().count() as u64);
+                                truncated += u64::from(e.truncated);
+                                *chunks_by_kind.entry(e.kind.as_str()).or_default() += text::chunk(&e.text).len();
+                                e.kind.as_str()
+                            })
+                        })
+                    }
+                },
+            };
+            let outcome = r.map_or_else(Skip::as_str, |_| "ok");
+            bump(by_kind.entry(r.unwrap_or_else(|_| label(name, mime))).or_default(), outcome);
+            bump(&mut by_outcome, outcome);
+        }
+    }
+    let sample_time = t.elapsed();
+    let estimate =
+        |n: usize| if messages == 0 { 0 } else { (n as f64 / messages as f64 * nids.len() as f64).round() as u64 };
+    let chunks: BTreeMap<_, _> =
+        chunks_by_kind.iter().map(|(k, &n)| (*k, json!({ "sample": n, "mailbox_estimate": estimate(n) }))).collect();
+    let total: usize = chunks_by_kind.values().sum();
+    json!({
+        "requested": sample,
+        "messages_with_attachments": nids.len(),
+        "messages": messages,
+        "attachments": seen,
+        "by_kind": by_kind,
+        "by_outcome": by_outcome,
+        "extracted": {
+            "distinct_ok": chars.len(),
+            "truncated": truncated,
+            "chars": dist(chars),
+            "time_us": dist(time_us),
+        },
+        "chunks": {
+            "chunk_chars": CHUNK_CHARS,
+            "overlap": CHUNK_OVERLAP,
+            "by_kind": chunks,
+            "sample_total": total,
+            "mailbox_estimate": estimate(total),
+        },
+        "dedupe": dedupe(&hashes),
+        "timings_ms": { "scan": ms(scan_time), "sample": ms(sample_time) },
+        "errors": errors,
+    })
+}
+
+/// Full `doctor --attachments` report, extracting through `x` (child process).
+pub fn run_attachments(file: &Path, sample: usize, x: &mut Isolated) -> Result<Json> {
+    let t = Instant::now();
+    let mut src = StoreSource::open(file).map_err(sanitize)?;
+    let seed = std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), t.elapsed());
+    let l = x.limits;
+    let a = attachments_report(&mut src, sample, seed, &l, &mut |b, n, m| x.extract(b, n, m));
+    let ndb = &src.store.ndb;
+    Ok(json!({
+        "tool": { "name": "outlook-index", "version": env!("CARGO_PKG_VERSION") },
+        "file": { "kind": if ndb.is_ost { "ost" } else { "pst" }, "format": ndb.format.name(), "bytes": ndb.file_len() },
+        "limits": {
+            "max_bytes": l.max_bytes,
+            "max_chars": l.max_chars,
+            "max_rows": l.max_rows,
+            "max_cells": l.max_cells,
+            "timeout_s": x.timeout.as_secs(),
+        },
+        "workers_started": x.spawned,
+        "attachments": a,
+    }))
 }
 
 /// Keep the kind, replace the message with a fixed one: messages may hold
@@ -437,6 +587,7 @@ pub fn run(file: &Path, index: &Path, sample: usize) -> Result<Json> {
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::index::extract;
     use crate::store::{DELETED_ITEMS_NAMES, JUNK_NAMES, locate};
 
     const MARKERS: &[&str] = &["SECRET", "Alice", "bob@example.org", "Quarterly"];
@@ -521,6 +672,9 @@ mod tests {
         fn well_known(&mut self, _: &[Folder]) -> Result<WellKnown> {
             Err(Error::NotFound("SECRET_ERR".into()))
         }
+        fn attachment_data(&mut self, _: Nid, _: &Attachment) -> Result<Vec<u8>> {
+            Ok(b"SECRET_BODY Alice".to_vec())
+        }
     }
 
     /// Inbox, Deleted Items (French name), its subfolder and Junk (by source
@@ -554,6 +708,112 @@ mod tests {
                 junk: locate(folders, Some(&junk_id), JUNK_NAMES, &mut key)?,
             })
         }
+        fn attachment_data(&mut self, _: Nid, _: &Attachment) -> Result<Vec<u8>> {
+            Err(Error::NotFound("SECRET_ERR".into()))
+        }
+    }
+
+    /// Messages 10 and 11 have attachments with marker names and contents
+    /// (a PDF twice, an inline image, a forward, a text, a broken DOCX, a
+    /// 30 MB PDF); 12 has none.
+    struct AttFake;
+
+    fn data(name: &str) -> Vec<u8> {
+        match name {
+            n if n.ends_with(".pdf") => extract::tests::pdf(&["SECRET_TEXT Alice Quarterly"]),
+            n if n.ends_with(".txt") => b"SECRET_BODY from bob@example.org".to_vec(),
+            n if n.ends_with(".docx") => b"PK\x03\x04 SECRET broken".to_vec(),
+            _ => b"SECRET image".to_vec(),
+        }
+    }
+
+    impl Source for AttFake {
+        fn folders(&mut self) -> Result<Vec<Folder>> {
+            Ok(vec![folder(1, "SECRET_FOLDER_Alice", Some("IPF.Note"), 0)])
+        }
+        fn rows(&mut self, _: Nid) -> Result<Vec<Row>> {
+            let row = |nid, flags| Row { nid, class: None, received: 0, flags, has_message_id: true };
+            Ok(vec![row(10, MSGFLAG_HASATTACH), row(11, MSGFLAG_HASATTACH), row(12, 0)])
+        }
+        fn sample(&mut self, nid: Nid) -> Result<Sample> {
+            let mut logo = att(1, "SECRET_logo_Alice.png", "by_value", 900);
+            logo.inline = true;
+            let attachments = match nid {
+                10 => vec![
+                    att(0, "SECRET_Alice_invoice.pdf", "by_value", 900),
+                    logo,
+                    att(2, "SECRET copy Alice.pdf", "by_value", 900),
+                    att(3, "SECRET fwd", "embedded_message", 500),
+                ],
+                11 => vec![
+                    att(0, "SECRET_notes_Alice.txt", "by_value", 40),
+                    att(1, "SECRET_Alice.docx", "by_value", 30),
+                    att(2, "SECRET_big_Alice.pdf", "by_value", 30_000_000),
+                ],
+                _ => panic!("message without attachments opened"),
+            };
+            Ok(Sample { text: Some("SECRET_BODY".into()), text_time: Duration::ZERO, attachments })
+        }
+        fn well_known(&mut self, _: &[Folder]) -> Result<WellKnown> {
+            Ok(WellKnown::default())
+        }
+        fn attachment_data(&mut self, _: Nid, a: &Attachment) -> Result<Vec<u8>> {
+            Ok(data(a.name.as_deref().unwrap()))
+        }
+    }
+
+    fn att_report(src: &mut dyn Source, sample: usize) -> Json {
+        let l = Limits::default();
+        attachments_report(src, sample, 7, &l, &mut |b, n, m| extract::extract_with(b, n, m, &l))
+    }
+
+    #[test]
+    fn attachment_doctor_has_no_mail_content() {
+        let v = att_report(&mut AttFake, 300);
+        let s = v.to_string();
+        for m in MARKERS.iter().chain(&["invoice", "logo", "notes", "copy", "fwd"]) {
+            assert!(!s.contains(m), "attachment doctor leaks {m:?}: {s}");
+        }
+        assert_eq!((v["messages_with_attachments"].as_u64(), v["messages"].as_u64()), (Some(2), Some(2)), "{v}");
+        assert_eq!(v["attachments"], 7, "{v}");
+        let k = &v["by_kind"];
+        assert_eq!(k["pdf"], json!({ "ok": 2, "too_large": 1 }), "{v}");
+        assert_eq!(k["image"], json!({ "inline": 1 }), "{v}");
+        assert_eq!(k["other"], json!({ "embedded_message": 1 }), "{v}");
+        assert_eq!(k["txt"], json!({ "ok": 1 }), "{v}");
+        assert_eq!(k["docx"], json!({ "failed": 1 }), "{v}");
+        assert_eq!(v["by_outcome"]["ok"], 3, "{v}");
+        // Hashed: pdf, its copy, txt, docx. Extracted once per content.
+        assert_eq!(v["dedupe"], json!({ "hashed": 4, "distinct": 3, "distinct_ratio": 0.75 }), "{v}");
+        assert_eq!(v["extracted"]["distinct_ok"], 2, "{v}");
+        let pdf_chars = "SECRET_TEXT Alice Quarterly".len() as u64;
+        assert_eq!(v["extracted"]["chars"]["sum"], pdf_chars + 32, "{v}");
+        assert!(v["extracted"]["time_us"]["p95"].is_u64(), "{v}");
+        // One chunk each over 2 messages; 2 messages with attachments in the mailbox.
+        assert_eq!(v["chunks"]["by_kind"]["pdf"], json!({ "sample": 1, "mailbox_estimate": 1 }), "{v}");
+        assert_eq!(v["chunks"]["mailbox_estimate"], 2, "{v}");
+        assert_eq!(v["errors"], json!({}), "{v}");
+
+        // Whole messages up to the requested count.
+        let v = att_report(&mut AttFake, 1);
+        assert_eq!(v["messages"], 1, "{v}");
+        assert!(matches!(v["attachments"].as_u64(), Some(3 | 4)), "{v}");
+
+        // Read errors are counted by kind only.
+        let v = att_report(&mut Fake, 10);
+        assert!(!v.to_string().contains("SECRET"), "{v}");
+        assert_eq!(v["attachments"], 3, "{v}");
+        assert_eq!(v["by_kind"]["pdf"]["failed"], 1, "marker bytes are no PDF: {v}");
+    }
+
+    #[test]
+    fn dedupe_ratio() {
+        let h = |b: u8| [b; 32];
+        assert_eq!(
+            dedupe(&[h(1), h(2), h(1), h(3), h(1)]),
+            json!({ "hashed": 5, "distinct": 3, "distinct_ratio": 0.6 })
+        );
+        assert_eq!(dedupe(&[]), json!({ "hashed": 0, "distinct": 0, "distinct_ratio": null }));
     }
 
     #[test]

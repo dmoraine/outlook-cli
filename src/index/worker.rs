@@ -31,13 +31,13 @@ fn io(e: std::io::Error) -> Error {
     Error::Io(format!("embedding worker: {e}"))
 }
 
-fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<()> {
+pub(crate) fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<()> {
     let n = u32::try_from(payload.len()).map_err(|_| Error::Format("frame too large".into()))?;
     w.write_all(&n.to_le_bytes()).and_then(|_| w.write_all(payload)).and_then(|_| w.flush()).map_err(io)
 }
 
 /// Next frame; None at end of input.
-fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
     let mut n = [0u8; 4];
     match r.read_exact(&mut n) {
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),

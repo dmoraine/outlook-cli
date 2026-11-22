@@ -164,6 +164,32 @@ fixed message. No subjects, addresses, names, folder or attachment names, body t
 
 **Paste back**: the whole stdout JSON, plus any stderr line (`{"warning":...}` or `{"error":...}`). Read it first.
 
+### Attachment text (diagnostic)
+
+Attachment text extraction exists as a library and a diagnostic only; `sync` and `search` do not use it yet.
+Supported: PDF (text layer, pages separated by a blank line; no OCR), DOCX (paragraphs), PPTX (slides in number
+order), XLSX (sheet name line, one line per row, cells tab-separated; at most 20,000 rows per sheet and 200,000
+cells), TXT and CSV (UTF-8, UTF-16 with BOM, else Windows-1252), HTML. The type comes from the extension, then the
+magic bytes, then the MIME type. Text is whitespace-normalised and capped at 2,000,000 characters (`truncated`).
+Skip reasons: `image`, `inline`, `too_large` (> 20 MB), `unsupported_type` (including archives and old `.doc`/`.xls`),
+`embedded_message`, `encrypted`, `empty_text` (e.g. a scanned PDF), `failed` (malformed file, parser panic or worker
+crash), `timeout`. Each file is parsed in a child process (`outlook-index extract-worker`, internal), killed after
+30 s and restarted for the next file.
+
+```powershell
+outlook-index.exe doctor --attachments --pretty               # 300 attachments of random messages
+outlook-index.exe doctor --attachments --sample 1000 --pretty # more precise, slower
+```
+
+It opens random messages with attachments (whole messages) until `--sample` attachments are seen and prints
+aggregates only: `by_kind` (`pdf`, `docx`, ..., `image`, `other`) × outcome (`ok` or a skip reason), `by_outcome`,
+`extracted` (distinct contents that gave text: chars and extraction time `{min, p50, p95, max, sum}` in µs, count
+truncated), `chunks` per kind (same chunking as bodies, sample and mailbox estimate), `dedupe` (`hashed` attachments,
+`distinct` SHA-256, `distinct_ratio`; the same content is extracted once), `limits`, `workers_started` (more than 1 =
+restarts after a timeout or crash), and error counts by kind. No file names, text or subjects.
+
+**Paste back**: the whole stdout JSON and any stderr line.
+
 Index file: `--index` / `OUTLOOK_INDEX_DB`, default `%LOCALAPPDATA%\outlook-cli\index.sqlite` (Linux:
 `$XDG_DATA_HOME/outlook-cli/index.sqlite`). A path under OneDrive gets a warning. `doctor` does not create it.
 

@@ -10,9 +10,16 @@ fn doctor_errors_leak_nothing() {
     let junk = dir.join("SECRET_Alice.ost");
     std::fs::write(&junk, b"SECRET_BODY not a pst".repeat(100)).unwrap();
     let missing = dir.join("SECRET_missing.ost");
-    for (file, kind) in [(&junk, "format"), (&missing, "io")] {
+    for (file, kind, extra) in [
+        (&junk, "format", None),
+        (&missing, "io", None),
+        (&junk, "format", Some("--attachments")),
+        (&missing, "io", Some("--attachments")),
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_outlook-index"))
-            .args(["doctor", "--file"])
+            .arg("doctor")
+            .args(extra)
+            .arg("--file")
             .arg(file)
             .arg("--index")
             .arg(dir.join("SECRET_index.sqlite"))

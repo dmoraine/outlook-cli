@@ -8,7 +8,7 @@ use serde_json::{Value as Json, json};
 use outlook_cli::error::{Error, Result};
 use outlook_cli::index::doctor::{self, StoreSource};
 use outlook_cli::index::embed::{self, Embedder};
-use outlook_cli::index::{self, model, search, sync, vectors, worker};
+use outlook_cli::index::{self, extract, model, search, sync, vectors, worker};
 use outlook_cli::paths::{default_file, native_path};
 use outlook_cli::timeutil::parse_when;
 
@@ -64,9 +64,16 @@ enum Cmd {
     /// Aggregate-only diagnostics of the mailbox and this machine. Prints
     /// counts, sizes and timings only: no mail content, no names.
     Doctor {
-        /// Messages to open for body text and attachment statistics.
-        #[arg(long, default_value_t = 200)]
-        sample: usize,
+        /// Messages to open for body text and attachment statistics (default
+        /// 200); with --attachments, attachments to extract (default 300).
+        #[arg(long)]
+        sample: Option<usize>,
+        /// Attachment text extraction instead: whole random messages with
+        /// attachments, each attachment extracted in a child process (30 s
+        /// timeout). Counts per type and skip reason, sizes, timings,
+        /// estimated chunks and the SHA-256 dedupe ratio.
+        #[arg(long)]
+        attachments: bool,
     },
     /// Bring the index up to date with the file (every mail folder): new,
     /// deleted, moved and read/unread changes, then embed pending chunks of
@@ -189,6 +196,10 @@ enum Cmd {
         #[arg(long, default_value_t = embed::DEFAULT_BATCH as u64, value_parser = clap::value_parser!(u64).range(1..=256))]
         batch: u64,
     },
+    /// Internal: attachment extraction worker (frames on stdin/stdout, see
+    /// src/index/extract.rs).
+    #[command(hide = true)]
+    ExtractWorker,
     /// Internal: one embedding worker process of --workers (frames on
     /// stdin/stdout, see src/index/worker.rs).
     #[command(hide = true)]
@@ -395,6 +406,9 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         });
         return worker::serve(e, &mut std::io::stdin().lock(), &mut { out });
     }
+    if let Cmd::ExtractWorker = cli.cmd {
+        return extract::serve(&mut std::io::stdin().lock(), &mut { out });
+    }
     let file = || match &cli.file {
         Some(f) => Ok(native_path(f)),
         None => default_file(),
@@ -410,9 +424,17 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
     let mut lines = None;
     let v = match cli.cmd {
         // doctor output gets pasted back: its errors carry no path or content.
-        Cmd::Doctor { sample } => {
+        Cmd::Doctor { sample, attachments } => {
             let f = file().map_err(doctor::sanitize)?;
-            doctor::run(&f, &index_path, sample).map_err(doctor::sanitize)?
+            if attachments {
+                let exe = std::env::current_exe().map_err(|e| doctor::sanitize(Error::Io(e.to_string())))?;
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg("extract-worker");
+                let mut x = extract::Isolated::new(cmd, extract::TIMEOUT, extract::Limits::default());
+                doctor::run_attachments(&f, sample.unwrap_or(300), &mut x).map_err(doctor::sanitize)?
+            } else {
+                doctor::run(&f, &index_path, sample.unwrap_or(200)).map_err(doctor::sanitize)?
+            }
         }
         Cmd::Sync { ref max_time, allow_mass_delete, no_embed, ref include_folders, ref embed } => {
             let start = Instant::now();
@@ -530,7 +552,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 json!({ "count": hits.len(), "mode": run_mode, "hits": hits })
             }
         }
-        Cmd::EmbedWorker { .. } => unreachable!("served above"),
+        Cmd::EmbedWorker { .. } | Cmd::ExtractWorker => unreachable!("served above"),
         Cmd::Status => search::status(&index::open(&existing(index_path)?)?)?,
         Cmd::Model { cmd: ModelCmd::List } => model::list(model::default_dir)?,
         Cmd::Model { cmd: ModelCmd::Fetch { ref model } } => {
