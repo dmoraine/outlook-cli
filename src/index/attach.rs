@@ -49,8 +49,8 @@ pub fn scope(c: &Connection) -> Result<Scope> {
     }
 }
 
-/// Store the scope. Stored contents outside it are kept (`counts`:
-/// `out_of_scope`). Messages with an attachment skipped as too large or of
+/// Store the scope. Stored contents outside it are kept, through later
+/// syncs too (`counts`: `out_of_scope`). Messages with an attachment skipped as too large or of
 /// an excluded type are read again by the next sync; returns their number.
 pub fn set_scope(c: &Connection, s: &Scope) -> Result<usize> {
     if s.types.is_empty() {
@@ -189,9 +189,33 @@ fn link(tx: &Connection, message: i64, a: &Attachment, sha: Option<&str>, skip: 
     .map_err(db_err)
 }
 
-fn skipped(tx: &Connection, st: &mut Stats, message: i64, a: &Attachment, reason: &'static str) -> Result<bool> {
+/// Skip `a`. Out of the scope (type, size), a stored content stays linked
+/// while the attachment is the same (properties, and data `sha` when read):
+/// only a changed or removed attachment unlinks it, and `gc` collects a
+/// content with its last link.
+fn skipped(
+    tx: &Connection,
+    st: &mut Stats,
+    (message, a): (i64, &Attachment),
+    reason: &'static str,
+    sha: Option<&str>,
+) -> Result<bool> {
     *st.skipped.entry(reason).or_default() += 1;
-    link(tx, message, a, None, Some(reason))?;
+    let scope = reason == EXCLUDED_TYPE || reason == Skip::TooLarge.as_str();
+    let same: bool = scope
+        && tx
+            .query_row(
+                "SELECT 1 FROM message_attachments WHERE message = ?1 AND idx = ?2 AND sha256 IS NOT NULL
+                 AND name IS ?3 AND size IS ?4 AND mime IS ?5 AND (?6 IS NULL OR sha256 = ?6)",
+                params![message, a.index as i64, a.name, a.size, a.mime_type, sha],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(db_err)?
+            .is_some();
+    if !same {
+        link(tx, message, a, None, Some(reason))?;
+    }
     Ok(true)
 }
 
@@ -213,7 +237,7 @@ fn one(
     tried: &mut HashSet<String>,
 ) -> Result<bool> {
     if let Some(r) = before_read(a, s) {
-        return skipped(tx, st, message, a, r);
+        return skipped(tx, st, (message, a), r, None);
     }
     let data = match src.attachment_data(nid, a) {
         Ok(d) => d,
@@ -223,15 +247,15 @@ fn one(
         }
     };
     let (name, mime) = (a.name.as_deref(), a.mime_type.as_deref());
+    let sha = format!("{:x}", Sha256::digest(&data));
     if data.len() as u64 > s.max_bytes {
-        return skipped(tx, st, message, a, Skip::TooLarge.as_str());
+        return skipped(tx, st, (message, a), Skip::TooLarge.as_str(), Some(&sha));
     }
     let kind = match extract::kind(&data, name, mime) {
         Ok(k) if s.types.contains(&k) => k,
-        Ok(_) => return skipped(tx, st, message, a, EXCLUDED_TYPE),
-        Err(r) => return skipped(tx, st, message, a, r.as_str()),
+        Ok(_) => return skipped(tx, st, (message, a), EXCLUDED_TYPE, Some(&sha)),
+        Err(r) => return skipped(tx, st, (message, a), r.as_str(), Some(&sha)),
     };
-    let sha = format!("{:x}", Sha256::digest(&data));
     let prev: Option<(String, i64)> = tx
         .query_row("SELECT outcome, attempts FROM attachment_contents WHERE sha256 = ?1", [&sha], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -545,6 +569,81 @@ mod tests {
         for bad in [Scope { types: vec![], ..Scope::default() }, Scope { max_bytes: 0, ..Scope::default() }] {
             assert_eq!(set_scope(&c, &bad).unwrap_err().kind(), "usage");
         }
+    }
+
+    /// B2: a stored, embedded DOCX next to an oversized PDF. Narrowing the
+    /// types to PDF and syncing keeps the DOCX text, FTS rows and vectors
+    /// (counted out of scope); widening back extracts and embeds nothing;
+    /// deleting the last message still collects everything.
+    #[test]
+    fn narrowed_scope_keeps_stored_content() {
+        let (mut c, mut f) = (db(), mailbox());
+        f.add(0x604, 0x22, Some("<k1@fict.invalid>"), "Files", "See the files.");
+        f.attach(0x604, "minutes.docx", None, false, &docx(&["Minutes of the Plimsoll meeting"]));
+        f.attach(0x604, "big.pdf", None, false, b"%PDF- small data").size = Some(30 << 20);
+        let (_, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!(calls, 1);
+        let m = crate::index::model::get("e5-small").unwrap();
+        c.execute(
+            "INSERT INTO attachment_vectors SELECT id, ?1, ?2, zeroblob(?3) FROM attachment_chunks",
+            params![m.name, m.revision, (m.dims * 4) as i64],
+        )
+        .unwrap();
+        for (k, v) in [("embed_model", m.name), ("embed_revision", m.revision)] {
+            set_meta(&c, k, v).unwrap();
+        }
+        let stored = |c: &Connection| {
+            [
+                count(c, "SELECT COUNT(*) FROM attachment_contents"),
+                count(c, "SELECT COUNT(*) FROM attachment_chunks"),
+                count(c, "SELECT COUNT(*) FROM attachment_vectors"),
+                fts(c, "plimsoll"),
+                count(c, "SELECT COUNT(*) FROM message_attachments WHERE sha256 IS NOT NULL"),
+            ]
+        };
+        let before = stored(&c);
+        assert_eq!(before, [1, 1, 1, 1, 1]);
+
+        assert_eq!(set_scope(&c, &Scope { types: vec![Kind::Pdf], ..Scope::default() }).unwrap(), 1);
+        let (s, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((s["unchanged"].as_bool(), calls), (Some(false), 0), "{s}");
+        assert_eq!(stored(&c), before, "kept after a narrowed sync");
+        let v = counts(&c).unwrap();
+        assert_eq!((v["distinct"].as_u64(), v["out_of_scope"].as_u64()), (Some(1), Some(1)), "{v}");
+        let st = crate::index::search::status(&c).unwrap();
+        assert_eq!(st["attachments"]["out_of_scope"], 1, "{st}");
+        assert_eq!(st["embedding"]["attachment_chunks"]["out_of_scope_embedded"], 1, "{st}");
+
+        set_scope(&c, &Scope::default()).unwrap();
+        let (s, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((calls, s["attachments_extracted"].as_u64()), (0, Some(0)), "no re-extraction: {s}");
+        assert_eq!(stored(&c), before);
+        let v = crate::index::vectors::counts(&c).unwrap();
+        assert_eq!(v["attachment_chunks"]["pending"], 0, "no re-embedding: {v}");
+
+        // Below a narrower size limit: kept the same way.
+        set_scope(&c, &Scope { max_bytes: 10, ..Scope::default() }).unwrap();
+        let (s, calls) = run(&mut c, &mut f, &Options::default());
+        assert_eq!((calls, s["attachments_skipped_by_reason"]["too_large"].as_u64()), (0, Some(2)), "{s}");
+        assert_eq!((stored(&c), counts(&c).unwrap()["out_of_scope"].as_u64()), (before, Some(1)));
+        set_scope(&c, &Scope::default()).unwrap();
+        run(&mut c, &mut f, &Options::default());
+        assert_eq!(stored(&c), before);
+
+        // The source replaces the DOCX (same index, other file): the old content goes.
+        f.files.get_mut(&0x604).unwrap()[0].0.size = Some(1);
+        set_scope(&c, &Scope { types: vec![Kind::Pdf], ..Scope::default() }).unwrap();
+        run(&mut c, &mut f, &Options::default());
+        assert_eq!(stored(&c), [0, 0, 0, 0, 0], "replaced in the source");
+
+        // Last reference deleted: normal GC.
+        set_scope(&c, &Scope::default()).unwrap();
+        run(&mut c, &mut f, &Options::default());
+        assert_eq!(stored(&c), [1, 1, 0, 1, 1], "read again, to embed again");
+        f.remove(0x604);
+        run(&mut c, &mut f, &Options::default());
+        assert_eq!(stored(&c), [0, 0, 0, 0, 0], "last reference gone");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM attachment_fts"), 0);
     }
 
     #[test]

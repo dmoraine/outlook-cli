@@ -260,7 +260,7 @@ impl ModelArgs {
     /// --model, else the model of `index` when it exists (not created), else e5-base.
     fn resolve(&self, index: Option<&std::path::Path>) -> Result<(&'static model::Model, PathBuf)> {
         let stored = match index.filter(|p| p.exists()) {
-            Some(p) => vectors::current_model(&index::open(p)?)?,
+            Some(p) => vectors::current_model(&index::open_read(p)?)?,
             None => None,
         };
         let m = model::choose(self.model.as_deref(), stored.as_deref())?;
@@ -535,8 +535,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             });
             let opts = sync::Options { max_time, allow_mass_delete, include, ..Default::default() };
             let f = file()?;
-            let mut c = index::open(&index_path)?;
-            let _lock = sync::lock(&index_path)?;
+            let (mut c, _lock) = index::open_write(&index_path)?;
             // Model choice is checked before indexing.
             let m = if no_embed { None } else { Some(embed.model(&c)?) };
             // Each attachment is parsed in a child process (30 s timeout, restarted after a failure).
@@ -562,8 +561,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         Cmd::Embed { ref max_time, ref embed, ref progress } => {
             let start = Instant::now();
             let max_time = max_time.as_deref().map(parse_duration).transpose()?;
-            let mut c = index::open(&existing(index_path.clone())?)?;
-            let _lock = sync::lock(&index_path)?;
+            let (mut c, _lock) = index::open_write(&existing(index_path)?)?;
             let m = embed.model(&c)?;
             let mut p = progress.start(Some(embed.par.workers()), Some(m));
             let v = embed_step(&mut c, embed, m, start, max_time, false, &mut p)?;
@@ -586,9 +584,8 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 || attachment_chunks.is_some();
             let attachments = clear || attachment_types.is_some() || attachment_max_mb.is_some();
             let mut requeued = None;
-            let c = if embedding || attachments {
-                let c = index::open(&index_path)?;
-                let _lock = sync::lock(&index_path)?;
+            let (c, _lock) = if embedding || attachments {
+                let (c, lock) = index::open_write(&index_path)?;
                 if embedding {
                     let mut s = if clear { vectors::Scope::default() } else { vectors::scope(&c)? };
                     if let Some(t) = embed_since {
@@ -617,9 +614,11 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                     }
                     requeued = Some(attach::set_scope(&c, &a)?);
                 }
-                c
+                (c, Some(lock))
             } else {
-                index::open(&existing(index_path)?)?
+                let c = index::open_read(&index_path)?;
+                index::require_current(&c)?;
+                (c, None)
             };
             let mut v = vectors::counts(&c)?;
             v["attachments"] = attach::counts(&c)?;
@@ -647,7 +646,8 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let t = |o: Option<String>, flag| o.as_deref().map(|s| when(flag, s)).transpose();
             let (since, until) = (t(since, "--since")?, t(until, "--until")?);
             search::check_text(&query)?;
-            let c = index::open(&existing(index_path)?)?;
+            let c = index::open_read(&index_path)?;
+            index::require_current(&c)?;
             let (mut run_mode, m, warn) = search::plan(&c, mode, model.as_deref())?;
             let warning =
                 |kind: &str, msg: &str| eprintln!("{}", json!({ "warning": { "kind": kind, "message": msg } }));
@@ -682,7 +682,14 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 vector,
                 model: m,
             };
-            let hits = search::search(&c, &q)?;
+            // One snapshot from here, the model loaded before: plan again in it.
+            let snapshot = c.unchecked_transaction().map_err(|e| Error::Io(format!("index database: {e}")))?;
+            if run_mode != search::Mode::Keyword
+                && search::plan(&snapshot, mode, model.as_deref())?.1.map(|m| m.name) != m.map(|m| m.name)
+            {
+                return Err(Error::Corrupt("the index vectors changed during the search; retry".into()));
+            }
+            let hits = search::search(&snapshot, &q)?;
             if format == Format::Jsonl {
                 lines = Some(hits);
                 Json::Null
@@ -692,8 +699,8 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         }
         Cmd::EmbedWorker { .. } | Cmd::ExtractWorker => unreachable!("served above"),
         Cmd::Status { watch } => {
-            let path = existing(index_path)?;
-            let c = index::open(&path)?;
+            let path = index_path;
+            let c = index::open_read(&path)?;
             if let Some(secs) = watch {
                 // jsonl whatever --pretty: one line per tick.
                 loop {
@@ -784,6 +791,8 @@ const PUBLIC: &[&str] = &[
     "no data directory found; pass --model-dir or set OUTLOOK_INDEX_MODEL_DIR",
     "no .ost file found; pass --file or set OUTLOOK_CLI_FILE",
     "index schema 7 is newer than this tool; upgrade outlook-index",
+    "index schema 4 needs an upgrade; run `outlook-index sync`",
+    "the index vectors changed during the search; retry",
     INCLUDE_NONE,
     "invalid --max-time (use e.g. 90s, 30m, 2h)",
     "cannot parse --since (use e.g. 2026-10-15T08:00:00Z, '2026-10-15 08:00', 2026-10-15, 2h, 3d, today)",
@@ -835,7 +844,12 @@ fn template(m: &str) -> String {
 
 /// The public message of `e`: as is when listed in PUBLIC, else fixed per kind.
 fn public(e: &Error) -> String {
-    let (Error::Io(m) | Error::Format(m) | Error::Corrupt(m) | Error::NotFound(m) | Error::Usage(m)) = e;
+    let (Error::Io(m)
+    | Error::Format(m)
+    | Error::Corrupt(m)
+    | Error::NotFound(m)
+    | Error::Usage(m)
+    | Error::UpgradePending(m)) = e;
     let t = template(m);
     if PUBLIC.iter().any(|p| template(p) == t) {
         return e.to_string();
@@ -856,6 +870,7 @@ fn public(e: &Error) -> String {
         Error::Corrupt(_) => {
             "inconsistent data: the mailbox file changed during the read; retry (details: OUTLOOK_INDEX_DEBUG=1)"
         }
+        Error::UpgradePending(_) => "the index schema needs an upgrade; run `outlook-index sync`",
     }
     .into()
 }

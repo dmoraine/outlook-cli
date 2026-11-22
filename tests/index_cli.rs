@@ -41,7 +41,8 @@ fn search_and_status_cli() {
     }
     let o = run(&["status"], &idx);
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert!(v["schema"].as_u64().is_some_and(|s| s >= 2), "{v}");
+    assert!(v["schema"]["version"].as_u64().is_some_and(|s| s >= 2), "{v}");
+    assert_eq!(v["schema"]["upgrade_pending"], false, "{v}");
     assert!(v["last_sync"].get("revision").is_some() && v["last_sync"].get("at").is_some(), "{v}");
     let o = run(&["sync", "--max-time", "soon", "--file", "/nonexistent.ost"], &idx);
     assert_eq!(o.status.code(), Some(2));
@@ -399,5 +400,154 @@ fn progress_and_watch_cli() {
     let o = run(&["embed", "--progress", "bar", "--model-dir", dir.join("none").to_str().unwrap()], &idx);
     assert_eq!(o.status.code(), Some(3), "accepted");
     drop(c);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A schema-4 index (before attachments) with one fictitious message, as an
+/// older build left it, checkpointed into the main file.
+fn old_index(dir: &std::path::Path) -> std::path::PathBuf {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let idx = dir.join("index.sqlite");
+    let c = outlook_cli::index::open(&idx).unwrap();
+    c.execute_batch(
+        "DROP TABLE attachment_vectors; DROP TABLE attachment_fts; DROP TABLE attachment_chunks;
+         DROP TABLE message_attachments; DROP TABLE attachment_contents;
+         ALTER TABLE messages DROP COLUMN attachments_done;
+         DELETE FROM schema_version WHERE version > 4;
+         INSERT INTO folders VALUES (34, 'Inbox', 'Inbox');
+         INSERT INTO messages(id, ident, received, has_attachments, subject) VALUES (1, 'mid:x', 0, 0, 'Budget');
+         INSERT INTO locations VALUES (36, 34, 1, 1);
+         INSERT INTO chunks(message, seq, text) VALUES (1, 0, 'budget review');",
+    )
+    .unwrap();
+    drop(c);
+    idx
+}
+
+/// Schema version stored in the main file, read without migrating.
+fn file_schema(idx: &std::path::Path) -> i64 {
+    let c = rusqlite::Connection::open_with_flags(idx, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    c.query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0)).unwrap()
+}
+
+fn writer(idx: &std::path::Path) -> Output {
+    run(&["scope", "--attachment-max-mb", "20"], idx)
+}
+
+/// S2: read-only commands on an older schema neither migrate nor write;
+/// status reports the pending upgrade, search asks for a sync; a writer
+/// waits for the sync lock before migrating; concurrent readers and writers
+/// on an old index migrate once.
+#[test]
+fn old_schema_readers_and_writers_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-old-cli-{}", std::process::id()));
+    let idx = old_index(&dir);
+    let bytes = std::fs::read(&idx).unwrap();
+    let o = run(&["status"], &idx);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let s = &v["schema"];
+    assert_eq!((s["version"].as_u64(), s["upgrade_pending"].as_bool()), (Some(4), Some(true)), "{v}");
+    assert!(s["expected"].as_u64().is_some_and(|e| e > 4), "{v}");
+    assert_eq!(v["messages"], 1, "{v}");
+    let o = run(&["search", "budget"], &idx);
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(3), "upgrade_pending"), "{o:?}");
+    let o = run(&["scope"], &idx);
+    assert_eq!(err_kind(&o), "upgrade_pending", "{o:?}");
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let o = run(&["bench-embed", "--seconds", "1", "--model-dir", empty.to_str().unwrap()], &idx);
+    assert_eq!(o.status.code(), Some(3), "{o:?}");
+    let o = run(&["status", "--watch", "1"], &idx);
+    assert!(o.status.success(), "{o:?}");
+    assert_eq!(
+        (file_schema(&idx), std::fs::read(&idx).unwrap() == bytes),
+        (4, true),
+        "read-only commands write nothing"
+    );
+
+    // A writer while another process holds the sync lock: refused, nothing migrated.
+    let lock = outlook_cli::index::sync::lock(&idx).unwrap();
+    let t = std::time::Instant::now();
+    let o = writer(&idx);
+    let waited = t.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(2500) && waited < std::time::Duration::from_secs(20),
+        "{waited:?}"
+    );
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(2), "usage"), "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("another sync is running"), "{o:?}");
+    assert_eq!((file_schema(&idx), std::fs::read(&idx).unwrap() == bytes), (4, true), "no migration without the lock");
+    drop(lock);
+    let o = writer(&idx);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&run(&["status"], &idx).stdout).unwrap();
+    assert_eq!(v["schema"]["upgrade_pending"], false, "{v}");
+    assert!(run(&["search", "budget"], &idx).status.success());
+
+    // Old index, several readers and writers at once.
+    let idx = old_index(&dir);
+    let p = idx.as_path();
+    let outs: Vec<(bool, Output)> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|i| s.spawn(move || if i % 2 == 0 { (true, writer(p)) } else { (false, run(&["status"], p)) }))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (w, o) in &outs {
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "writer={w}: {err}");
+        assert!(!err.contains("duplicate"), "{err}");
+    }
+    let c = rusqlite::Connection::open(&idx).unwrap();
+    let versions: Vec<i64> = c
+        .prepare("SELECT version FROM schema_version ORDER BY version")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(versions, (1..=versions.len() as i64).collect::<Vec<_>>());
+    assert!(versions.len() > 4);
+
+    // A newer schema: readers and writers refuse it, nothing written.
+    c.execute("INSERT INTO schema_version(version) VALUES (99)", []).unwrap();
+    drop(c);
+    let bytes = std::fs::read(&idx).unwrap();
+    for args in [&["status"][..], &["search", "budget"], &["scope"], &["scope", "--attachment-max-mb", "20"]] {
+        let o = run(args, &idx);
+        assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(5), "format"), "{args:?}: {o:?}");
+        assert!(String::from_utf8_lossy(&o.stderr).contains("newer than this tool"), "{o:?}");
+    }
+    assert_eq!(std::fs::read(&idx).unwrap(), bytes);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// S9: an observer probing the lock (status) holds it shared for a moment;
+/// a writer starting meanwhile waits a little instead of being refused.
+#[test]
+fn observer_probe_does_not_refuse_writer_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-probe-cli-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let idx = dir.join("index.sqlite");
+    drop(outlook_cli::index::sync::lock(&idx).unwrap());
+    outlook_cli::index::open(&idx).unwrap();
+    let t = std::time::Instant::now();
+    assert!(!outlook_cli::index::sync::held(&idx));
+    assert!(t.elapsed() < std::time::Duration::from_millis(100), "the probe stays short");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let lock = dir.join("index.sqlite.lock");
+    let probe = std::thread::spawn(move || {
+        let f = std::fs::File::open(&lock).unwrap();
+        f.lock_shared().unwrap();
+        tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    });
+    rx.recv().unwrap();
+    let o = writer(&idx);
+    probe.join().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     std::fs::remove_dir_all(&dir).unwrap();
 }

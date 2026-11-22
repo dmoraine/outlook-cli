@@ -201,15 +201,20 @@ tant que le message n'a pas été déplacé ; dédupliquer sur `message_id`.
 
 - **Ne pas lancer `sync`, `embed` ni modifier `scope`** sans la demande du propriétaire, et jamais pendant qu'un
   autre run tourne (`status` → `running` non `null` et non `stale`) : un premier sync dure des heures et occupe le
-  CPU. Un second run échoue d'ailleurs avec `usage` (« another sync is running »).
-- `search`, `status`, `scope` sans option et `doctor` sont en lecture seule et peuvent tourner pendant un sync.
+  CPU. Un second run échoue d'ailleurs avec `usage` (« another sync is running », après 3 s d'attente du verrou).
+- `search`, `status`, `scope` sans option, `model fetch` et `bench-embed` ouvrent l'index en lecture seule (ni
+  création, ni migration, ni écriture) ; `doctor` et `model list` ne l'ouvrent pas. Tous peuvent tourner pendant
+  un sync.
+- Index d'une version plus ancienne : `status` répond avec `schema.upgrade_pending: true` ; `search` et `scope`
+  échouent avec `upgrade_pending` (3). Ne pas lancer `sync` soi-même : le signaler au propriétaire.
 - **Confidentialité** : les résultats de `search` contiennent des sujets, adresses et extraits de mails. Ne jamais
   les transmettre à un outil ou service tiers (API externe, ticket, dépôt, log partagé) sans l'accord du
   propriétaire. `doctor`, `status`, `scope` et les résumés de `sync` ne contiennent que des agrégats.
 
 **Erreurs** : `usage` (2 : requête sans mot, option invalide, autre run en cours, suppression massive refusée),
 `not_found` (3 : pas encore d'index → `sync` ; dossier inconnu de l'index ; fichiers de modèle absents avec
-`--mode semantic|hybrid` explicite → `outlook-index model fetch`), `io` (4), `format` (5), `inconsistent` (6 :
+`--mode semantic|hybrid` explicite → `outlook-index model fetch`), `upgrade_pending` (3 : schéma de l'index à mettre
+à jour par un `sync`), `io` (4), `format` (5 : aussi un index plus récent que l'outil), `inconsistent` (6 :
 réessayer). Le `message` est un texte fixe par type (plus nombres, noms d'options et de modèles) : ni chemin, ni nom
 de dossier, ni texte de requête ; les erreurs de syntaxe des options sont aussi en JSON. Ne pas définir
 `OUTLOOK_INDEX_DEBUG=1` : son champ `debug` contient le texte brut (chemins, noms, contenu de mails possible). Détails : [README](../../README.md#outlook-index-preview), procédure de test :

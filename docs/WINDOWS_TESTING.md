@@ -80,7 +80,10 @@ outlook-index status --pretty              # counts, embedded %, size; "running"
 - Embedding runs at below-normal priority: the laptop stays usable.
 - **Ctrl-C** is safe: every batch is committed, so at most the batches in flight are lost. Run `sync` again to
   resume. `status` shows `"stale": true` for a run that was killed; the next sync resumes it.
-- One sync or embed at a time per index: a second one fails at once (`usage`, "another sync is running").
+- One sync or embed at a time per index: a second one fails after waiting 3 s for the lock (`usage`, "another sync
+  is running"). `search`, `status` and `scope` without options are read-only and can run during a sync.
+- After updating `outlook-index`, `status` may show `"schema": {..., "upgrade_pending": true}` and `search` fail
+  with `upgrade_pending`: the next `sync` upgrades the index.
 - A sync that would delete more than max(100, 20 %) of the indexed messages aborts with no change. Report it
   before rerunning with `--allow-mass-delete`.
 - Deleted Items and Junk E-mail are excluded by default (`--include-folders deleted,junk` to include them).

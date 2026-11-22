@@ -60,7 +60,12 @@ pub(crate) fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
 
 fn message(e: &Error) -> &str {
     match e {
-        Error::Io(m) | Error::Format(m) | Error::Corrupt(m) | Error::NotFound(m) | Error::Usage(m) => m,
+        Error::Io(m)
+        | Error::Format(m)
+        | Error::Corrupt(m)
+        | Error::NotFound(m)
+        | Error::Usage(m)
+        | Error::UpgradePending(m) => m,
     }
 }
 

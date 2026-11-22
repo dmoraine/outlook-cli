@@ -165,11 +165,17 @@ fn db_err(e: rusqlite::Error) -> Error {
     Error::Io(format!("index database: {e}"))
 }
 
-/// Open (creating if needed) the index and bring its schema up to date.
-pub fn open(p: &Path) -> Result<Connection> {
-    if let Some(d) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(d).map_err(|e| Error::Io(format!("cannot create the index directory: {e}")))?;
+fn make_dir(p: &Path) -> Result<()> {
+    match p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => std::fs::create_dir_all(d).map_err(|e| Error::Io(format!("cannot create the index directory: {e}"))),
+        None => Ok(()),
     }
+}
+
+/// Open (creating if needed) the index and bring its schema up to date.
+/// Commands use `open_write` (sync lock first) or `open_read`.
+pub fn open(p: &Path) -> Result<Connection> {
+    make_dir(p)?;
     let mut c = Connection::open(p).map_err(db_err)?;
     c.busy_timeout(std::time::Duration::from_secs(10)).map_err(db_err)?;
     c.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
@@ -178,30 +184,84 @@ pub fn open(p: &Path) -> Result<Connection> {
     Ok(c)
 }
 
+/// Writers (sync, embed, scope change): take the sync lock, then open and
+/// migrate. The lock is held as long as the returned file lives.
+pub fn open_write(p: &Path) -> Result<(Connection, std::fs::File)> {
+    make_dir(p)?;
+    let lock = sync::lock(p)?;
+    Ok((open(p)?, lock))
+}
+
+/// Readers (search, status, scope show, model commands): an existing index,
+/// read-only, never migrated. An older schema opens (see `schema`,
+/// `require_current`); a newer one is refused.
+pub fn open_read(p: &Path) -> Result<Connection> {
+    if !p.exists() {
+        return Err(Error::NotFound("no index yet; run `outlook-index sync`".into()));
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let c = Connection::open_with_flags(p, flags).map_err(db_err)?;
+    c.busy_timeout(std::time::Duration::from_secs(10)).map_err(db_err)?;
+    let v = schema_version(&c)?;
+    if v > MIGRATIONS.len() {
+        return Err(newer(v));
+    }
+    Ok(c)
+}
+
+fn newer(v: usize) -> Error {
+    Error::Format(format!("index schema {v} is newer than this tool; upgrade outlook-index"))
+}
+
+/// Apply the missing migrations in one IMMEDIATE transaction: the version is
+/// read under the write lock, so a concurrent migration is waited for, never
+/// applied twice.
 pub fn migrate(c: &mut Connection) -> Result<()> {
-    c.execute_batch(
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(db_err)?;
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER PRIMARY KEY,
             applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
     )
     .map_err(db_err)?;
-    let v = schema_version(c)?;
+    let v = schema_version(&tx)?;
     if v > MIGRATIONS.len() {
-        return Err(Error::Format(format!("index schema {v} is newer than this tool; upgrade outlook-index")));
+        return Err(newer(v));
     }
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(v) {
-        let tx = c.transaction().map_err(db_err)?;
         tx.execute_batch(sql).map_err(db_err)?;
         tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [i as i64 + 1]).map_err(db_err)?;
-        tx.commit().map_err(db_err)?;
     }
-    Ok(())
+    tx.commit().map_err(db_err)
 }
 
+/// Schema version of the file; 0 before any migration.
 pub fn schema_version(c: &Connection) -> Result<usize> {
-    let v: i64 =
-        c.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0)).map_err(db_err)?;
+    let v: i64 = c
+        .query_row(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')
+                THEN (SELECT COALESCE(MAX(version), 0) FROM schema_version) ELSE 0 END",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
     Ok(v.max(0) as usize)
+}
+
+/// `{version, expected, upgrade_pending}`: an older index waits for a writer.
+pub fn schema(c: &Connection) -> Result<serde_json::Value> {
+    let v = schema_version(c)?;
+    Ok(serde_json::json!({ "version": v, "expected": MIGRATIONS.len(), "upgrade_pending": v < MIGRATIONS.len() }))
+}
+
+/// For readers that need the current tables (search, scope show).
+pub fn require_current(c: &Connection) -> Result<()> {
+    match schema_version(c)? {
+        v if v < MIGRATIONS.len() => {
+            Err(Error::UpgradePending(format!("index schema {v} needs an upgrade; run `outlook-index sync`")))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Whether the linked SQLite has FTS5.
@@ -318,6 +378,43 @@ mod tests {
         let a = &v["attachment_chunks"];
         assert_eq!((a["chunks"].as_i64(), a["pending"].as_i64(), a["embedded"].as_i64()), (Some(2), Some(2), Some(0)));
         assert_eq!(a["cap"], 30, "{v}");
+    }
+
+    /// S2: a migration racing another one (here: committed after this one
+    /// read the old version) re-reads the version under the write lock: no
+    /// duplicate-column error, each migration applied once.
+    #[test]
+    fn concurrent_migrations_apply_once() {
+        let dir = std::env::temp_dir().join(format!("outlook-index-migrate-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("index.sqlite");
+        let c = Connection::open(&p).unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        c.execute_batch("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT)").unwrap();
+        for (i, sql) in MIGRATIONS[..4].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.execute("INSERT INTO schema_version(version) VALUES (?1)", [i as i64 + 1]).unwrap();
+        }
+        // The other migration holds the write lock, not committed yet.
+        c.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().skip(4) {
+            c.execute_batch(sql).unwrap();
+            c.execute("INSERT INTO schema_version(version) VALUES (?1)", [i as i64 + 1]).unwrap();
+        }
+        let q = p.clone();
+        let t = std::thread::spawn(move || {
+            let mut d = Connection::open(&q).unwrap();
+            d.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+            migrate(&mut d).map(|_| schema_version(&d).unwrap())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        c.execute_batch("COMMIT").unwrap();
+        let r = t.join().unwrap();
+        assert_eq!(r.map_err(|e| e.to_string()), Ok(MIGRATIONS.len()));
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(n as usize, MIGRATIONS.len());
+        drop(c);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

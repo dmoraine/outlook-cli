@@ -11,6 +11,8 @@ pub enum Error {
     Corrupt(String),
     NotFound(String),
     Usage(String),
+    /// The index schema is older than this tool; a writer (`sync`) upgrades it.
+    UpgradePending(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -26,7 +28,7 @@ impl fmt::Display for Error {
             Error::Format(m) => write!(f, "unsupported file: {m}"),
             Error::Corrupt(m) => write!(f, "inconsistent data: {m}"),
             Error::NotFound(m) => write!(f, "not found: {m}"),
-            Error::Usage(m) => write!(f, "{m}"),
+            Error::Usage(m) | Error::UpgradePending(m) => write!(f, "{m}"),
         }
     }
 }
@@ -36,7 +38,7 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Usage(_) => 2,
-            Error::NotFound(_) => 3,
+            Error::NotFound(_) | Error::UpgradePending(_) => 3,
             Error::Io(_) => 4,
             Error::Format(_) => 5,
             Error::Corrupt(_) => 6,
@@ -50,6 +52,7 @@ impl Error {
             Error::Io(_) => "io",
             Error::Format(_) => "format",
             Error::Corrupt(_) => "inconsistent",
+            Error::UpgradePending(_) => "upgrade_pending",
         }
     }
 }

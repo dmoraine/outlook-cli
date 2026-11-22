@@ -475,7 +475,7 @@ mod tests {
             self.inner.entries(f)
         }
         fn open(&mut self, nid: crate::ndb::Nid) -> Result<sync::Opened> {
-            let c = crate::index::open(&self.path).unwrap();
+            let c = crate::index::open_read(&self.path).unwrap();
             let mut v = search::status(&c).unwrap();
             v["running"] = running(&c, true).unwrap();
             self.seen.push(v);
@@ -513,7 +513,7 @@ mod tests {
         // A writer inside a transaction does not block status.
         let tx = c.transaction().unwrap();
         set_meta(&tx, "sync_progress", &record("embed_bodies", 0)).unwrap();
-        let other = crate::index::open(&path).unwrap();
+        let other = crate::index::open_read(&path).unwrap();
         assert_eq!(running(&other, true).unwrap(), Json::Null, "last committed record: done");
         search::status(&other).unwrap();
         tx.commit().unwrap();

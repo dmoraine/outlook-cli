@@ -572,6 +572,7 @@ pub fn sanitize(e: Error) -> Error {
         Error::Corrupt(_) => Error::Corrupt("the file changed during the read; retry".into()),
         Error::NotFound(_) => Error::NotFound("a required item is missing".into()),
         Error::Usage(_) => Error::Usage("no OST file or data directory found; pass --file / --index".into()),
+        Error::UpgradePending(_) => Error::UpgradePending("the index needs an upgrade; run sync".into()),
     }
 }
 

@@ -172,9 +172,22 @@ chemins, des noms et du contenu de mails ; ne jamais le transmettre.
 
 Fichier d'index : `--index` / `OUTLOOK_INDEX_DB`, par défaut `%LOCALAPPDATA%\outlook-cli\index.sqlite` (Linux :
 `$XDG_DATA_HOME/outlook-cli/index.sqlite`). Un chemin sous OneDrive provoque un avertissement
-`{"warning":{"kind":"onedrive",...}}` sur stderr. Un seul `sync`, `embed` ou changement de `scope` à la fois par
-index (verrou `index.sqlite.lock`) ; un second échoue aussitôt (`usage`). L'index se reconstruit toujours depuis
-l'OST : le supprimer suffit à revenir en arrière.
+`{"warning":{"kind":"onedrive",...}}` sur stderr. L'index se reconstruit toujours depuis l'OST : le supprimer
+suffit à revenir en arrière.
+
+Lecture et écriture de l'index :
+
+- **Écrivains** : `sync`, `embed` et `scope` avec une option. Un seul à la fois par index (verrou
+  `index.sqlite.lock`) : un écrivain attend jusqu'à 3 s que le verrou se libère (un `status` le sonde un
+  instant), puis échoue (`usage`, « another sync is running »). Il prend le verrou avant toute mise à jour du
+  schéma, qu'il applique dans une seule transaction.
+- **Lecteurs** : `search`, `status`, `scope` sans option, `model fetch` et `bench-embed` ouvrent l'index en
+  lecture seule (jamais créé, migré ni modifié) et peuvent tourner pendant un sync ; `doctor` et `model list`
+  ne l'ouvrent pas. `search` lit un instantané cohérent de l'index (modèle chargé avant).
+- **Index d'une version plus ancienne** : `status` fonctionne et indique `schema` :
+  `{"version": 4, "expected": 6, "upgrade_pending": true}` (compteurs dont les tables manquent à `null`) ;
+  `search` et `scope` sans option échouent avec `upgrade_pending` (code 3) : lancer `sync` (ou un autre
+  écrivain), qui met le schéma à jour. Un index d'une version plus récente est refusé (`format`, code 5).
 
 ### doctor
 
@@ -302,8 +315,11 @@ les deux portées par défaut et ne se combine pas avec les autres options. Sort
 vecteur), `attachment_chunks` et `attachments`. Les dossiers sont comptés, pas affichés.
 
 Portée des pièces jointes : `--attachment-types` (liste qui remplace la précédente) et `--attachment-max-mb`
-(1 à 100, défaut 20). La restreindre conserve les textes déjà extraits ; les pièces écartées en `too_large` ou
-`excluded_type` sont relues au sync suivant après un changement (`requeued_messages`).
+(1 à 100, défaut 20). La restreindre conserve les textes déjà extraits, leurs lignes FTS et leurs vecteurs, y
+compris aux syncs suivants (comptés dans `attachments.out_of_scope`) ; seuls la suppression du dernier message
+qui les porte ou le remplacement de la pièce dans la boîte les effacent. Les pièces écartées en `too_large` ou
+`excluded_type` sont relues au sync suivant après un changement (`requeued_messages`) ; un contenu déjà stocké
+n'est ni réextrait ni réembeddé.
 `--attachment-chunks N` (défaut 30, ~50 000 caractères ; `0` = aucune) : seuls les chunks 0 à N−1 de chaque
 contenu distinct sont embeddés ; la recherche par mots couvre tout le texte. Augmenter N embedde le reste au run
 suivant ; le baisser conserve les vecteurs.
@@ -346,7 +362,8 @@ outlook-index status --watch      # une ligne {"running": ...} toutes les 10 s (
 planté) : le `sync` suivant reprend. `status --watch` écrit une ligne par tick (même avec `--pretty`) et s'arrête
 sur `null`, `done` ou `stale`. Compteurs et durées seulement.
 
-`status` : `messages`, `chunks`, `folders`, `locations`, `schema`, `embedding` (modèle, révision, dimensions,
+`status` : `messages`, `chunks`, `folders`, `locations`, `schema` (`version`, `expected`, `upgrade_pending`),
+`embedding` (modèle, révision, dimensions,
 vecteurs, compteurs de portée), `include`, `attachments`, `db_bytes`, `last_sync`, `running`.
 
 ### search

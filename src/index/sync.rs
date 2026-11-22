@@ -119,22 +119,34 @@ impl MailSource for StoreSource {
     }
 }
 
-/// Exclusive lock for one sync per index, released when the file is
-/// dropped or the process dies.
+/// How long a writer retries a held sync lock: an observer (`held`) holds
+/// it shared for an instant only.
+pub const LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// Exclusive lock for one writer per index, released when the file is
+/// dropped or the process dies. Retried for LOCK_WAIT.
 pub fn lock(index: &std::path::Path) -> Result<std::fs::File> {
     let mut p = index.as_os_str().to_owned();
     p.push(".lock");
     let f = std::fs::File::create(&p).map_err(|e| Error::Io(format!("cannot create the sync lock file: {e}")))?;
-    match f.try_lock() {
-        Ok(()) => Ok(f),
-        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Usage("another sync is running on this index".into())),
-        Err(std::fs::TryLockError::Error(e)) => Err(Error::Io(format!("cannot lock the index: {e}"))),
+    let start = Instant::now();
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) if start.elapsed() < LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(25))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::Usage("another sync is running on this index".into()));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(Error::Io(format!("cannot lock the index: {e}"))),
+        }
     }
 }
 
 /// Whether a process (or another handle of this one) holds the sync lock of
-/// `index`. Does not create the lock file.
-// ponytail: probes with a shared lock; a sync starting in that instant is refused as concurrent.
+/// `index`. Does not create the lock file. Probes with a shared lock,
+/// released at once; `lock` waits that out.
 pub fn held(index: &std::path::Path) -> bool {
     let mut p = index.as_os_str().to_owned();
     p.push(".lock");

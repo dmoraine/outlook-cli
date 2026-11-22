@@ -161,6 +161,25 @@ pub fn plan(
     Ok((Mode::Keyword, None, warn))
 }
 
+// Test hook, called between search stages ("planned", "ranked", "legs").
+#[cfg(test)]
+type Hook = Option<Box<dyn FnMut(&str)>>;
+
+#[cfg(test)]
+thread_local! {
+    static STAGE: std::cell::Cell<Hook> = const { std::cell::Cell::new(None) };
+}
+
+fn stage(_name: &str) {
+    #[cfg(test)]
+    STAGE.with(|h| {
+        if let Some(mut f) = h.take() {
+            f(_name);
+            h.set(Some(f));
+        }
+    });
+}
+
 /// Best chunk of a message in one leg.
 struct Leg {
     message: i64,
@@ -240,6 +259,7 @@ fn keyword_leg(c: &Connection, q: &Query, expr: &str, folders: &str, limit: usiz
             attachment: r.get(8).map_err(db_err)?,
         });
     }
+    stage("ranked");
     // Snippets for the kept chunks only (costly on every match).
     let snippet = |t: &str, col: i64| {
         c.prepare(&format!("SELECT snippet({t}, {col}, '', '', '...', ?3) FROM {t} WHERE {t} MATCH ?1 AND rowid = ?2"))
@@ -421,26 +441,35 @@ fn hit(c: &Connection, q: &Query, folders: &str, leg: &Leg, ranks: Json, scores:
 
 /// Best matching chunk per message, best first, in `q.mode`. Keyword: every
 /// word. Semantic: nearest chunks to `q.vector`. Hybrid: RRF (k = 60) of an
-/// any-word keyword leg and the semantic leg, top LEG of each.
+/// any-word keyword leg and the semantic leg, top LEG of each. Every read
+/// below shares one snapshot: the caller's transaction, else its own.
 pub fn search(c: &Connection, q: &Query) -> Result<Vec<Json>> {
     check_text(&q.text)?;
+    let _snapshot = if c.is_autocommit() { Some(c.unchecked_transaction().map_err(db_err)?) } else { None };
     let words = words(&q.text);
     let folders = serde_json::to_string(&folder_ids(c, &q.folders)?).unwrap();
     let limit = q.limit.max(1);
+    stage("planned");
     let vector = || match (q.model, q.vector.as_deref()) {
         (Some(m), Some(v)) => Ok((m, v)),
         _ => Err(Error::Usage("semantic and hybrid search need a query vector and its model".into())),
     };
     match q.mode {
-        Mode::Keyword => keyword_leg(c, q, &fts_query(&q.text).unwrap(), &folders, limit)?
-            .iter()
-            .enumerate()
-            .map(|(i, l)| hit(c, q, &folders, l, json!({ "keyword": i + 1 }), json!({ "keyword": round(l.score, 4) })))
-            .collect(),
+        Mode::Keyword => {
+            let kw = keyword_leg(c, q, &fts_query(&q.text).unwrap(), &folders, limit)?;
+            stage("legs");
+            kw.iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    hit(c, q, &folders, l, json!({ "keyword": i + 1 }), json!({ "keyword": round(l.score, 4) }))
+                })
+                .collect()
+        }
         Mode::Semantic => {
             let (m, v) = vector()?;
-            semantic_leg(c, q, m, v, &folders, limit)?
-                .iter()
+            let sem = semantic_leg(c, q, m, v, &folders, limit)?;
+            stage("legs");
+            sem.iter()
                 .enumerate()
                 .map(|(i, l)| {
                     hit(c, q, &folders, l, json!({ "semantic": i + 1 }), json!({ "semantic": round(l.score, 4) }))
@@ -451,6 +480,7 @@ pub fn search(c: &Connection, q: &Query) -> Result<Vec<Json>> {
             let (m, v) = vector()?;
             let kw = keyword_leg(c, q, &or_query(&words), &folders, LEG)?;
             let sem = semantic_leg(c, q, m, v, &folders, LEG)?;
+            stage("legs");
             let ids = |l: &[Leg]| l.iter().map(|x| x.message).collect::<Vec<_>>();
             let fused = rrf(&[&ids(&kw), &ids(&sem)]);
             let mut out = Vec::new();
@@ -476,16 +506,26 @@ pub fn search(c: &Connection, q: &Query) -> Result<Vec<Json>> {
     }
 }
 
-/// Aggregate counts only.
+/// Aggregate counts only. On an older schema (upgrade pending), a part
+/// whose tables are missing is null.
 pub fn status(c: &Connection) -> Result<Json> {
+    let schema = super::schema(c)?;
+    let pending = schema["upgrade_pending"] == true;
+    let part = |r: Result<Json>| match r {
+        Err(_) if pending => Ok(Json::Null),
+        r => r,
+    };
     let at = get_meta(c, "sync_at")?.and_then(|t| t.parse().ok()).and_then(|t| format_ft(t, false));
     let last = get_meta(c, "sync_last")?.and_then(|s| serde_json::from_str::<Json>(&s).ok());
-    let mut v = totals(c)?;
+    let mut v = part(totals(c))?;
+    if v.is_null() {
+        v = json!({});
+    }
     let o = v.as_object_mut().unwrap();
-    o.insert("schema".into(), json!(super::schema_version(c)?));
-    o.insert("embedding".into(), super::vectors::counts(c)?);
+    o.insert("schema".into(), schema);
+    o.insert("embedding".into(), part(super::vectors::counts(c))?);
     o.insert("include".into(), json!(super::sync::include(c)?.unwrap_or_default()));
-    o.insert("attachments".into(), super::attach::counts(c)?);
+    o.insert("attachments".into(), part(super::attach::counts(c))?);
     let bytes = c.query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |r| {
         r.get::<_, i64>(0)
     });
@@ -724,7 +764,8 @@ mod tests {
         );
         assert_eq!(s["embedding"]["scope"]["all"], true, "{s}");
         assert_eq!(s["last_sync"]["complete"], true);
-        assert_eq!(s["schema"], crate::index::schema_version(&c).unwrap());
+        let n = crate::index::schema_version(&c).unwrap();
+        assert_eq!(s["schema"], json!({ "version": n, "expected": n, "upgrade_pending": false }));
         assert!(s["last_sync"]["revision"].is_string() && s["last_sync"]["at"].is_string(), "{s}");
         assert_eq!(s["last_sync"]["summary"]["new"], 5, "{s}");
         let t = s.to_string();
@@ -896,6 +937,69 @@ mod tests {
 
     fn sem(text: &str, mode: Mode) -> Query {
         Query { mode, vector: Some(meaning(text)), model: Some(&MODELS[0]), ..q(text) }
+    }
+
+    /// S4: another connection deletes, or replaces under the same ids, the
+    /// ranked invoices between two search stages. The search answers from
+    /// the snapshot it started with: no error, attribution consistent.
+    #[test]
+    fn search_uses_one_snapshot() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let dir = std::env::temp_dir().join(format!("outlook-index-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for stage in ["planned", "ranked", "legs"] {
+            for replace in [false, true] {
+                for mode in [Mode::Keyword, Mode::Semantic, Mode::Hybrid] {
+                    let p = dir.join(format!("{stage}-{replace}-{mode:?}.sqlite"));
+                    let mut c = crate::index::open(&p).unwrap();
+                    let mut f = mailbox();
+                    f.add(0x404, 0x22, Some("<s1@fict.invalid>"), "Invoice one", "Invoice for the March delivery.");
+                    f.add(0x424, 0x42, Some("<s2@fict.invalid>"), "Invoice two", "Another invoice, for April.");
+                    sync(&mut c, &mut f, &Options::default()).unwrap();
+                    embed(&mut c);
+                    let w = crate::index::open(&p).unwrap();
+                    let fired = Rc::new(Cell::new(false));
+                    let seen = fired.clone();
+                    STAGE.set(Some(Box::new(move |s: &str| {
+                        if s != stage || seen.replace(true) {
+                            return;
+                        }
+                        let ids = "(SELECT id FROM messages WHERE subject LIKE 'Invoice%')";
+                        let mut sql = format!(
+                            "CREATE TEMP TABLE gone AS SELECT m.id, c.id AS chunk, l.nid, l.folder FROM messages m
+                                JOIN chunks c ON c.message = m.id JOIN locations l ON l.message = m.id
+                                WHERE m.id IN {ids};
+                             DELETE FROM chunks WHERE message IN {ids};
+                             DELETE FROM locations WHERE message IN {ids};
+                             DELETE FROM messages WHERE id IN {ids};"
+                        );
+                        if replace {
+                            sql += "INSERT INTO messages(id, ident, received, has_attachments, subject)
+                                        SELECT id, 'mid:new' || id, 0, 0, 'Replaced' FROM gone;
+                                    INSERT INTO chunks(id, message, seq, text) SELECT chunk, id, 0, 'replaced text' FROM gone;
+                                    INSERT INTO locations SELECT nid, folder, id, 0 FROM gone;";
+                        }
+                        w.execute_batch(&(sql + "DROP TABLE gone;")).unwrap();
+                    })));
+                    let hits = search(&c, &sem("invoice", mode));
+                    STAGE.set(None);
+                    let label = format!("{stage} replace={replace} {mode:?}");
+                    let hits = hits.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert!(fired.get() || (stage == "ranked" && mode == Mode::Semantic), "{label}: hook not reached");
+                    let subjects: Vec<&str> = hits.iter().map(|h| h["subject"].as_str().unwrap()).collect();
+                    assert!(
+                        subjects.contains(&"Invoice one") && subjects.contains(&"Invoice two"),
+                        "{label}: {subjects:?}"
+                    );
+                    for h in &hits {
+                        let (s, e) = (h["subject"].as_str().unwrap(), h["excerpt"].as_str().unwrap().to_lowercase());
+                        assert_eq!(s.starts_with("Invoice"), e.contains("invoice"), "{label}: {s} / {e}");
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
