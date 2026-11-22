@@ -145,7 +145,7 @@ pub fn get_meta(c: &Connection, key: &str) -> Result<Option<String>> {
     c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(db_err)
 }
 
-fn set_meta(c: &Connection, key: &str, value: &str) -> Result<()> {
+pub fn set_meta(c: &Connection, key: &str, value: &str) -> Result<()> {
     c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)", [key, value]).map(drop).map_err(db_err)
 }
 

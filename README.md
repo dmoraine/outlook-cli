@@ -144,8 +144,8 @@ $r.messages | Select-Object id, received, subject
 ## outlook-index (preview)
 
 Separate binary for a local mailbox index (cargo feature `index`, bundled SQLite with FTS5). Read-only on the OST.
-Built by `scripts/build.sh` as `dist/outlook-index.exe`. Commands: `doctor`, `sync`, `search`, `status`, `model`,
-`bench-embed`.
+Built by `scripts/build.sh` as `dist/outlook-index.exe`. Commands: `doctor`, `sync`, `search`, `status`, `scope`,
+`embed`, `model`, `bench-embed`.
 
 ```powershell
 outlook-index.exe doctor --pretty                # samples 200 messages
@@ -183,7 +183,7 @@ change (usage error, counts only) unless `--allow-mass-delete` is passed. One sy
 stripped; the rest is cut into ~1750-character chunks with ~200 characters of overlap; each chunk keeps its character
 range in the stripped body.
 
-`search` (keyword only for now; `--mode semantic|hybrid` is a usage error until embeddings land) matches every word,
+`search` (keyword only for now; `--mode semantic|hybrid` is a usage error until vector search lands) matches every word,
 accent- and case-insensitive (FTS5 `unicode61 remove_diacritics 2`), over subject and body. Query operators and
 quotes are plain words. Filters: `-F` folder name, or path with its subfolders (`Inbox` matches `Inbox/Projects`,
 not `Inboxes`; repeatable), `--since`/`--until`, `--from`, `--to`. One hit per message (its best chunk): `{id,
@@ -212,6 +212,44 @@ Default directory: `%LOCALAPPDATA%\outlook-cli\models\multilingual-e5-small` (or
 embedded in length-sorted batches (`--batch`, default 8) and mean-pooled over the tokens, then L2-normalized.
 `--threads` defaults to the logical CPUs minus one. `bench-embed` prints load time (hash check included), query
 latency and passages/s on synthetic text only. **Paste back** its whole JSON for both models.
+
+### Embeddings: scope and runs
+
+Search covers every mail folder; embeddings are limited by a scope stored in the index and reused by every run.
+
+```powershell
+outlook-index.exe scope --pretty                                   # scope + counts
+outlook-index.exe scope --embed-since 2025-01-01 --embed-until "2026-03-31" -F Inbox -F "Archive/2026"
+outlook-index.exe scope --clear                                    # back to everything
+outlook-index.exe embed --max-time 30m                             # newest first; resumable
+outlook-index.exe embed --model e5-base --reembed                  # change model: drops the e5-small vectors
+outlook-index.exe sync --max-time 1h                               # index, then embed in the time left
+outlook-index.exe sync --no-embed                                  # index only
+```
+
+`scope`: `--embed-since` (inclusive) and `--embed-until` (exclusive) on the received time, same syntax as
+`outlook-cli --since/--until`, stored as absolute times (the typed text is shown too: `90d` stays the date it meant
+when set); `-F` as in `search -F`, repeatable, replaces the stored folders; options not given are kept. Output:
+`chunks_in_scope`, `embedded`, `pending`, `embedded_pct`, `out_of_scope`, and `out_of_scope_embedded` (vectors are
+never deleted by a scope change). Folder specs are counted, not printed. A folder spec is checked against the
+indexed folders once a sync has run.
+
+`embed` embeds the pending in-scope chunks, newest message first; the passage is the subject, a newline and the chunk
+text (with the `passage: ` prefix). Each batch (`--batch`, default 8) is one commit, so `Ctrl-C` loses at most one
+batch and `--max-time` stops after the current batch; the next run resumes. It runs at below-normal priority
+(Windows `BELOW_NORMAL_PRIORITY_CLASS`, Linux nice 10; `--priority normal` to opt out) on `--threads` (default CPUs
+minus one). The model defaults to the one of the stored vectors (else e5-small); another model is refused unless
+`--reembed`, which drops the old vectors. Missing model files are a `not_found` error. Output: `embedded`, `pending`,
+`complete`, `interrupted`, `passages_per_s`, `load_ms`, `elapsed_ms`, model, threads, priority.
+
+`sync` runs the same step after indexing, within what is left of `--max-time`, with the same options. Without model
+files indexing still completes and the summary says `"embedding": {"skipped": "model files missing; run outlook-index
+model fetch"}`. `status` adds `embedding`: model, revision, dims, vectors, the scope counts above and a scope
+summary.
+
+Time estimate: `pending` (from `scope`) ÷ `passages_per_s` (from `bench-embed`) seconds; e.g. 100,000 chunks at
+10 passages/s ≈ 2.8 h. Size: about 2 MB per 1,000 e5-small vectors (measured: 384 × 4 bytes plus row and page
+overhead).
 
 Parity with sentence-transformers (`scripts/e5_reference.py` → `tests/fixtures/e5_reference.json`):
 `E5_SMALL_DIR=... E5_BASE_DIR=... cargo test --release --features index --test embed_parity -- --ignored --nocapture`.

@@ -98,3 +98,48 @@ fn model_and_bench_cli() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `scope` set/show/clear and `embed` without model files. Counts only.
+#[test]
+fn scope_and_embed_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-scope-cli-{}", std::process::id()));
+    let idx = dir.join("index.sqlite");
+    let json = |o: &Output| -> serde_json::Value {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    let o = run(&["scope"], &idx);
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(3), "not_found"), "show needs an index");
+    let v =
+        json(&run(&["scope", "--embed-since", "2026-01-01", "--embed-until", "2026-03-31", "-F", "SECRET_F"], &idx));
+    let s = &v["scope"];
+    assert_eq!((s["all"].as_bool(), s["folders"].as_u64()), (Some(false), Some(1)), "{v}");
+    assert_eq!((s["since_input"].as_str(), s["until_input"].as_str()), (Some("2026-01-01"), Some("2026-03-31")));
+    assert!(s["since"].as_str().is_some_and(|t| t.starts_with("202")), "{v}");
+    assert!(!v.to_string().contains("SECRET"), "{v}");
+    assert_eq!(v["chunks_in_scope"], 0);
+    // Kept across runs; a partial change keeps the rest.
+    let v = json(&run(&["scope", "--embed-until", "2026-06-30"], &idx));
+    assert_eq!((v["scope"]["since_input"].as_str(), v["scope"]["folders"].as_u64()), (Some("2026-01-01"), Some(1)));
+    let v = json(&run(&["status"], &idx));
+    assert_eq!(v["embedding"]["scope"]["until_input"], "2026-06-30", "{v}");
+    for bad in [
+        &["scope", "--clear", "--embed-since", "3d"][..],
+        &["scope", "--embed-since", "soon"],
+        &["scope", "--embed-since", "2026-05-01", "--embed-until", "2026-04-01"],
+    ] {
+        assert_eq!(run(bad, &idx).status.code(), Some(2), "{bad:?}");
+    }
+    assert_eq!(json(&run(&["scope", "--clear"], &idx))["scope"]["all"], true);
+
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let o = run(&["embed", "--model-dir", empty.to_str().unwrap()], &idx);
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(3), "not_found"), "explicit when files are missing");
+    for bad in [&["embed", "--batch", "0"][..], &["embed", "--priority", "high"], &["embed", "--max-time", "x"]] {
+        assert_eq!(run(bad, &idx).status.code(), Some(2), "{bad:?}");
+    }
+    let o = run(&["sync", "--no-embed", "--model", "e5-base", "--file", "/nonexistent.ost"], &idx);
+    assert_eq!(o.status.code(), Some(4), "flags accepted");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

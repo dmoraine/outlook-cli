@@ -1,5 +1,6 @@
 //! Local mail index (cargo feature `index`): database location, schema
-//! migrations, `doctor`, `sync`, `search`, `status` and local embeddings.
+//! migrations, `doctor`, `sync`, `search`, `status`, local embeddings and
+//! stored vectors.
 
 pub mod doctor;
 pub mod embed;
@@ -7,6 +8,7 @@ pub mod model;
 pub mod search;
 pub mod sync;
 pub mod text;
+pub mod vectors;
 
 use std::path::{Path, PathBuf};
 
@@ -65,6 +67,16 @@ const MIGRATIONS: &[&str] = &[
     // Char range of a chunk in the quote-stripped body; NULL for older rows.
     "ALTER TABLE chunks ADD COLUMN start_char INTEGER;
      ALTER TABLE chunks ADD COLUMN end_char INTEGER;",
+    // One vector per (chunk, model): little-endian f32, deleted with its chunk.
+    "CREATE TABLE vectors (
+        chunk INTEGER NOT NULL REFERENCES chunks(id),
+        model TEXT NOT NULL,
+        revision TEXT NOT NULL,
+        vec BLOB NOT NULL,
+        PRIMARY KEY (chunk, model));
+     CREATE TRIGGER chunks_vectors_ad AFTER DELETE ON chunks BEGIN
+        DELETE FROM vectors WHERE chunk = old.id;
+     END;",
 ];
 
 /// %LOCALAPPDATA%\outlook-cli on Windows, $XDG_DATA_HOME/outlook-cli elsewhere.

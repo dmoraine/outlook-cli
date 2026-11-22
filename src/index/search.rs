@@ -66,7 +66,7 @@ const SQL: &str = "
 
 /// Folder ids for -F specs, case-insensitive: a name, or a path with its
 /// subfolders ("Inbox" matches "Inbox/Projects", not "Inboxes").
-fn folder_ids(c: &Connection, specs: &[String]) -> Result<Vec<i64>> {
+pub(super) fn folder_ids(c: &Connection, specs: &[String]) -> Result<Vec<i64>> {
     let all: Vec<(i64, String, String)> = c
         .prepare("SELECT nid, path, name FROM folders")
         .map_err(db_err)?
@@ -158,7 +158,7 @@ pub fn status(c: &Connection) -> Result<Json> {
     let mut v = totals(c)?;
     let o = v.as_object_mut().unwrap();
     o.insert("schema".into(), json!(super::schema_version(c)?));
-    o.insert("embedded".into(), json!(0));
+    o.insert("embedding".into(), super::vectors::counts(c)?);
     let bytes = c.query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |r| {
         r.get::<_, i64>(0)
     });
@@ -390,7 +390,12 @@ mod tests {
         assert_eq!(s["locations"], 5);
         assert_eq!(s["folders"], 2);
         assert!(s["chunks"].as_u64().unwrap() >= 4);
-        assert_eq!(s["embedded"], 0);
+        assert_eq!(
+            (s["embedding"]["vectors"].as_u64(), s["embedding"]["pending"].as_u64()),
+            (Some(0), s["chunks"].as_u64()),
+            "{s}"
+        );
+        assert_eq!(s["embedding"]["scope"]["all"], true, "{s}");
         assert_eq!(s["last_sync"]["complete"], true);
         assert_eq!(s["schema"], crate::index::schema_version(&c).unwrap());
         assert!(s["last_sync"]["revision"].is_string() && s["last_sync"]["at"].is_string(), "{s}");

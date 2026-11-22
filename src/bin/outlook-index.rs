@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value as Json, json};
@@ -8,7 +8,7 @@ use serde_json::{Value as Json, json};
 use outlook_cli::error::{Error, Result};
 use outlook_cli::index::doctor::{self, StoreSource};
 use outlook_cli::index::embed::{self, Embedder};
-use outlook_cli::index::{self, model, search, sync};
+use outlook_cli::index::{self, model, search, sync, vectors};
 use outlook_cli::paths::{default_file, native_path};
 use outlook_cli::timeutil::parse_when;
 
@@ -59,6 +59,13 @@ enum Mode {
     Hybrid,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Priority {
+    /// Below normal (nice 10 on Linux), so the machine stays usable.
+    Low,
+    Normal,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Aggregate-only diagnostics of the mailbox and this machine. Prints
@@ -69,16 +76,52 @@ enum Cmd {
         sample: usize,
     },
     /// Bring the index up to date with the file (every mail folder): new,
-    /// deleted, moved and read/unread changes. Prints counts only.
-    /// Resumable: an interrupted sync continues where it stopped.
+    /// deleted, moved and read/unread changes, then embed pending chunks of
+    /// the embedding scope when the model files are present. Prints counts
+    /// only. Resumable: an interrupted sync continues where it stopped.
     Sync {
-        /// Stop after this long (90s, 30m, 2h); the next sync resumes.
+        /// Stop after this long (90s, 30m, 2h), embedding included; the next
+        /// sync resumes.
         #[arg(long)]
         max_time: Option<String>,
         /// Allow deleting more than max(100, 20%) of the indexed messages in
         /// one sync (default: abort with no change).
         #[arg(long)]
         allow_mass_delete: bool,
+        /// Index only; skip the embedding step.
+        #[arg(long)]
+        no_embed: bool,
+        #[command(flatten)]
+        embed: EmbedArgs,
+    },
+    /// Embed pending chunks of the embedding scope, newest message first.
+    /// Commits every batch: Ctrl-C or --max-time lose at most one batch, the
+    /// next run resumes. Prints counts and rates only.
+    Embed {
+        /// Stop after the batch that ends past this long (90s, 30m, 2h).
+        #[arg(long)]
+        max_time: Option<String>,
+        #[command(flatten)]
+        embed: EmbedArgs,
+    },
+    /// Show the persisted embedding scope with counts, or change it. Search
+    /// covers every folder; only embeddings are limited. Vectors that fall
+    /// out of scope are kept. Folder specs are counted, not printed.
+    Scope {
+        /// Embed messages received at or after (2026-01-01, 90d, ...),
+        /// stored as an absolute time.
+        #[arg(long)]
+        embed_since: Option<String>,
+        /// Embed messages received strictly before, stored as an absolute time.
+        #[arg(long)]
+        embed_until: Option<String>,
+        /// Embed only this folder (name, or path with its subfolders, as
+        /// `search -F`); repeatable = any. Replaces the stored folders.
+        #[arg(short = 'F', long = "folder")]
+        folders: Vec<String>,
+        /// Reset the scope to everything.
+        #[arg(long, conflicts_with_all = ["embed_since", "embed_until", "folders"])]
+        clear: bool,
     },
     /// Keyword search (FTS5, accent-insensitive). Best chunk per message.
     Search {
@@ -153,12 +196,94 @@ struct ModelArgs {
 impl ModelArgs {
     fn resolve(&self) -> Result<(&'static model::Model, PathBuf)> {
         let m = model::get(&self.model)?;
-        let dir = match &self.model_dir {
-            Some(d) => native_path(d),
-            None => model::default_dir(m)?,
-        };
-        Ok((m, dir))
+        Ok((m, model_dir(m, &self.model_dir)?))
     }
+}
+
+fn model_dir(m: &model::Model, dir: &Option<String>) -> Result<PathBuf> {
+    match dir {
+        Some(d) => Ok(native_path(d)),
+        None => model::default_dir(m),
+    }
+}
+
+#[derive(Args)]
+struct EmbedArgs {
+    /// Embedding model. Default: the model of the stored vectors, else e5-small.
+    #[arg(long, value_parser = model::NAMES)]
+    model: Option<String>,
+    /// Directory with the model files. Default: <data dir>/models/<repository name>.
+    #[arg(long, env = "OUTLOOK_INDEX_MODEL_DIR")]
+    model_dir: Option<String>,
+    /// Compute threads. Default: logical CPUs - 1 (at least 1).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    threads: Option<u64>,
+    /// Passages per batch (one model call, one commit).
+    #[arg(long, default_value_t = embed::DEFAULT_BATCH as u64, value_parser = clap::value_parser!(u64).range(1..=256))]
+    batch: u64,
+    /// Drop the vectors of another model and embed again (needed to change model).
+    #[arg(long)]
+    reembed: bool,
+    /// CPU priority while embedding.
+    #[arg(long, value_enum, default_value_t = Priority::Low)]
+    priority: Priority,
+}
+
+impl EmbedArgs {
+    /// The requested model, else the stored one, else e5-small; refused if
+    /// vectors of another model exist and --reembed is not given.
+    fn model(&self, c: &rusqlite::Connection) -> Result<&'static model::Model> {
+        let name = match &self.model {
+            Some(n) => n.clone(),
+            None => vectors::current_model(c)?.unwrap_or_else(|| model::NAMES[0].into()),
+        };
+        let m = model::get(&name)?;
+        vectors::check_model(c, m, self.reembed)?;
+        Ok(m)
+    }
+}
+
+/// Compute threads for candle (rayon reads RAYON_NUM_THREADS on first use).
+fn set_threads(threads: Option<u64>) -> usize {
+    let threads = threads.map_or_else(embed::default_threads, |n| n as usize);
+    // SAFETY: no other thread exists yet; candle and rayon read this
+    // variable on first use.
+    unsafe { std::env::set_var("RAYON_NUM_THREADS", threads.to_string()) };
+    threads
+}
+
+const MODEL_MISSING: &str = "model files missing; run outlook-index model fetch";
+
+/// Load the model and embed within `max_time` from `start`. Missing model
+/// files: Ok(skipped) when `missing_ok`, else the not_found error.
+fn embed_step(
+    c: &mut rusqlite::Connection,
+    a: &EmbedArgs,
+    m: &'static model::Model,
+    start: Instant,
+    max_time: Option<Duration>,
+    missing_ok: bool,
+) -> Result<Json> {
+    let threads = set_threads(a.threads);
+    let low = a.priority == Priority::Low && vectors::lower_priority();
+    let t = Instant::now();
+    let mut e = match Embedder::load(m, &model_dir(m, &a.model_dir)?) {
+        Err(Error::NotFound(_)) if missing_ok => return Ok(json!({ "skipped": MODEL_MISSING })),
+        r => r?,
+    };
+    e.batch = a.batch as usize;
+    let load_ms = t.elapsed().as_millis() as u64;
+    let o = vectors::Options {
+        batch: a.batch as usize,
+        max_time: max_time.map(|d| d.saturating_sub(start.elapsed())),
+        reembed: a.reembed,
+    };
+    let mut v = vectors::run(c, &mut e, &o)?;
+    let obj = v.as_object_mut().unwrap();
+    obj.insert("threads".into(), json!(threads));
+    obj.insert("priority".into(), json!(if low { "low" } else { "normal" }));
+    obj.insert("load_ms".into(), json!(load_ms));
+    Ok(v)
 }
 
 #[derive(Subcommand)]
@@ -215,16 +340,56 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let f = file().map_err(doctor::sanitize)?;
             doctor::run(&f, &index_path, sample).map_err(doctor::sanitize)?
         }
-        Cmd::Sync { ref max_time, allow_mass_delete } => {
-            let opts = sync::Options {
-                max_time: max_time.as_deref().map(parse_duration).transpose()?,
-                allow_mass_delete,
-                ..Default::default()
-            };
+        Cmd::Sync { ref max_time, allow_mass_delete, no_embed, ref embed } => {
+            let start = Instant::now();
+            let max_time = max_time.as_deref().map(parse_duration).transpose()?;
+            let opts = sync::Options { max_time, allow_mass_delete, ..Default::default() };
             let f = file()?;
             let mut c = index::open(&index_path)?;
             let _lock = sync::lock(&index_path)?;
-            sync::sync(&mut c, &mut StoreSource::open(&f)?, &opts)?
+            // Model choice is checked before indexing.
+            let m = if no_embed { None } else { Some(embed.model(&c)?) };
+            let mut v = sync::sync(&mut c, &mut StoreSource::open(&f)?, &opts)?;
+            let e = match m {
+                None => json!({ "skipped": "--no-embed" }),
+                Some(_) if max_time.is_some_and(|t| start.elapsed() >= t) => {
+                    json!({ "skipped": "max-time reached; the next sync or embed resumes" })
+                }
+                Some(m) => embed_step(&mut c, embed, m, start, max_time, true)?,
+            };
+            v.as_object_mut().unwrap().insert("embedding".into(), e);
+            v
+        }
+        Cmd::Embed { ref max_time, ref embed } => {
+            let start = Instant::now();
+            let max_time = max_time.as_deref().map(parse_duration).transpose()?;
+            let mut c = index::open(&existing(index_path.clone())?)?;
+            let _lock = sync::lock(&index_path)?;
+            let m = embed.model(&c)?;
+            embed_step(&mut c, embed, m, start, max_time, false)?
+        }
+        Cmd::Scope { embed_since, embed_until, folders, clear } => {
+            let c = if clear || embed_since.is_some() || embed_until.is_some() || !folders.is_empty() {
+                let c = index::open(&index_path)?;
+                let _lock = sync::lock(&index_path)?;
+                let mut s = if clear { vectors::Scope::default() } else { vectors::scope(&c)? };
+                if let Some(t) = embed_since {
+                    s.since = Some(parse_when(&t)?);
+                    s.since_input = Some(t);
+                }
+                if let Some(t) = embed_until {
+                    s.until = Some(parse_when(&t)?);
+                    s.until_input = Some(t);
+                }
+                if !folders.is_empty() {
+                    s.folders = folders;
+                }
+                vectors::set_scope(&c, &s)?;
+                c
+            } else {
+                index::open(&existing(index_path)?)?
+            };
+            vectors::counts(&c)?
         }
         Cmd::Search { query, mode, limit, folders, since, until, from, to, has_attachments, excerpt_max, format } => {
             if mode != Mode::Keyword {
@@ -263,10 +428,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         }
         Cmd::BenchEmbed { ref model, seconds, threads, batch } => {
             let (m, dir) = model.resolve()?;
-            let threads = threads.map_or_else(embed::default_threads, |n| n as usize);
-            // SAFETY: no other thread exists yet; candle and rayon read this
-            // variable on first use.
-            unsafe { std::env::set_var("RAYON_NUM_THREADS", threads.to_string()) };
+            let threads = set_threads(threads);
             let t = std::time::Instant::now();
             let mut e = Embedder::load(m, &dir)?;
             e.batch = batch as usize;
