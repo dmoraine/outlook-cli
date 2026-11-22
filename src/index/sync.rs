@@ -128,7 +128,11 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(3);
 pub fn lock(index: &std::path::Path) -> Result<std::fs::File> {
     let mut p = index.as_os_str().to_owned();
     p.push(".lock");
-    let f = std::fs::File::create(&p).map_err(|e| Error::Io(format!("cannot create the sync lock file: {e}")))?;
+    let f = super::private_file()
+        .create(true)
+        .truncate(true)
+        .open(&p)
+        .map_err(|e| Error::Io(format!("cannot create the sync lock file: {e}")))?;
     let start = Instant::now();
     loop {
         match f.try_lock() {

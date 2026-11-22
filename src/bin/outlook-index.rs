@@ -209,6 +209,17 @@ enum Cmd {
               value_parser = clap::value_parser!(u64).range(1..=3600))]
         watch: Option<u64>,
     },
+    /// Consistent copy of the index into a new file (SQLite VACUUM INTO,
+    /// safe during a sync), then checked read-only: integrity, schema
+    /// version, counts. Restore with every outlook-index stopped: delete
+    /// index.sqlite-wal and index.sqlite-shm, then copy the backup to
+    /// index.sqlite.
+    Backup {
+        /// New file to write (an existing one is refused). Default:
+        /// backups/index-YYYYMMDD-HHMMSS.sqlite next to the index.
+        #[arg(long, value_name = "PATH")]
+        to: Option<String>,
+    },
     /// Embedding model files: list, or download (opt-in network access).
     Model {
         #[command(subcommand)]
@@ -716,8 +727,10 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             }
             let mut v = search::status(&c)?;
             v["running"] = progress::running(&c, sync::held(&path))?;
+            v["permissions_warning"] = json!(index::permissions_warning(&path));
             v
         }
+        Cmd::Backup { ref to } => index::backup(&index_path, to.as_deref().map(native_path).as_deref())?,
         Cmd::Model { cmd: ModelCmd::List } => model::list(model::default_dir)?,
         Cmd::Model { cmd: ModelCmd::Fetch { ref model } } => {
             let (m, dir) = model.resolve(Some(&index_path))?;
@@ -793,6 +806,9 @@ const PUBLIC: &[&str] = &[
     "index schema 7 is newer than this tool; upgrade outlook-index",
     "index schema 4 needs an upgrade; run `outlook-index sync`",
     "the index vectors changed during the search; retry",
+    "the backup destination already exists; choose a new path",
+    "the backup path must be valid Unicode",
+    "the backup failed its integrity check",
     INCLUDE_NONE,
     "invalid --max-time (use e.g. 90s, 30m, 2h)",
     "cannot parse --since (use e.g. 2026-10-15T08:00:00Z, '2026-10-15 08:00', 2026-10-15, 2h, 3d, today)",

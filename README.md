@@ -157,7 +157,7 @@ outlook-index status --pretty                    # compteurs, taille, run en cou
 outlook-index search "facture impayée" -n 5      # hybride dès que des vecteurs existent
 ```
 
-Commandes : `doctor`, `sync`, `embed`, `search`, `status`, `scope`, `model list|fetch`, `bench-embed`. Options
+Commandes : `doctor`, `sync`, `embed`, `search`, `status`, `scope`, `backup`, `model list|fetch`, `bench-embed`. Options
 globales comme `outlook-cli` : `-f/--file`, `--pretty`, `--local-time`, `--ascii`, plus `--index`. Mêmes
 conventions : JSON sur stdout, erreurs `{"error":{"kind","message"}}` sur stderr, mêmes codes de retour.
 
@@ -175,19 +175,46 @@ Fichier d'index : `--index` / `OUTLOOK_INDEX_DB`, par défaut `%LOCALAPPDATA%\ou
 `{"warning":{"kind":"onedrive",...}}` sur stderr. L'index se reconstruit toujours depuis l'OST : le supprimer
 suffit à revenir en arrière.
 
+Permissions : l'index contient une copie en clair des mails. Sous Unix, un dossier d'index créé par
+`outlook-index` est en 0700 et la base (avec `index.sqlite-wal`, `index.sqlite-shm`, `index.sqlite.lock` et les
+sauvegardes) en 0600, quel que soit l'umask. Un dossier ou un fichier existant n'est jamais modifié (ni le dossier
+parent) : s'il est accessible au groupe ou aux autres, `status` et `doctor` (section `index`) affichent
+`permissions_warning` (texte fixe, sans chemin ; `null` sinon) ; corriger avec `chmod 700` sur le dossier et
+`chmod 600` sur les fichiers. Sous Windows, `%LOCALAPPDATA%` est propre à l'utilisateur ; un `--index` ailleurs
+(dossier partagé, autre disque) relève des ACL choisies par son propriétaire.
+
 Lecture et écriture de l'index :
 
 - **Écrivains** : `sync`, `embed` et `scope` avec une option. Un seul à la fois par index (verrou
   `index.sqlite.lock`) : un écrivain attend jusqu'à 3 s que le verrou se libère (un `status` le sonde un
   instant), puis échoue (`usage`, « another sync is running »). Il prend le verrou avant toute mise à jour du
   schéma, qu'il applique dans une seule transaction.
-- **Lecteurs** : `search`, `status`, `scope` sans option, `model fetch` et `bench-embed` ouvrent l'index en
+- **Lecteurs** : `search`, `status`, `scope` sans option, `backup`, `model fetch` et `bench-embed` ouvrent l'index en
   lecture seule (jamais créé, migré ni modifié) et peuvent tourner pendant un sync ; `doctor` et `model list`
   ne l'ouvrent pas. `search` lit un instantané cohérent de l'index (modèle chargé avant).
 - **Index d'une version plus ancienne** : `status` fonctionne et indique `schema` :
   `{"version": 4, "expected": 6, "upgrade_pending": true}` (compteurs dont les tables manquent à `null`) ;
   `search` et `scope` sans option échouent avec `upgrade_pending` (code 3) : lancer `sync` (ou un autre
   écrivain), qui met le schéma à jour. Un index d'une version plus récente est refusé (`format`, code 5).
+
+### backup
+
+```bash
+outlook-index backup                             # backups/index-AAAAMMJJ-HHMMSS.sqlite à côté de l'index
+outlook-index backup --to D:\sauvegardes\index-avant-test.sqlite
+```
+
+Copie cohérente de l'index (SQLite `VACUUM INTO`, un seul instantané, WAL compris) dans un **nouveau** fichier :
+une destination existante est refusée (`usage`, code 2), jamais écrasée. Sans danger pendant un `sync` (l'écrivain
+continue, la copie reflète un état validé). La copie est ensuite rouverte en lecture seule et vérifiée. Sortie :
+`destination`, `bytes`, `schema_version`, `counts` (`messages`, `chunks`, `vectors`, `attachment_chunks`,
+`attachment_vectors` ; `null` si la table manque) et `integrity` (`ok` ; sinon erreur `inconsistent` et la copie
+est supprimée). La sauvegarde est un fichier unique, sans `-wal` ni `-shm`.
+
+Restauration, **tous les utilisateurs de l'index arrêtés** (aucun `sync`, `embed`, `search`, `status --watch`) :
+supprimer `index.sqlite-wal` et `index.sqlite-shm` s'ils existent, puis copier la sauvegarde vérifiée sur
+`index.sqlite`. Ne jamais copier `index.sqlite` (ni ses fichiers `-wal`/`-shm`) à la main pendant qu'il est ouvert :
+un WAL obsolète peut être rejoué et rendre silencieusement un état ancien.
 
 ### doctor
 
@@ -198,7 +225,7 @@ outlook-index doctor --attachments --pretty      # extraction de 300 pièces joi
 ```
 
 `doctor` n'affiche que des agrégats : machine (OS, architecture, CPU, RAM), SQLite/FTS5, état de l'index
-(`exists`, `bytes`, `under_onedrive`), type et taille du fichier, nombre de dossiers et de messages par préfixe de
+(`exists`, `bytes`, `under_onedrive`, `permissions_warning`), type et taille du fichier, nombre de dossiers et de messages par préfixe de
 classe, profondeur et année, durée du scan complet, et pour l'échantillon : temps d'ouverture et d'extraction du
 texte (µs), longueurs de texte, estimation du nombre de chunks, couverture Message-ID, pièces jointes par
 extension et méthode. `well_known` donne pour l'Inbox, les Éléments supprimés et le Courrier indésirable `found`,
@@ -364,7 +391,8 @@ sur `null`, `done` ou `stale`. Compteurs et durées seulement.
 
 `status` : `messages`, `chunks`, `folders`, `locations`, `schema` (`version`, `expected`, `upgrade_pending`),
 `embedding` (modèle, révision, dimensions,
-vecteurs, compteurs de portée), `include`, `attachments`, `db_bytes`, `last_sync`, `running`.
+vecteurs, compteurs de portée), `include`, `attachments`, `db_bytes`, `last_sync`, `running`,
+`permissions_warning` (voir Permissions).
 
 ### search
 

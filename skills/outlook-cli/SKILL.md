@@ -202,11 +202,18 @@ tant que le message n'a pas été déplacé ; dédupliquer sur `message_id`.
 - **Ne pas lancer `sync`, `embed` ni modifier `scope`** sans la demande du propriétaire, et jamais pendant qu'un
   autre run tourne (`status` → `running` non `null` et non `stale`) : un premier sync dure des heures et occupe le
   CPU. Un second run échoue d'ailleurs avec `usage` (« another sync is running », après 3 s d'attente du verrou).
-- `search`, `status`, `scope` sans option, `model fetch` et `bench-embed` ouvrent l'index en lecture seule (ni
+- `search`, `status`, `scope` sans option, `backup`, `model fetch` et `bench-embed` ouvrent l'index en lecture seule (ni
   création, ni migration, ni écriture) ; `doctor` et `model list` ne l'ouvrent pas. Tous peuvent tourner pendant
   un sync.
 - Index d'une version plus ancienne : `status` répond avec `schema.upgrade_pending: true` ; `search` et `scope`
   échouent avec `upgrade_pending` (3). Ne pas lancer `sync` soi-même : le signaler au propriétaire.
+- **Sauvegarde** : `outlook-index backup [--to <nouveau fichier>]` (lecteur, possible pendant un sync) écrit une
+  copie cohérente vérifiée (`integrity: "ok"`, `schema_version`, `counts`) ; défaut
+  `backups/index-AAAAMMJJ-HHMMSS.sqlite` à côté de l'index ; une destination existante est refusée (`usage`). Ne
+  jamais copier `index.sqlite` à la main. Restauration réservée au propriétaire, tous les utilisateurs de l'index
+  arrêtés : supprimer `index.sqlite-wal` et `index.sqlite-shm`, puis copier la sauvegarde sur `index.sqlite`.
+- **Permissions** : `status` → `permissions_warning` non `null` = dossier ou base de l'index accessible à d'autres
+  utilisateurs (Unix) : le signaler au propriétaire, ne pas changer les droits soi-même.
 - **Confidentialité** : les résultats de `search` contiennent des sujets, adresses et extraits de mails. Ne jamais
   les transmettre à un outil ou service tiers (API externe, ticket, dépôt, log partagé) sans l'accord du
   propriétaire. `doctor`, `status`, `scope` et les résumés de `sync` ne contiennent que des agrégats.

@@ -165,10 +165,58 @@ fn db_err(e: rusqlite::Error) -> Error {
     Error::Io(format!("index database: {e}"))
 }
 
+/// Create `d` and its missing parents owner-only (0700 on Unix, whatever the
+/// umask); existing directories keep their mode.
+pub(crate) fn create_private_dir(d: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(d)
+}
+
+/// Write options that create a new file owner-only (0600 on Unix).
+pub(crate) fn private_file() -> std::fs::OpenOptions {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o
+}
+
 fn make_dir(p: &Path) -> Result<()> {
     match p.parent().filter(|d| !d.as_os_str().is_empty()) {
-        Some(d) => std::fs::create_dir_all(d).map_err(|e| Error::Io(format!("cannot create the index directory: {e}"))),
+        Some(d) => create_private_dir(d).map_err(|e| Error::Io(format!("cannot create the index directory: {e}"))),
         None => Ok(()),
+    }
+}
+
+/// Unix: a fixed, path-free warning (status, doctor) when the index
+/// directory, the database or its WAL/SHM sidecar grants any group/other
+/// access. Never changes a mode. Elsewhere None: %LOCALAPPDATA% is per-user,
+/// another --index is the owner's ACL.
+pub fn permissions_warning(p: &Path) -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let side = |s: &str| {
+            let mut o = p.as_os_str().to_owned();
+            o.push(s);
+            PathBuf::from(o)
+        };
+        let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let open = [dir.to_path_buf(), p.to_path_buf(), side("-wal"), side("-shm")]
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok())
+            .any(|m| m.permissions().mode() & 0o077 != 0);
+        open.then_some(
+            "the index directory or database is open to other users; restrict it to its owner (directory 700, files 600)",
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        None
     }
 }
 
@@ -176,6 +224,13 @@ fn make_dir(p: &Path) -> Result<()> {
 /// Commands use `open_write` (sync lock first) or `open_read`.
 pub fn open(p: &Path) -> Result<Connection> {
     make_dir(p)?;
+    // A new database starts owner-only; SQLite gives its sidecars its mode.
+    match private_file().create_new(true).open(p) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            return Err(Error::Io(format!("cannot create the index: {e}")));
+        }
+        _ => {}
+    }
     let mut c = Connection::open(p).map_err(db_err)?;
     c.busy_timeout(std::time::Duration::from_secs(10)).map_err(db_err)?;
     c.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
@@ -207,6 +262,62 @@ pub fn open_read(p: &Path) -> Result<Connection> {
         return Err(newer(v));
     }
     Ok(c)
+}
+
+/// `backup`: a consistent snapshot of the index (`VACUUM INTO` in one read
+/// transaction: safe while a sync writes, WAL content included) into a new
+/// owner-only file, never an existing one; then the copy is opened
+/// read-only and checked. Default destination:
+/// `backups/index-YYYYMMDD-HHMMSS.sqlite` next to the index.
+pub fn backup(index: &Path, to: Option<&Path>) -> Result<serde_json::Value> {
+    let c = open_read(index)?;
+    let dest = match to {
+        Some(t) => t.to_path_buf(),
+        None => {
+            let d = index.parent().unwrap_or(Path::new("")).join("backups");
+            create_private_dir(&d).map_err(|e| Error::Io(format!("cannot create the backup directory: {e}")))?;
+            d.join(chrono::Local::now().format("index-%Y%m%d-%H%M%S.sqlite").to_string())
+        }
+    };
+    let name = dest.to_str().ok_or_else(|| Error::Usage("the backup path must be valid Unicode".into()))?;
+    // VACUUM INTO accepts an empty file; create_new refuses an existing one.
+    private_file().create_new(true).open(&dest).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => {
+            Error::Usage("the backup destination already exists; choose a new path".into())
+        }
+        _ => Error::Io(format!("cannot create the backup: {e}")),
+    })?;
+    let r = c.execute("VACUUM INTO ?1", [name]).map_err(db_err).and_then(|_| check_backup(&dest));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&dest);
+    }
+    r
+}
+
+/// Integrity, schema version and row counts of a backup, opened read-only.
+fn check_backup(dest: &Path) -> Result<serde_json::Value> {
+    let b = open_read(dest)?;
+    let integrity: String = b.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(db_err)?;
+    if integrity != "ok" {
+        return Err(Error::Corrupt("the backup failed its integrity check".into()));
+    }
+    let mut counts = serde_json::Map::new();
+    for t in ["messages", "chunks", "vectors", "attachment_chunks", "attachment_vectors"] {
+        let q = "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)";
+        let n: Option<i64> = match b.query_row(q, [t], |r| r.get(0)).map_err(db_err)? {
+            true => Some(b.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).map_err(db_err)?),
+            false => None,
+        };
+        counts.insert(t.into(), n.into());
+    }
+    let bytes = std::fs::metadata(dest).map_err(|e| Error::Io(format!("backup: {e}")))?.len();
+    Ok(serde_json::json!({
+        "destination": dest.display().to_string(),
+        "bytes": bytes,
+        "schema_version": schema_version(&b)?,
+        "counts": counts,
+        "integrity": integrity,
+    }))
 }
 
 fn newer(v: usize) -> Error {

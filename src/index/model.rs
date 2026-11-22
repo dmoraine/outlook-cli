@@ -172,7 +172,7 @@ fn install_part(m: &Model, f: &ModelFile, part: &Path, dest: &Path) -> Result<()
 /// huggingface.co at the pinned revision, with `curl`. Files go to `<name>.part`
 /// (resumed if shorter than expected) and are renamed only after the SHA-256 check.
 pub fn fetch(m: &Model, dir: &Path, mut progress: impl FnMut(&ModelFile)) -> Result<Json> {
-    std::fs::create_dir_all(dir).map_err(|e| Error::Io(format!("cannot create the model directory: {e}")))?;
+    super::create_private_dir(dir).map_err(|e| Error::Io(format!("cannot create the model directory: {e}")))?;
     let mut files = Vec::new();
     for f in &m.files {
         let dest = dir.join(f.name);

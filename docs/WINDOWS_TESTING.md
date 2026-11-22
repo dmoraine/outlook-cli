@@ -90,16 +90,18 @@ outlook-index status --pretty              # counts, embedded %, size; "running"
 
 ## 6. Backup
 
-After a complete first sync, with no run in progress (`status`: `"running": null`):
+After a complete first sync (safe even while a sync runs):
 
 ```bash
-idx="$(wslpath "$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')")/outlook-cli"
-mkdir -p "$idx/backup"
-cp "$idx/index.sqlite" "$idx/backup/"
-[ -f "$idx/index.sqlite-wal" ] && cp "$idx/index.sqlite-wal" "$idx/backup/"
+outlook-index backup --pretty      # %LOCALAPPDATA%\outlook-cli\backups\index-YYYYMMDD-HHMMSS.sqlite
 ```
 
-The index can always be rebuilt from the OST; the backup saves the hours of embedding.
+One consistent snapshot (SQLite `VACUUM INTO`) into a new single file (an existing `--to PATH` is refused), then
+reopened read-only and checked: report `integrity` (`"ok"`), `schema_version`, `counts` and `bytes`, not the
+`destination`. Never copy `index.sqlite` or its `-wal` by hand: a stale WAL can bring back an old state.
+
+The index can always be rebuilt from the OST; the backup saves the hours of embedding. `%LOCALAPPDATA%` is
+per-user; an `--index` elsewhere (shared folder, other drive) keeps the ACLs its owner gives it.
 
 ## 7. Search
 
@@ -123,7 +125,15 @@ time outlook-index search "facture fournisseur" | grep -o '"count":[0-9]*,"mode"
 
 Nothing is ever written to the OST, and `outlook-cli` is unchanged. To drop the index, stop any run, then delete
 `index.sqlite`, `index.sqlite-wal`, `index.sqlite-shm` and `index.sqlite.lock` in `%LOCALAPPDATA%\outlook-cli\`
-(keep `backup\` and `models\`). To restore, copy the backup files back to `%LOCALAPPDATA%\outlook-cli\`.
+(keep `backups\` and `models\`). To restore, with every `outlook-index` stopped (no sync, embed, search or
+`status --watch`): delete `index.sqlite-wal` and `index.sqlite-shm` if present, then copy the verified backup to
+`index.sqlite`:
+
+```powershell
+$d = "$env:LOCALAPPDATA\outlook-cli"
+Remove-Item "$d\index.sqlite-wal", "$d\index.sqlite-shm" -ErrorAction SilentlyContinue
+Copy-Item "$d\backups\index-YYYYMMDD-HHMMSS.sqlite" "$d\index.sqlite"
+```
 
 ## 9. WSL and PowerShell notes
 

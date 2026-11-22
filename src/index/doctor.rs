@@ -593,13 +593,20 @@ pub fn run(file: &Path, index: &Path, sample: usize) -> Result<Json> {
     let o = v.as_object_mut().unwrap();
     o.insert("tool".into(), json!({ "name": "outlook-index", "version": env!("CARGO_PKG_VERSION") }));
     o.insert("sqlite".into(), json!({ "version": rusqlite::version(), "fts5": super::fts5_available() }));
-    let size = std::fs::metadata(index).ok().map(|m| m.len());
-    o.insert(
-        "index".into(),
-        json!({ "exists": size.is_some(), "bytes": size, "under_onedrive": super::under_onedrive(index) }),
-    );
+    o.insert("index".into(), index_json(index));
     o.insert("file".into(), file_json);
     Ok(v)
+}
+
+/// Doctor's index section: no path.
+fn index_json(index: &Path) -> Json {
+    let size = std::fs::metadata(index).ok().map(|m| m.len());
+    json!({
+        "exists": size.is_some(),
+        "bytes": size,
+        "under_onedrive": super::under_onedrive(index),
+        "permissions_warning": super::permissions_warning(index),
+    })
 }
 
 #[cfg(test)]
@@ -990,5 +997,27 @@ mod tests {
         assert_eq!(chunks(CHUNK_CHARS), 1);
         assert_eq!(chunks(CHUNK_CHARS + 1), 2);
         assert_eq!(chunks(CHUNK_CHARS + CHUNK_CHARS - CHUNK_OVERLAP), 2);
+    }
+
+    /// S6: the index section warns, without a path, on an index location
+    /// open to group/other.
+    #[cfg(unix)]
+    #[test]
+    fn index_section_permissions_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let chmod = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let dir = std::env::temp_dir().join(format!("SECRET_doctor_perm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = dir.join("index.sqlite");
+        std::fs::write(&idx, b"").unwrap();
+        chmod(&dir, 0o755);
+        chmod(&idx, 0o600);
+        let v = index_json(&idx);
+        let w = v["permissions_warning"].as_str().unwrap_or_else(|| panic!("{v}"));
+        assert!(!w.contains("SECRET") && !w.contains('/'), "{w}");
+        chmod(&dir, 0o700);
+        assert!(index_json(&idx)["permissions_warning"].is_null());
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700, "unchanged");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
