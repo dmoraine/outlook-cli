@@ -322,3 +322,77 @@ fn attachments_cli() {
     assert_eq!(o.status.code(), Some(4), "flag accepted");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `status.running`, `status --watch` and the progress flags. Fictitious records only.
+#[test]
+fn progress_and_watch_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-watch-cli-{}", std::process::id()));
+    let idx = dir.join("index.sqlite");
+    std::fs::create_dir_all(&dir).unwrap();
+    let c = outlook_cli::index::open(&idx).unwrap();
+    let json = |o: &Output| -> serde_json::Value {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    assert_eq!(json(&run(&["status"], &idx))["running"], serde_json::Value::Null);
+    let o = run(&["status", "--watch", "1"], &idx);
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "{\"running\":null}\n", "no run: one line");
+
+    let record = |phase: &str, ago_s: i64| {
+        let at = chrono::Utc::now() - chrono::Duration::seconds(ago_s);
+        let r = serde_json::json!({
+            "phase": phase, "done": 5, "total": 10, "percent": 50.0, "rate": 1.5, "eta_s": 4, "elapsed_s": 60,
+            "workers": 2, "model": "e5-base", "pid": 4242, "started_at": "2026-11-22T10:00:00Z",
+            "updated_at": at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "interval_s": 1,
+        });
+        c.execute("INSERT OR REPLACE INTO meta VALUES ('sync_progress', ?1)", [r.to_string()]).unwrap();
+    };
+    // A crashed run: stale, watch prints it once and stops.
+    record("embed_bodies", 600);
+    let v = json(&run(&["status"], &idx));
+    assert_eq!((v["running"]["phase"].as_str(), v["running"]["stale"].as_bool()), (Some("embed_bodies"), Some(true)));
+    let o = run(&["status", "--watch", "1", "--pretty"], &idx);
+    let lines: Vec<&str> = std::str::from_utf8(&o.stdout).unwrap().lines().collect();
+    assert_eq!(lines.len(), 1, "jsonl even with --pretty: {lines:?}");
+    let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(v["running"]["stale"], true);
+
+    // A live run (lock held): one line per tick until the record says done.
+    let lock = outlook_cli::index::sync::lock(&idx).unwrap();
+    record("index", 0);
+    let child = Command::new(env!("CARGO_BIN_EXE_outlook-index"))
+        .args(["status", "--watch", "1", "--index"])
+        .arg(&idx)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let v = json(&run(&["status"], &idx));
+    assert_eq!((v["running"]["phase"].as_str(), v["running"]["stale"].as_bool()), (Some("index"), Some(false)), "{v}");
+    record("done", 0);
+    drop(lock);
+    let o = child.wait_with_output().unwrap();
+    let lines: Vec<serde_json::Value> =
+        std::str::from_utf8(&o.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(lines.len() >= 3, "{lines:?}");
+    assert_eq!(lines[0]["running"]["phase"], "index");
+    assert_eq!(lines.last().unwrap()["running"]["phase"], "done");
+    assert_eq!(json(&run(&["status"], &idx))["running"], serde_json::Value::Null, "finished");
+
+    for ok in [&["sync", "--progress", "jsonl", "--progress-interval", "5"][..], &["sync", "--progress", "none"]] {
+        let o = run(&[ok, &["--file", "/nonexistent.ost"][..]].concat(), &idx);
+        assert_eq!(o.status.code(), Some(4), "{ok:?} accepted");
+    }
+    for bad in [
+        &["sync", "--progress", "fancy"][..],
+        &["sync", "--progress-interval", "0"],
+        &["embed", "--progress", "x"],
+        &["status", "--watch", "0"],
+    ] {
+        assert_eq!(run(bad, &idx).status.code(), Some(2), "{bad:?}");
+    }
+    let o = run(&["embed", "--progress", "bar", "--model-dir", dir.join("none").to_str().unwrap()], &idx);
+    assert_eq!(o.status.code(), Some(3), "accepted");
+    drop(c);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

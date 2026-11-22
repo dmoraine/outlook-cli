@@ -112,6 +112,7 @@ pub fn phase(
     batch: usize,
     ran: bool,
     over: &dyn Fn() -> bool,
+    p: &mut super::progress::Progress,
 ) -> Result<Stats> {
     let s = scope(c)?;
     let todo: Vec<(i64, Nid)> = c
@@ -126,6 +127,8 @@ pub fn phase(
         .collect::<rusqlite::Result<_>>()
         .map_err(db_err)?;
     let (mut st, mut tried) = (Stats::default(), HashSet::new());
+    p.phase(Some(c), "attachments", todo.len() as u64)?;
+    let mut done = 0;
     for (i, group) in todo.chunks(batch.max(1)).enumerate() {
         if (i > 0 || ran) && over() {
             st.interrupted = true;
@@ -150,6 +153,8 @@ pub fn phase(
         }
         // A link may have changed content.
         gc(&tx)?;
+        done += group.len() as u64;
+        p.update(Some(&tx), done)?;
         tx.commit().map_err(db_err)?;
     }
     Ok(st)

@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,7 @@ use serde_json::{Value as Json, json};
 use outlook_cli::error::{Error, Result};
 use outlook_cli::index::doctor::{self, StoreSource};
 use outlook_cli::index::embed::{self, Embedder};
+use outlook_cli::index::progress::{self, Progress};
 use outlook_cli::index::{self, attach, extract, model, search, sync, vectors, worker};
 use outlook_cli::paths::{default_file, native_path};
 use outlook_cli::timeutil::parse_when;
@@ -105,6 +106,8 @@ enum Cmd {
         include_folders: Option<Vec<String>>,
         #[command(flatten)]
         embed: EmbedArgs,
+        #[command(flatten)]
+        progress: ProgressArgs,
     },
     /// Embed pending chunks of the embedding scope: body chunks newest
     /// message first, then attachment chunks (up to the scope's cap per
@@ -117,6 +120,8 @@ enum Cmd {
         max_time: Option<String>,
         #[command(flatten)]
         embed: EmbedArgs,
+        #[command(flatten)]
+        progress: ProgressArgs,
     },
     /// Show the persisted embedding and attachment scopes with counts, or
     /// change them. Search covers every folder; only embeddings are limited.
@@ -194,8 +199,16 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Format::Json)]
         format: Format,
     },
-    /// Index counts and size. No content, no names.
-    Status,
+    /// Index counts and size, and `running`: the live progress of a sync or
+    /// embed (null when none; `stale` when its process is gone). No content,
+    /// no names.
+    Status {
+        /// Print `{"running": ...}` every SECONDS (default 10), one line per
+        /// tick, until the run ends (done, stale or none).
+        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "10",
+              value_parser = clap::value_parser!(u64).range(1..=3600))]
+        watch: Option<u64>,
+    },
     /// Embedding model files: list, or download (opt-in network access).
     Model {
         #[command(subcommand)]
@@ -307,11 +320,36 @@ struct ParArgs {
 }
 
 impl ParArgs {
+    fn workers(&self) -> usize {
+        self.workers.map_or_else(|| embed::default_workers(embed::logical_cpus()), |n| n as usize)
+    }
+
     /// Effective (workers, threads); sets this process's compute threads
     /// (worker processes get --threads).
     fn apply(&self) -> (usize, usize) {
-        let workers = self.workers.map_or_else(|| embed::default_workers(embed::logical_cpus()), |n| n as usize);
-        (workers, set_threads(self.threads as usize))
+        (self.workers(), set_threads(self.threads as usize))
+    }
+}
+
+#[derive(Args)]
+struct ProgressArgs {
+    /// Progress on stderr (stdout keeps the summary): auto = bar on a
+    /// terminal, else jsonl ({"progress":{...}} lines). Counts only. The
+    /// live record is also kept in the index for `status`.
+    #[arg(long, value_enum, default_value_t = progress::Mode::Auto)]
+    progress: progress::Mode,
+    /// Seconds between progress reports; phase changes are always reported.
+    #[arg(long, value_name = "SECONDS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    progress_interval: u64,
+}
+
+impl ProgressArgs {
+    fn start(&self, workers: Option<usize>, model: Option<&'static model::Model>) -> Progress {
+        let mode = self.progress.resolve(std::io::stderr().is_terminal());
+        let every = Duration::from_secs(self.progress_interval);
+        let mut p = Progress::new(mode, every, Box::new(std::io::stderr()), true);
+        (p.workers, p.model) = (workers, model.map(|m| m.name));
+        p
     }
 }
 
@@ -336,6 +374,7 @@ fn embed_step(
     start: Instant,
     max_time: Option<Duration>,
     missing_ok: bool,
+    p: &mut Progress,
 ) -> Result<Json> {
     let (workers, threads) = a.par.apply();
     // Before the workers start: they inherit it.
@@ -351,7 +390,7 @@ fn embed_step(
         max_time: max_time.map(|d| d.saturating_sub(start.elapsed())),
         reembed: a.reembed,
     };
-    let mut v = vectors::run(c, &mut es.iter_mut().map(|e| e.as_mut()).collect::<Vec<_>>(), &o)?;
+    let mut v = vectors::run_with(c, &mut es.iter_mut().map(|e| e.as_mut()).collect::<Vec<_>>(), &o, p)?;
     let obj = v.as_object_mut().unwrap();
     obj.insert("threads".into(), json!(threads));
     obj.insert("priority".into(), json!(if low { "low" } else { "normal" }));
@@ -454,7 +493,15 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 doctor::run(&f, &index_path, sample.unwrap_or(200)).map_err(doctor::sanitize)?
             }
         }
-        Cmd::Sync { ref max_time, allow_mass_delete, no_embed, no_attachments, ref include_folders, ref embed } => {
+        Cmd::Sync {
+            ref max_time,
+            allow_mass_delete,
+            no_embed,
+            no_attachments,
+            ref include_folders,
+            ref embed,
+            ref progress,
+        } => {
             let start = Instant::now();
             let max_time = max_time.as_deref().map(parse_duration).transpose()?;
             let include = include_folders.as_ref().map(|v| sync::Include {
@@ -474,24 +521,29 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let mut x = extract::Isolated::new(cmd, extract::TIMEOUT, limits);
             let mut extract = |b: &[u8], n: Option<&str>, m: Option<&str>| x.extract(b, n, m);
             let extract: Option<&mut doctor::ExtractFn> = if no_attachments { None } else { Some(&mut extract) };
-            let mut v = sync::sync_with(&mut c, &mut StoreSource::open(&f)?, extract, &opts)?;
+            let mut p = progress.start(m.map(|_| embed.par.workers()), m);
+            let mut v = sync::sync_with_progress(&mut c, &mut StoreSource::open(&f)?, extract, &opts, &mut p)?;
             let e = match m {
                 None => json!({ "skipped": "--no-embed" }),
                 Some(_) if max_time.is_some_and(|t| start.elapsed() >= t) => {
                     json!({ "skipped": "max-time reached; the next sync or embed resumes" })
                 }
-                Some(m) => embed_step(&mut c, embed, m, start, max_time, true)?,
+                Some(m) => embed_step(&mut c, embed, m, start, max_time, true, &mut p)?,
             };
+            p.finish(Some(&c))?;
             v.as_object_mut().unwrap().insert("embedding".into(), e);
             v
         }
-        Cmd::Embed { ref max_time, ref embed } => {
+        Cmd::Embed { ref max_time, ref embed, ref progress } => {
             let start = Instant::now();
             let max_time = max_time.as_deref().map(parse_duration).transpose()?;
             let mut c = index::open(&existing(index_path.clone())?)?;
             let _lock = sync::lock(&index_path)?;
             let m = embed.model(&c)?;
-            embed_step(&mut c, embed, m, start, max_time, false)?
+            let mut p = progress.start(Some(embed.par.workers()), Some(m));
+            let v = embed_step(&mut c, embed, m, start, max_time, false, &mut p)?;
+            p.finish(Some(&c))?;
+            v
         }
         Cmd::Scope {
             embed_since,
@@ -614,7 +666,26 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             }
         }
         Cmd::EmbedWorker { .. } | Cmd::ExtractWorker => unreachable!("served above"),
-        Cmd::Status => search::status(&index::open(&existing(index_path)?)?)?,
+        Cmd::Status { watch } => {
+            let path = existing(index_path)?;
+            let c = index::open(&path)?;
+            if let Some(secs) = watch {
+                // jsonl whatever --pretty: one line per tick.
+                loop {
+                    let r = progress::live(&c, sync::held(&path))?;
+                    let end = r.as_ref().is_none_or(|r| r["phase"] == "done" || r["stale"] == true);
+                    writeln!(out, "{}", render(&json!({ "running": r }), false, cli.ascii)?).map_err(io)?;
+                    out.flush().map_err(io)?;
+                    if end {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_secs(secs));
+                }
+            }
+            let mut v = search::status(&c)?;
+            v["running"] = progress::running(&c, sync::held(&path))?;
+            v
+        }
         Cmd::Model { cmd: ModelCmd::List } => model::list(model::default_dir)?,
         Cmd::Model { cmd: ModelCmd::Fetch { ref model } } => {
             let (m, dir) = model.resolve(Some(&index_path))?;
@@ -639,22 +710,25 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             }
         }
     };
-    let print = |v: &Json, pretty: bool| {
-        let s = if pretty { serde_json::to_string_pretty(v) } else { serde_json::to_string(v) };
-        let s = s.map_err(|e| Error::Io(e.to_string()))?;
-        let s = if cli.ascii { ascii(&s) } else { s };
-        Ok::<_, Error>(s)
-    };
-    let io = |e: std::io::Error| Error::Io(e.to_string());
     match lines {
         Some(hits) => {
             for h in &hits {
-                writeln!(out, "{}", print(h, false)?).map_err(io)?;
+                writeln!(out, "{}", render(h, false, cli.ascii)?).map_err(io)?;
             }
             Ok(())
         }
-        None => writeln!(out, "{}", print(&v, cli.pretty)?).map_err(io),
+        None => writeln!(out, "{}", render(&v, cli.pretty, cli.ascii)?).map_err(io),
     }
+}
+
+fn io(e: std::io::Error) -> Error {
+    Error::Io(e.to_string())
+}
+
+fn render(v: &Json, pretty: bool, ascii_only: bool) -> Result<String> {
+    let s = if pretty { serde_json::to_string_pretty(v) } else { serde_json::to_string(v) };
+    let s = s.map_err(|e| Error::Io(e.to_string()))?;
+    Ok(if ascii_only { ascii(&s) } else { s })
 }
 
 /// Non-ASCII as JSON \uXXXX escapes. JSON has non-ASCII only inside

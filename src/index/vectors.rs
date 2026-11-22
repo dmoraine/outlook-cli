@@ -12,6 +12,7 @@ use serde_json::{Value as Json, json};
 use super::db_err;
 use super::embed::Embedder;
 use super::model::{self, Model};
+use super::progress::Progress;
 use super::search::folder_ids;
 use super::sync::{get_meta, set_meta};
 use crate::error::{Error, Result, guarded};
@@ -205,6 +206,18 @@ type Rows = Vec<(bool, i64, String)>;
 /// dispatching, commits the batches still in flight and returns the first
 /// error. Counts only.
 pub fn run<E: Embed + ?Sized>(c: &mut Connection, es: &mut [&mut E], o: &Options) -> Result<Json> {
+    run_with(c, es, o, &mut Progress::none())
+}
+
+/// `run`, reporting phases `embed_bodies` (total: pending body chunks in
+/// scope) and `embed_attachments` (pending attachment chunks under the cap)
+/// to `p`, stored in each batch transaction.
+pub fn run_with<E: Embed + ?Sized>(
+    c: &mut Connection,
+    es: &mut [&mut E],
+    o: &Options,
+    p: &mut Progress,
+) -> Result<Json> {
     let start = Instant::now();
     let m = es.first().ok_or_else(|| Error::Usage("no embedding worker".into()))?.model();
     check_model(c, m, o.reembed)?;
@@ -237,14 +250,22 @@ pub fn run<E: Embed + ?Sized>(c: &mut Connection, es: &mut [&mut E], o: &Options
          ORDER BY scoped.newest DESC, a.sha256, a.seq",
         scoped_contents()
     );
-    let p = attachment_params(c, &s, Some(m.name), Some(m.revision))?;
+    let ap = attachment_params(c, &s, Some(m.name), Some(m.revision))?;
     c.prepare(&sql)
         .map_err(db_err)?
-        .query_map(params_from_iter(&p), |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map(params_from_iter(&ap), |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(db_err)?
         .try_for_each(|r| r.map(|r| ids.push(r)))
         .map_err(db_err)?;
 
+    let n_body = ids.iter().filter(|r| !r.0).count() as u64;
+    let n_att = ids.len() as u64 - n_body;
+    let (mut body_done, mut bodies) = (0u64, true);
+    p.phase(Some(c), "embed_bodies", n_body)?;
+    if n_body == 0 {
+        p.phase(Some(c), "embed_attachments", n_att)?;
+        bodies = false;
+    }
     let workers = es.len();
     let t = Instant::now();
     let (mut embedded, mut embedded_att, mut interrupted) = (0u64, 0u64, false);
@@ -286,10 +307,21 @@ pub fn run<E: Embed + ?Sized>(c: &mut Connection, es: &mut [&mut E], o: &Options
             }
             let (rows, r) = res_rx.recv().map_err(|_| Error::Format("embedding worker stopped".into()))?;
             in_flight -= 1;
-            match r.and_then(|vecs| store(c, m, &rows, &vecs)) {
+            let att = rows.iter().filter(|r| r.0).count() as u64;
+            let body = rows.len() as u64 - att;
+            // Attachments once the bodies are done (or the first attachment batch lands).
+            let report = |tx: &Connection| {
+                if bodies && (body_done + body >= n_body || att > 0) {
+                    p.phase(Some(tx), "embed_attachments", n_att)?;
+                    bodies = false;
+                }
+                p.update(Some(tx), if bodies { body_done + body } else { embedded_att + att })
+            };
+            match r.and_then(|vecs| store(c, m, &rows, &vecs, report)) {
                 Ok(()) => {
                     embedded += rows.len() as u64;
-                    embedded_att += rows.iter().filter(|r| r.0).count() as u64;
+                    embedded_att += att;
+                    body_done += body;
                 }
                 Err(e) => {
                     failed.get_or_insert(e);
@@ -340,8 +372,14 @@ fn texts(c: &Connection, ids: &[(bool, i64)]) -> Result<Rows> {
     Ok(rows)
 }
 
-/// One batch, one transaction: all its vectors or none.
-fn store(c: &mut Connection, m: &Model, rows: &Rows, vecs: &[Vec<f32>]) -> Result<()> {
+/// One batch, one transaction: all its vectors or none; `report` runs in it.
+fn store(
+    c: &mut Connection,
+    m: &Model,
+    rows: &Rows,
+    vecs: &[Vec<f32>],
+    report: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<()> {
     if vecs.len() != rows.len() {
         return Err(Error::Format(format!("{} vectors for {} passages", vecs.len(), rows.len())));
     }
@@ -357,6 +395,7 @@ fn store(c: &mut Connection, m: &Model, rows: &Rows, vecs: &[Vec<f32>]) -> Resul
             .map_err(db_err)?;
         }
     }
+    report(&tx)?;
     tx.commit().map_err(db_err)
 }
 
@@ -471,6 +510,7 @@ mod tests {
     use super::*;
     use crate::index::migrate;
     use crate::index::model::MODELS;
+    use crate::index::progress::{Mode, Progress};
     use crate::index::sync::fake::*;
     use crate::index::sync::{self, sync};
 
@@ -1033,6 +1073,74 @@ mod tests {
             31
         );
         assert_eq!(count(&c, "SELECT COUNT(*) FROM attachment_vectors"), 31);
+    }
+
+    // --- progress ---
+
+    /// A full fake sync + embed with progress: (summaries, events, meta record).
+    fn progress_run(f: &mut Fake, mode: Mode, interval: Duration) -> (Vec<Json>, String, String) {
+        let mut c = Connection::open_in_memory().unwrap();
+        migrate(&mut c).unwrap();
+        let (b, out) = crate::index::progress::testing::buf();
+        let mut p = Progress::new(mode, interval, out, true);
+        (p.workers, p.model) = (Some(1), Some(MODELS[0].name));
+        let mut x = |b: &[u8], n: Option<&str>, m: Option<&str>| crate::index::extract::extract(b, n, m);
+        let s = sync::sync_with_progress(&mut c, f, Some(&mut x), &sync::Options::default(), &mut p).unwrap();
+        let e = run_with(&mut c, &mut [&mut hashed(0)], &opts(4), &mut p).unwrap();
+        p.finish(Some(&c)).unwrap();
+        let text = crate::index::progress::testing::text(&b);
+        (vec![s, e], text, get_meta(&c, "sync_progress").unwrap().unwrap())
+    }
+
+    #[test]
+    fn progress_phases_over_a_fake_run() {
+        let mut f = with_files();
+        let (sums, text, rec) = progress_run(&mut f, Mode::Jsonl, Duration::from_secs(3600));
+        let ev: Vec<Json> =
+            text.lines().map(|l| serde_json::from_str::<Json>(l).unwrap()["progress"].clone()).collect();
+        let phases: Vec<&str> = ev.iter().map(|e| e["phase"].as_str().unwrap()).collect();
+        assert_eq!(phases, ["scan", "index", "attachments", "embed_bodies", "embed_attachments", "done"], "{text}");
+        let totals: Vec<u64> = ev.iter().map(|e| e["total"].as_u64().unwrap()).collect();
+        let bodies = sums[0]["chunks_added"].as_u64().unwrap();
+        assert_eq!(totals, [2, 5, 2, bodies, 31, 31], "{text}");
+        assert_eq!((ev[5]["done"].as_u64(), ev[5]["percent"].as_f64()), (Some(31), Some(100.0)));
+        for e in &ev {
+            assert_eq!((e["workers"].as_u64(), e["model"].as_str()), (Some(1), Some("e5-small")), "{e}");
+        }
+        for s in &sums {
+            assert!(!s.to_string().contains("progress") && s.get("phase").is_none(), "summary unchanged: {s}");
+        }
+        let r: Json = serde_json::from_str(&rec).unwrap();
+        assert_eq!((r["phase"].as_str(), r["interval_s"].as_u64()), (Some("done"), Some(3600)), "{r}");
+        // Every batch with a zero interval: still one phase order, counts rising.
+        let (_, text, _) = progress_run(&mut with_files(), Mode::Jsonl, Duration::ZERO);
+        let ev: Vec<Json> =
+            text.lines().map(|l| serde_json::from_str::<Json>(l).unwrap()["progress"].clone()).collect();
+        assert!(ev.len() > 10, "{text}");
+        let mut order: Vec<&str> = ev.iter().map(|e| e["phase"].as_str().unwrap()).collect();
+        order.dedup();
+        assert_eq!(order, ["scan", "index", "attachments", "embed_bodies", "embed_attachments", "done"]);
+    }
+
+    #[test]
+    fn progress_has_counts_only() {
+        let secret = || {
+            let mut f = mailbox();
+            f.folders[0].path = "SECRET_FOLDER".into();
+            f.folders[0].name = "SECRET_FOLDER".into();
+            f.add(0x2e4, 0x22, Some("<SECRET@fict.invalid>"), "SECRET_SUBJECT", "SECRET_BODY");
+            f.attach(0x2e4, "SECRET_NAME.txt", None, false, b"SECRET_CONTENT");
+            f
+        };
+        for mode in [Mode::Jsonl, Mode::Bar] {
+            let (_, text, rec) = progress_run(&mut secret(), mode, Duration::ZERO);
+            assert!(!text.is_empty());
+            for o in [&text, &rec] {
+                for m in ["SECRET", "secret", "Zed", "fict", "Budget", "Lunch", "Archive", "Inbox", ".txt"] {
+                    assert!(!o.contains(m), "progress leaks {m:?}: {o}");
+                }
+            }
+        }
     }
 
     /// Real e5-small on ~200 synthetic chunks: passages/s and DB bytes per

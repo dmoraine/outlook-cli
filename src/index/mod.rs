@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod embed;
 pub mod extract;
 pub mod model;
+pub mod progress;
 pub mod search;
 pub mod sync;
 pub mod text;

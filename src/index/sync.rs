@@ -10,6 +10,7 @@ use serde_json::{Value as Json, json};
 use super::attach;
 use super::db_err;
 use super::doctor::{ExtractFn, Source, StoreSource};
+use super::progress::Progress;
 use super::text::{chunk, strip_quotes};
 use crate::body::text_of;
 use crate::error::{Error, Result};
@@ -131,6 +132,16 @@ pub fn lock(index: &std::path::Path) -> Result<std::fs::File> {
     }
 }
 
+/// Whether a process (or another handle of this one) holds the sync lock of
+/// `index`. Does not create the lock file.
+// ponytail: probes with a shared lock; a sync starting in that instant is refused as concurrent.
+pub fn held(index: &std::path::Path) -> bool {
+    let mut p = index.as_os_str().to_owned();
+    p.push(".lock");
+    let Ok(f) = std::fs::File::open(&p) else { return false };
+    matches!(f.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 /// Identity of a message: Internet Message-ID, else a fingerprint of
 /// contents-table columns. The NID is only a locator.
 pub fn identity(e: &Entry) -> String {
@@ -193,12 +204,25 @@ pub fn sync(c: &mut Connection, src: &mut dyn MailSource, o: &Options) -> Result
     sync_with(c, src, None, o)
 }
 
+/// `sync_with_progress`, silent.
+pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut ExtractFn>, o: &Options) -> Result<Json> {
+    sync_with_progress(c, src, x, o, &mut Progress::none())
+}
+
 /// Reconcile the index with `src`: new, deleted, moved/copied messages and
 /// flag changes. Only new messages are opened. New messages are committed in
 /// batches, so an interrupted run resumes where it stopped. Then, with `x`,
 /// the attachment phase (`attach::phase`), in batches too. Returns a
-/// count-only summary (no content, no names).
-pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut ExtractFn>, o: &Options) -> Result<Json> {
+/// count-only summary (no content, no names). Phases `scan` (folders, not
+/// stored: the mass-deletion guard writes nothing), `index` (new messages)
+/// and `attachments` go to `p`, stored in each batch transaction.
+pub fn sync_with_progress(
+    c: &mut Connection,
+    src: &mut dyn MailSource,
+    x: Option<&mut ExtractFn>,
+    o: &Options,
+    p: &mut Progress,
+) -> Result<Json> {
     let start = Instant::now();
     let revision = src.revision()?;
     let stored = include(c)?;
@@ -231,15 +255,18 @@ pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut Ex
         .collect();
     let (excluded, folders): (Vec<Folder>, Vec<Folder>) =
         all.into_iter().partition(|f| roots.iter().any(|r| format!("{}/", f.path).starts_with(r.as_str())));
+    p.phase(None, "scan", (folders.len() + excluded.len()) as u64)?;
     let mut entries = Vec::new();
-    for f in &folders {
+    for (i, f) in folders.iter().enumerate() {
         entries.extend(src.entries(f.nid)?);
+        p.update(None, i as u64 + 1)?;
     }
     // Identities still in the file, in excluded folders: leaving the index
     // because of the exclusion, not deleted.
     let mut kept_out = HashSet::new();
-    for f in &excluded {
+    for (i, f) in excluded.iter().enumerate() {
         kept_out.extend(src.entries(f.nid)?.iter().map(identity));
+        p.update(None, (folders.len() + i) as u64 + 1)?;
     }
 
     // Group rows by identity, in scan order.
@@ -340,10 +367,11 @@ pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut Ex
     };
     set_meta(&tx, "include_folders", &serde_json::to_string(&inc).unwrap())?;
     set_meta(&tx, "sync_complete", "0")?;
+    p.phase(Some(&tx), "index", fresh.len() as u64)?;
     tx.commit().map_err(db_err)?;
 
     let (mut new, mut chunks, mut errors) = (0u64, 0u64, BTreeMap::<&'static str, u64>::new());
-    let (mut interrupted, mut batches) = (false, 0);
+    let (mut interrupted, mut batches, mut done) = (false, 0, 0u64);
     let mut pending = fresh.into_iter().peekable();
     while pending.peek().is_some() {
         if batches > 0 && o.max_time.is_some_and(|m| start.elapsed() > m) {
@@ -352,6 +380,7 @@ pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut Ex
         }
         let tx = c.transaction().map_err(db_err)?;
         for (ident, group) in pending.by_ref().take(o.batch.max(1)) {
+            done += 1;
             let e = &group[0];
             let m = match src.open(e.nid) {
                 Ok(m) => m,
@@ -403,6 +432,7 @@ pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut Ex
             }
             new += 1;
         }
+        p.update(Some(&tx), done)?;
         tx.commit().map_err(db_err)?;
         batches += 1;
     }
@@ -410,7 +440,7 @@ pub fn sync_with(c: &mut Connection, src: &mut dyn MailSource, x: Option<&mut Ex
     let over = || o.max_time.is_some_and(|m| start.elapsed() > m);
     let with_attachments = x.is_some();
     let att = match x {
-        Some(x) if !interrupted => Some(attach::phase(c, src, x, o.batch, batches > 0, &over)?),
+        Some(x) if !interrupted => Some(attach::phase(c, src, x, o.batch, batches > 0, &over, p)?),
         _ => None,
     };
     let att_remaining = attach::pending(c)?;

@@ -380,6 +380,39 @@ attachments, the owner's mailbox adds at most ~10,000 chunks (doctor estimate; t
 ~190,000): ~50,000 chunks ≈ 1 h 42 min at that rate (e5-base is slower: use its `bench-embed` rate). Size: about
 2 MB per 1,000 e5-small vectors (measured: 384 × 4 bytes plus row and page overhead).
 
+### Progress of long runs
+
+`sync` and `embed` report progress on stderr; stdout still gets only the final JSON summary.
+`--progress auto|bar|jsonl|none` (default `auto`: `bar` when stderr is a terminal, else `jsonl`, e.g. a pipe, an
+agent or a log file). Reports at each phase change, at most every `--progress-interval` seconds (default 10) in
+between, and a final `done`. Phases in order: `scan` (folders), `index` (new messages), `attachments` (messages
+with attachments to read), `embed_bodies` (pending body chunks in scope), `embed_attachments` (pending attachment
+chunks under the cap); totals are taken at phase start.
+
+```text
+{"progress":{"phase":"embed_bodies","done":12345,"total":30112,"percent":40.9,"rate":3.9,"eta_s":4556,"elapsed_s":5210,"workers":4,"model":"e5-base"}}
+embed_bodies       41 % 12,345/30,112  3.9/s  ETA 1h15m
+```
+
+`jsonl`: one whole line per event, so lines stay parseable among `{"warning":...}` lines. `rate` is items/s over
+the last minute of the phase, `eta_s` derives from it (`null` until known), `elapsed_s` counts from the start of the
+run; `workers` and `model` are `null` without embedding. `bar`: one self-overwriting line per phase, plain ASCII
+(Windows Terminal, PowerShell, WSL). Counts and durations only: no names, subjects or text.
+
+The same record (plus `pid`, `started_at`, `updated_at`, `interval_s`) is stored in the index (meta `sync_progress`)
+inside the run's batch transactions, so another process can read it:
+
+```powershell
+outlook-index.exe status            # "running": null, or {phase, done, total, percent, rate, eta_s, elapsed_s, pid, updated_at, stale}
+outlook-index.exe status --watch    # {"running": ...} every 10 s (--watch 30: every 30 s) until the run ends
+```
+
+`status` reads while a sync runs (WAL, no wait). `running` is `null` when no run was recorded or the last one
+finished; `stale: true` means the run's process is gone (no process holds the index lock) and the record is older
+than twice its interval: a crashed or killed run, resumed by the next `sync`. `status --watch` prints one line per
+tick (jsonl, even with `--pretty`) and stops after a line whose record is `null`, `done` or stale. **Agents**: read
+`running` from `status` (or poll `status --watch`), or parse the `{"progress":...}` lines of the run's stderr.
+
 Parity with sentence-transformers (`scripts/e5_reference.py` → `tests/fixtures/e5_reference.json`):
 `E5_SMALL_DIR=... E5_BASE_DIR=... cargo test --release --features index --test embed_parity -- --ignored --nocapture`.
 
