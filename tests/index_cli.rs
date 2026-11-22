@@ -2,6 +2,31 @@
 #![cfg(feature = "index")]
 
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
+
+/// A child process killed and reaped when dropped (also on a test failure).
+struct Reap(std::process::Child);
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Output of `c`, which must end within `max`.
+fn output_within(c: &mut Command, max: Duration) -> (Output, Duration) {
+    let t = Instant::now();
+    let mut c = Reap(c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap());
+    while c.0.try_wait().unwrap().is_none() {
+        assert!(t.elapsed() < max, "still running after {max:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    std::io::Read::read_to_end(&mut c.0.stdout.take().unwrap(), &mut stdout).unwrap();
+    std::io::Read::read_to_end(&mut c.0.stderr.take().unwrap(), &mut stderr).unwrap();
+    (Output { status: c.0.wait().unwrap(), stdout, stderr }, t.elapsed())
+}
 
 fn run(args: &[&str], index: &std::path::Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_outlook-index")).args(args).arg("--index").arg(index).output().unwrap()
@@ -366,20 +391,42 @@ fn progress_and_watch_cli() {
     // A live run (lock held): one line per tick until the record says done.
     let lock = outlook_cli::index::sync::lock(&idx).unwrap();
     record("index", 0);
-    let child = Command::new(env!("CARGO_BIN_EXE_outlook-index"))
-        .args(["status", "--watch", "1", "--index"])
-        .arg(&idx)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(2500));
+    // Handshake (S8): read its lines until two live ticks, then mark done and
+    // read until it stops; one overall deadline, the child killed on failure.
+    let mut child = Reap(
+        Command::new(env!("CARGO_BIN_EXE_outlook-index"))
+            .args(["status", "--watch", "1", "--index"])
+            .arg(&idx)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = std::io::BufReader::new(child.0.stdout.take().unwrap());
+    let reader = std::thread::spawn(move || {
+        for l in std::io::BufRead::lines(out) {
+            let _ = tx.send(serde_json::from_str::<serde_json::Value>(&l.unwrap()).unwrap());
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut lines = Vec::new();
+    let mut until = |phase: &str, n: usize| {
+        while lines.iter().filter(|l: &&serde_json::Value| l["running"]["phase"] == phase).count() < n {
+            let left = deadline.saturating_duration_since(Instant::now());
+            lines.push(rx.recv_timeout(left).unwrap_or_else(|e| panic!("waiting for {phase}: {e:?} after {lines:?}")));
+        }
+    };
+    until("index", 2);
     let v = json(&run(&["status"], &idx));
     assert_eq!((v["running"]["phase"].as_str(), v["running"]["stale"].as_bool()), (Some("index"), Some(false)), "{v}");
     record("done", 0);
     drop(lock);
-    let o = child.wait_with_output().unwrap();
-    let lines: Vec<serde_json::Value> =
-        std::str::from_utf8(&o.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    until("done", 1);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "watch still running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    reader.join().unwrap();
     assert!(lines.len() >= 3, "{lines:?}");
     assert_eq!(lines[0]["running"]["phase"], "index");
     assert_eq!(lines.last().unwrap()["running"]["phase"], "done");
@@ -550,5 +597,83 @@ fn observer_probe_does_not_refuse_writer_cli() {
     let o = writer(&idx);
     probe.join().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Processes still alive whose environment holds `token` (Linux only).
+fn alive_with(token: &str) -> usize {
+    if !cfg!(target_os = "linux") {
+        return 0;
+    }
+    let Ok(d) = std::fs::read_dir("/proc") else { return 0 };
+    d.flatten()
+        .filter(|e| {
+            std::fs::read(e.path().join("environ")).is_ok_and(|b| b.windows(token.len()).any(|w| w == token.as_bytes()))
+        })
+        .count()
+}
+
+/// S3: embedding workers that never load, hang, send half a reply or exit
+/// end the run within --worker-timeout: killed and reaped, a resumable io
+/// error, the lock free, the vectors already stored kept. Driven by the
+/// worker's test hook (OUTLOOK_INDEX_TEST_WORKER, fake model, no files).
+#[test]
+fn embedding_worker_timeouts_cli() {
+    let dir = std::env::temp_dir().join(format!("outlook-index-wtimeout-cli-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let idx = dir.join("index.sqlite");
+    let c = outlook_cli::index::open(&idx).unwrap();
+    c.execute_batch(
+        "INSERT INTO folders VALUES (34, 'F', 'F');
+         INSERT INTO messages(id, ident, received, has_attachments, subject) VALUES (1, 'mid:x', 0, 0, 'S');
+         INSERT INTO locations VALUES (36, 34, 1, 1);",
+    )
+    .unwrap();
+    for i in 0..4 {
+        c.execute("INSERT INTO chunks(message, seq, text) VALUES (1, ?1, 'fictitious text')", [i]).unwrap();
+    }
+    let embed = |hook: &str| {
+        let token = format!("wt-{}-{}", std::process::id(), hook.replace(' ', "-"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_outlook-index"));
+        cmd.args(["embed", "--model", "e5-small", "--workers", "2", "--threads", "1", "--batch", "1"])
+            .args(["--worker-timeout", "1s", "--progress", "none", "--model-dir"])
+            .arg(&dir)
+            .arg("--index")
+            .arg(&idx)
+            .env("OUTLOOK_INDEX_TEST_WORKER", format!("{hook} {token}"));
+        let (o, t) = output_within(&mut cmd, Duration::from_secs(30));
+        assert!(t < Duration::from_secs(15), "{hook}: {t:?}");
+        assert_eq!(alive_with(&token), 0, "{hook}: no process left");
+        o
+    };
+    let vectors = || -> (i64, i64) {
+        c.query_row("SELECT count(*), COALESCE(SUM(length(vec) = 384 * 4), 0) FROM vectors", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    };
+    for (hook, msg) in
+        [("never_ready 0", "timed out"), ("hang 0", "timed out"), ("partial 0", "timed out"), ("exit 0", "exited")]
+    {
+        let o = embed(hook);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(4), "io"), "{hook}: {err}");
+        assert!(err.contains(msg), "{hook}: {err}");
+        drop(outlook_cli::index::sync::lock(&idx).expect("lock released"));
+        assert_eq!(vectors(), (0, 0), "{hook}");
+    }
+    // One good batch per worker, then hung: what was stored stays, valid.
+    let o = embed("hang 1");
+    assert_eq!(o.status.code(), Some(4), "{}", String::from_utf8_lossy(&o.stderr));
+    let (n, valid) = vectors();
+    assert!((1..4).contains(&n) && valid == n, "{n} {valid}");
+    // The next run resumes with the rest.
+    let o = embed("hang 9");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!((v["embedded"].as_i64(), v["complete"].as_bool()), (Some(4 - n), Some(true)), "{v}");
+    assert_eq!(vectors(), (4, 4));
+    drop(c);
     std::fs::remove_dir_all(&dir).unwrap();
 }

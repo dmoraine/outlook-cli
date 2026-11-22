@@ -556,6 +556,7 @@ pub fn run_attachments(file: &Path, sample: usize, x: &mut Isolated) -> Result<J
             "max_chars": l.max_chars,
             "max_rows": l.max_rows,
             "max_cells": l.max_cells,
+            "max_cols": l.max_cols,
             "timeout_s": x.timeout.as_secs(),
         },
         "workers_started": x.spawned,

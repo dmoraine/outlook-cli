@@ -328,6 +328,16 @@ struct ParArgs {
     /// Compute threads per worker.
     #[arg(long, default_value_t = embed::DEFAULT_THREADS as u64, value_parser = clap::value_parser!(u64).range(1..=1024))]
     threads: u64,
+    /// With worker processes: the longest wait for a worker to load the
+    /// model, then for each batch (e.g. 90s, 5m). A worker past it is
+    /// killed and the run stops; run again to resume. Default: 180s to
+    /// load, 120s per batch.
+    #[arg(long, value_name = "DURATION", value_parser = worker_timeout)]
+    worker_timeout: Option<Duration>,
+}
+
+fn worker_timeout(s: &str) -> std::result::Result<Duration, String> {
+    duration(s).filter(|d| !d.is_zero()).ok_or_else(|| "use e.g. 90s, 5m".into())
 }
 
 impl ParArgs {
@@ -393,7 +403,8 @@ fn embed_step(
     // Before the workers start: they inherit it.
     let low = a.priority == Priority::Low && vectors::lower_priority();
     let t = Instant::now();
-    let mut es = match embedders(m, &model_dir(m, &a.model_dir)?, workers, threads, a.batch as usize) {
+    let dir = model_dir(m, &a.model_dir)?;
+    let mut es = match embedders(m, &dir, workers, threads, a.batch as usize, a.par.worker_timeout) {
         Err(Error::NotFound(_)) if missing_ok => return Ok(json!({ "skipped": MODEL_MISSING })),
         r => r?,
     };
@@ -420,6 +431,7 @@ fn embedders(
     workers: usize,
     threads: usize,
     batch: usize,
+    timeout: Option<Duration>,
 ) -> Result<Vec<Box<dyn vectors::Embed>>> {
     if workers <= 1 {
         let mut e = Embedder::load(m, dir)?;
@@ -429,7 +441,10 @@ fn embedders(
     let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| Error::Io(e.to_string()))?);
     cmd.args(["embed-worker", "--model", m.name, "--threads", &threads.to_string(), "--batch", &batch.to_string()]);
     cmd.arg("--model-dir").arg(dir);
-    Ok(worker::Child::spawn(cmd, workers, m)?.into_iter().map(|c| Box::new(c) as Box<dyn vectors::Embed>).collect())
+    Ok(worker::Child::spawn(cmd, workers, m, timeout)?
+        .into_iter()
+        .map(|c| Box::new(c) as Box<dyn vectors::Embed>)
+        .collect())
 }
 
 #[derive(Subcommand)]
@@ -448,6 +463,10 @@ enum ModelCmd {
 
 /// "90s", "30m", "2h".
 fn parse_duration(s: &str) -> Result<Duration> {
+    duration(s).ok_or_else(|| Error::Usage("invalid --max-time (use e.g. 90s, 30m, 2h)".into()))
+}
+
+fn duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let mult = match unit.trim() {
@@ -456,10 +475,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
         "h" => 3600,
         _ => 0,
     };
-    match n.parse::<u64>() {
-        Ok(n) if mult > 0 => Ok(Duration::from_secs(n * mult)),
-        _ => Err(Error::Usage("invalid --max-time (use e.g. 90s, 30m, 2h)".into())),
-    }
+    n.parse::<u64>().ok().filter(|_| mult > 0).map(|n| Duration::from_secs(n * mult))
 }
 
 /// `parse_when`, with an error naming the flag, not the value.
@@ -478,6 +494,45 @@ fn test_panic(point: &str) {
     }
 }
 
+/// Test hook of the worker timeouts: OUTLOOK_INDEX_TEST_WORKER="<mode> <ok>"
+/// serves a fake model (no files) that answers `ok` batches, then hangs
+/// (`hang`), sends half a reply and hangs (`partial`) or exits (`exit`);
+/// `never_ready` never reports ready.
+fn test_worker(hook: &str, m: &'static model::Model, out: &mut dyn Write) -> Result<()> {
+    struct Fake(&'static model::Model, String, usize);
+    impl vectors::Embed for Fake {
+        fn model(&self) -> &'static model::Model {
+            self.0
+        }
+        fn passages(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            if self.2 == 0 {
+                match self.1.as_str() {
+                    "exit" => std::process::exit(1),
+                    "partial" => {
+                        let mut o = std::io::stdout().lock();
+                        let _ = o.write_all(&[9, 0, 0, 0, 0]).and_then(|_| o.flush());
+                    }
+                    _ => {}
+                }
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            self.2 -= 1;
+            Ok(texts.iter().map(|_| (0..self.0.dims).map(|i| f32::from(u8::from(i == 0))).collect()).collect())
+        }
+    }
+    let mut w = hook.split(' ');
+    let mode = w.next().unwrap_or_default().to_string();
+    if mode == "never_ready" {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+    let ok = w.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    worker::serve(Ok(Fake(m, mode, ok)), &mut std::io::stdin().lock(), &mut { out })
+}
+
 fn existing(p: PathBuf) -> Result<PathBuf> {
     if p.exists() { Ok(p) } else { Err(Error::NotFound("no index yet; run `outlook-index sync`".into())) }
 }
@@ -485,6 +540,9 @@ fn existing(p: PathBuf) -> Result<PathBuf> {
 fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
     if let Cmd::EmbedWorker { ref model, threads, batch } = cli.cmd {
         set_threads(threads as usize);
+        if let Ok(hook) = std::env::var("OUTLOOK_INDEX_TEST_WORKER") {
+            return test_worker(&hook, model.resolve(None)?.0, out);
+        }
         // A load panic goes back as an error frame.
         let e = guarded(|| {
             test_panic("embed-worker");
@@ -749,7 +807,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 e.batch = batch as usize;
                 embed::bench(&e, t.elapsed(), time, threads)?
             } else {
-                let mut es = embedders(m, &dir, workers, threads, batch as usize)?;
+                let mut es = embedders(m, &dir, workers, threads, batch as usize, par.worker_timeout)?;
                 let mut es: Vec<&mut dyn vectors::Embed> = es.iter_mut().map(|e| e.as_mut()).collect();
                 worker::bench(&mut es, t.elapsed(), time, batch as usize, threads)?
             }
@@ -828,6 +886,7 @@ const PUBLIC: &[&str] = &[
     "model file config.json does not match intfloat/multilingual-e5-base revision d128750597153bb5987e10b1c3493a34e5a4502a",
     "curl not found; download the model files manually and pass --model-dir",
     "embedding worker exited",
+    "embedding worker timed out; run again to resume",
     "embedding worker stopped",
     "worker panicked",
     "truncated frame header (1 of 4 bytes)",

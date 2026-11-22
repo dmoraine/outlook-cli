@@ -286,10 +286,10 @@ et extensions inconnues sont écartés d'après leurs propriétés, sans lire le
 le portent, supprimé avec le dernier. Une extraction `failed` ou `timeout` est retentée par les syncs suivants
 (3 essais en tout).
 
-Formats extraits : PDF (couche texte, pas d'OCR), DOCX, PPTX, XLSX (au plus 20 000 lignes par feuille et 200 000
-cellules), TXT et CSV (UTF-8, UTF-16 avec BOM, sinon Windows-1252), HTML. Le type vient de l'extension, puis des
-octets magiques, puis du type MIME. Texte limité à 2 000 000 caractères. Motifs d'exclusion : `inline`, `image`,
-`too_large`, `unsupported_type` (archives, `.doc`/`.xls` anciens, Markdown…), `excluded_type`,
+Formats extraits : PDF (couche texte, pas d'OCR), DOCX, PPTX, XLSX (au plus 20 000 lignes par feuille, 200 000
+cellules et 1 024 colonnes ; chaque cellule à sa colonne, les cellules vides en champs vides), TXT et CSV
+(UTF-8, UTF-16 avec BOM, sinon Windows-1252), HTML. Le type vient de l'extension, puis des octets magiques, puis du type MIME.
+Texte limité à 2 000 000 caractères. Motifs d'exclusion : `inline`, `image`, `too_large`, `unsupported_type` (archives, `.doc`/`.xls` anciens, Markdown…), `excluded_type`,
 `embedded_message`, `encrypted`, `empty_text` (PDF scanné), `failed`, `timeout`.
 
 Résumé (stdout, compteurs seulement), notamment : `complete`, `new`, `refreshed`, `deleted`, `excluded_removed`, `moved`,
@@ -325,6 +325,9 @@ puis moyennés et normalisés.
 `--threads` est le nombre de threads *par worker*. Défauts : workers = max(1, (CPU logiques − 2) / 3), threads = 3,
 soit 4 × 3 pour 14 CPU. Au-delà d'un worker, chacun est un processus fils (`outlook-index embed-worker`, interne)
 avec sa propre copie du modèle : la mémoire croît avec N (VPS, e5-small : ~1,25 Go de RSS par processus).
+`--worker-timeout` (ex. `5m`) borne l'attente d'un worker : chargement du modèle (défaut 180 s) puis chaque lot
+(défaut 120 s). Au-delà, le worker est tué, l'exécution s'arrête en erreur `io` (« timed out ») ; les lots déjà
+enregistrés restent, relancer reprend.
 Plusieurs petits processus passent mieux à l'échelle qu'un seul avec beaucoup de threads. Portable du
 propriétaire (Intel i5, 14 CPU logiques, e5-small, ~311 tokens par passage) : un processus à 2 / 4 / 6 / 8 / 13
 threads donne 2,39 / 2,96 / 3,71 / 3,81 / 4,48 passages/s ; 4 processus × 3 threads 8,19 au total, 6 × 2 7,42 ;

@@ -94,14 +94,16 @@ pub struct Limits {
     pub max_bytes: usize,
     /// Output text cap, in characters.
     pub max_chars: usize,
-    /// XLSX: rows per sheet, and cells in the whole workbook.
+    /// XLSX: rows per sheet, cells in the whole workbook, and columns
+    /// (cells past it are dropped).
     pub max_rows: usize,
     pub max_cells: usize,
+    pub max_cols: usize,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { max_bytes: 20 << 20, max_chars: 2_000_000, max_rows: 20_000, max_cells: 200_000 }
+        Limits { max_bytes: 20 << 20, max_chars: 2_000_000, max_rows: 20_000, max_cells: 200_000, max_cols: 1024 }
     }
 }
 
@@ -441,7 +443,16 @@ fn pptx(z: &mut Zip, out: &mut Out) -> std::result::Result<(), Skip> {
     Ok(())
 }
 
-/// Sheet name line, then one line per row, cells tab-separated.
+/// Zero-based column of a cell reference ("C7" -> 2).
+fn column(r: &str) -> Option<usize> {
+    r.bytes()
+        .take_while(u8::is_ascii_alphabetic)
+        .fold(0usize, |n, b| n.saturating_mul(26).saturating_add(usize::from(b.to_ascii_uppercase() - b'A') + 1))
+        .checked_sub(1)
+}
+
+/// Sheet name line, then one line per row, cells tab-separated at their
+/// column (`r`; the next column without it), gaps as empty fields.
 fn xlsx(z: &mut Zip, l: &Limits, out: &mut Out) -> std::result::Result<(), Skip> {
     // Shared strings: <si> = concatenated <t>, phonetic runs (<rPh>) excluded.
     let mut shared = Vec::new();
@@ -488,6 +499,7 @@ fn xlsx(z: &mut Zip, l: &Limits, out: &mut Out) -> std::result::Result<(), Skip>
         out.push(name);
         out.push("\n");
         let (mut rows, mut row, mut val, mut typ, mut in_v) = (0, Vec::<String>::new(), String::new(), None, false);
+        let mut col = None;
         walk(z, &part, |e| {
             match tag(e) {
                 Some(("row", true, _)) if rows >= l.max_rows => {
@@ -495,7 +507,10 @@ fn xlsx(z: &mut Zip, l: &Limits, out: &mut Out) -> std::result::Result<(), Skip>
                     return false;
                 }
                 Some(("row", _, true)) => {
-                    if row.iter().any(|c| !c.is_empty()) {
+                    while row.last().is_some_and(String::is_empty) {
+                        row.pop();
+                    }
+                    if !row.is_empty() {
                         out.push(&row.join("\t"));
                         out.push("\n");
                         rows += 1;
@@ -505,6 +520,7 @@ fn xlsx(z: &mut Zip, l: &Limits, out: &mut Out) -> std::result::Result<(), Skip>
                 Some(("c", open, close)) => {
                     if open && let Event::Start(s) | Event::Empty(s) = e {
                         typ = attr(s, "t");
+                        col = attr(s, "r").and_then(|r| column(&r));
                     }
                     if close {
                         let v = std::mem::take(&mut val);
@@ -515,7 +531,14 @@ fn xlsx(z: &mut Zip, l: &Limits, out: &mut Out) -> std::result::Result<(), Skip>
                             Some("b") => (if v.trim() == "1" { "TRUE" } else { "FALSE" }).to_string(),
                             _ => v,
                         };
-                        row.push(v.replace(['\t', '\n', '\r'], " "));
+                        // Out of order or repeated: the next column.
+                        let at = col.take().filter(|&c| c >= row.len()).unwrap_or(row.len());
+                        if at < l.max_cols {
+                            row.resize(at, String::new());
+                            row.push(v.replace(['\t', '\n', '\r'], " "));
+                        } else {
+                            out.truncated = true;
+                        }
                         cells += 1;
                         if cells >= l.max_cells {
                             out.push(&row.join("\t"));
@@ -794,6 +817,44 @@ pub(crate) mod tests {
         let e = ok(extract_with(&big, Some("b.xlsx"), None, &l));
         assert!(e.truncated && !e.text.contains("Notes"), "{}", e.text);
         assert_eq!(e.text.matches('\t').count(), 3, "{}", e.text);
+    }
+
+    /// S7: cells keep their column (`r`), gaps are empty fields.
+    #[test]
+    fn xlsx_sparse_columns() {
+        let wb = r#"<workbook><sheets><sheet name="Sparse" r:id="rId1"/></sheets></workbook>"#;
+        let ss = r#"<sst><si><t>Item</t></si><si><t>Paper</t></si></sst>"#;
+        let s1 = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="inlineStr"><is><t>Amount</t></is></c></row>
+            <row r="2"><c r="B2" t="s"><v>1</v></c><c r="D2"><v>42</v></c></row>
+            <row r="3"><c r="A3"/><c r="B3" t="s"/></row>
+            <row r="7"><c r="AB7" t="inlineStr"><is><t>far</t></is></c></row>
+            <row r="8"><c r="C8"><v>1</v></c><c><v>2</v></c><c r="E8"/></row>
+        </sheetData></worksheet>"#;
+        let x = zip(&[
+            ("[Content_Types].xml", CT),
+            ("xl/workbook.xml", wb),
+            ("xl/sharedStrings.xml", ss),
+            ("xl/worksheets/sheet1.xml", s1),
+        ]);
+        let e = ok(extract(&x, Some("s.xlsx"), None));
+        let far = format!("{}far", "\t".repeat(27));
+        assert_eq!(e.text, format!("Sparse\nItem\t\tAmount\n\tPaper\t\t42\n{far}\n\t\t1\t2"), "{e:?}");
+        assert!(!e.truncated);
+
+        // Column cap: cells past it are dropped, the rest kept.
+        let l = Limits { max_cols: 4, ..Limits::default() };
+        let e = ok(extract_with(&x, Some("s.xlsx"), None, &l));
+        assert_eq!(e.text, "Sparse\nItem\t\tAmount\n\tPaper\t\t42\n\t\t1\t2", "{e:?}");
+        assert!(e.truncated);
+        // Cell cap counts stored cells, not gaps.
+        let l = Limits { max_cells: 3, ..Limits::default() };
+        let e = ok(extract_with(&x, Some("s.xlsx"), None, &l));
+        assert_eq!((e.text.as_str(), e.truncated), ("Sparse\nItem\t\tAmount\n\tPaper", true), "{e:?}");
+        // Output cap bounds the gap filling too.
+        let l = Limits { max_chars: 20, ..Limits::default() };
+        let e = ok(extract_with(&x, Some("s.xlsx"), None, &l));
+        assert!(e.truncated && e.text.chars().count() <= 20, "{e:?}");
     }
 
     #[test]

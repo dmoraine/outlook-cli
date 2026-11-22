@@ -12,9 +12,14 @@
 //!   then JSON `{"kind","message"}`.
 //!
 //! The child exits at end of input. Nothing else is written on its stdout.
+//!
+//! The parent talks to each child through a writer and a reader thread, so
+//! every wait is bounded (`LOAD_TIMEOUT`, `BATCH_TIMEOUT`): a child past it is
+//! killed and reaped, which also ends both threads.
 
 use std::io::{BufReader, Read, Write};
-use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value as Json, json};
@@ -23,6 +28,11 @@ use super::embed::{logical_cpus, synthetic_passages};
 use super::model::Model;
 use super::vectors::{Embed, from_blob, to_blob};
 use crate::error::{Error, Result, guarded};
+
+/// Default bound on a worker's model load.
+pub const LOAD_TIMEOUT: Duration = Duration::from_secs(180);
+/// Default bound on each batch reply.
+pub const BATCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Larger frames are refused (a batch is a few MB at most).
 const MAX_FRAME: usize = 256 << 20;
@@ -125,27 +135,67 @@ pub fn serve<E: Embed>(e: Result<E>, r: &mut impl Read, w: &mut impl Write) -> R
 /// Parent side of one worker process.
 pub struct Child {
     proc: std::process::Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    tx: mpsc::Sender<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
     model: &'static Model,
+    timeout: Duration,
 }
 
 impl Child {
     /// Start `n` workers from `cmd` (the `embed-worker` command line) and
-    /// wait until all have loaded the model; the first load error is returned.
-    pub fn spawn(mut cmd: Command, n: usize, model: &'static Model) -> Result<Vec<Child>> {
+    /// wait until all have loaded the model; the first load error is
+    /// returned. `timeout` bounds the load and then each batch (default
+    /// `LOAD_TIMEOUT`, `BATCH_TIMEOUT`).
+    pub fn spawn(mut cmd: Command, n: usize, model: &'static Model, timeout: Option<Duration>) -> Result<Vec<Child>> {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        let (load, batch) = timeout.map_or((LOAD_TIMEOUT, BATCH_TIMEOUT), |t| (t, t));
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             let mut proc = cmd.spawn().map_err(io)?;
-            let (stdin, stdout) = (proc.stdin.take().unwrap(), BufReader::new(proc.stdout.take().unwrap()));
-            out.push(Child { proc, stdin, stdout, model });
+            let (mut stdin, stdout) = (proc.stdin.take().unwrap(), proc.stdout.take().unwrap());
+            let (tx, requests) = mpsc::channel::<Vec<u8>>();
+            std::thread::spawn(move || {
+                for f in requests {
+                    if write_frame(&mut stdin, &f).is_err() {
+                        break;
+                    }
+                }
+            });
+            let (replies, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(stdout);
+                while let Ok(Some(f)) = read_frame(&mut r) {
+                    if replies.send(f).is_err() {
+                        break;
+                    }
+                }
+            });
+            out.push(Child { proc, tx, rx, model, timeout: batch });
         }
+        // The workers load in parallel: one deadline for all.
+        let deadline = Instant::now() + load;
         for c in &mut out {
-            let ready = read_frame(&mut c.stdout)?.ok_or_else(|| Error::Io("embedding worker exited".into()))?;
+            let ready = c.recv(deadline.saturating_duration_since(Instant::now()))?;
             decode(&ready, 0, model.dims)?;
         }
         Ok(out)
+    }
+
+    /// The next reply within `t`; the worker is stopped when none comes.
+    fn recv(&mut self, t: Duration) -> Result<Vec<u8>> {
+        self.rx.recv_timeout(t).map_err(|e| {
+            self.stop();
+            Error::Io(match e {
+                RecvTimeoutError::Timeout => "embedding worker timed out; run again to resume".into(),
+                RecvTimeoutError::Disconnected => "embedding worker exited".into(),
+            })
+        })
+    }
+
+    /// Kill and reap; its pipes close, so both threads end.
+    fn stop(&mut self) {
+        let _ = self.proc.kill();
+        let _ = self.proc.wait();
     }
 }
 
@@ -154,8 +204,9 @@ impl Embed for Child {
         self.model
     }
     fn passages(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        write_frame(&mut self.stdin, serde_json::to_string(texts).unwrap().as_bytes())?;
-        let reply = read_frame(&mut self.stdout)?.ok_or_else(|| Error::Io("embedding worker exited".into()))?;
+        // The writer thread may block on a full pipe; the wait below is bounded.
+        let _ = self.tx.send(serde_json::to_string(texts).unwrap().into_bytes());
+        let reply = self.recv(self.timeout)?;
         decode(&reply, texts.len(), self.model.dims)
     }
 }
@@ -163,8 +214,7 @@ impl Embed for Child {
 impl Drop for Child {
     /// Holds no state: stopping it mid-batch loses nothing stored.
     fn drop(&mut self) {
-        let _ = self.proc.kill();
-        let _ = self.proc.wait();
+        self.stop();
     }
 }
 
