@@ -210,5 +210,7 @@ tant que le message n'a pas été déplacé ; dédupliquer sur `message_id`.
 **Erreurs** : `usage` (2 : requête sans mot, option invalide, autre run en cours, suppression massive refusée),
 `not_found` (3 : pas encore d'index → `sync` ; dossier inconnu de l'index ; fichiers de modèle absents avec
 `--mode semantic|hybrid` explicite → `outlook-index model fetch`), `io` (4), `format` (5), `inconsistent` (6 :
-réessayer). Détails : [README](../../README.md#outlook-index-preview), procédure de test :
+réessayer). Le `message` est un texte fixe par type (plus nombres, noms d'options et de modèles) : ni chemin, ni nom
+de dossier, ni texte de requête ; les erreurs de syntaxe des options sont aussi en JSON. Ne pas définir
+`OUTLOOK_INDEX_DEBUG=1` : son champ `debug` contient le texte brut (chemins, noms, contenu de mails possible). Détails : [README](../../README.md#outlook-index-preview), procédure de test :
 [docs/WINDOWS_TESTING.md](../../docs/WINDOWS_TESTING.md).

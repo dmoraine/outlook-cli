@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value as Json, json};
 
-use outlook_cli::error::{Error, Result};
+use outlook_cli::error::{Error, Result, guarded};
 use outlook_cli::index::doctor::{self, StoreSource};
 use outlook_cli::index::embed::{self, Embedder};
 use outlook_cli::index::progress::{self, Progress};
@@ -363,6 +363,8 @@ fn set_threads(threads: usize) -> usize {
     threads
 }
 
+const INCLUDE_NONE: &str = "--include-folders none cannot be combined with deleted or junk";
+
 const MODEL_MISSING: &str = "model files missing; run outlook-index model fetch";
 
 /// Load the model and embed within `max_time` from `start`. Missing model
@@ -445,7 +447,23 @@ fn parse_duration(s: &str) -> Result<Duration> {
     };
     match n.parse::<u64>() {
         Ok(n) if mult > 0 => Ok(Duration::from_secs(n * mult)),
-        _ => Err(Error::Usage(format!("invalid duration '{s}' (use e.g. 90s, 30m, 2h)"))),
+        _ => Err(Error::Usage("invalid --max-time (use e.g. 90s, 30m, 2h)".into())),
+    }
+}
+
+/// `parse_when`, with an error naming the flag, not the value.
+fn when(flag: &str, s: &str) -> Result<i64> {
+    parse_when(s).map_err(|_| {
+        Error::Usage(format!(
+            "cannot parse {flag} (use e.g. 2026-10-15T08:00:00Z, '2026-10-15 08:00', 2026-10-15, 2h, 3d, today)"
+        ))
+    })
+}
+
+/// Test hook of the error boundary: OUTLOOK_INDEX_TEST_PANIC="<point> <text>" panics at `point`.
+fn test_panic(point: &str) {
+    if let Some(v) = std::env::var("OUTLOOK_INDEX_TEST_PANIC").ok().filter(|v| v.split(' ').next() == Some(point)) {
+        panic!("{v}");
     }
 }
 
@@ -456,7 +474,10 @@ fn existing(p: PathBuf) -> Result<PathBuf> {
 fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
     if let Cmd::EmbedWorker { ref model, threads, batch } = cli.cmd {
         set_threads(threads as usize);
-        let e = model.resolve(None).and_then(|(m, dir)| {
+        // A load panic goes back as an error frame.
+        let e = guarded(|| {
+            test_panic("embed-worker");
+            let (m, dir) = model.resolve(None)?;
             let mut e = Embedder::load(m, &dir)?;
             e.batch = batch as usize;
             Ok(e)
@@ -466,6 +487,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
     if let Cmd::ExtractWorker = cli.cmd {
         return extract::serve(&mut std::io::stdin().lock(), &mut { out });
     }
+    test_panic("run");
     let file = || match &cli.file {
         Some(f) => Ok(native_path(f)),
         None => default_file(),
@@ -504,6 +526,9 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         } => {
             let start = Instant::now();
             let max_time = max_time.as_deref().map(parse_duration).transpose()?;
+            if include_folders.as_ref().is_some_and(|v| v.len() > 1 && v.iter().any(|x| x == "none")) {
+                return Err(Error::Usage(INCLUDE_NONE.into()));
+            }
             let include = include_folders.as_ref().map(|v| sync::Include {
                 deleted: v.iter().any(|x| x == "deleted"),
                 junk: v.iter().any(|x| x == "junk"),
@@ -567,11 +592,11 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 if embedding {
                     let mut s = if clear { vectors::Scope::default() } else { vectors::scope(&c)? };
                     if let Some(t) = embed_since {
-                        s.since = Some(parse_when(&t)?);
+                        s.since = Some(when("--embed-since", &t)?);
                         s.since_input = Some(t);
                     }
                     if let Some(t) = embed_until {
-                        s.until = Some(parse_when(&t)?);
+                        s.until = Some(when("--embed-until", &t)?);
                         s.until_input = Some(t);
                     }
                     if !folders.is_empty() {
@@ -619,8 +644,8 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             excerpt_max,
             format,
         } => {
-            let t = |o: Option<String>| o.as_deref().map(parse_when).transpose();
-            let (since, until) = (t(since)?, t(until)?);
+            let t = |o: Option<String>, flag| o.as_deref().map(|s| when(flag, s)).transpose();
+            let (since, until) = (t(since, "--since")?, t(until, "--until")?);
             search::check_text(&query)?;
             let c = index::open(&existing(index_path)?)?;
             let (mut run_mode, m, warn) = search::plan(&c, mode, model.as_deref())?;
@@ -747,14 +772,192 @@ fn ascii(s: &str) -> String {
     o
 }
 
+/// Messages printed as they are: fixed words, flag names, numbers and model
+/// identifiers only (compared as `template`s). Any other error gets the
+/// fixed text of its kind: messages may hold paths, folder or attachment
+/// names, query text or, from a reader or a worker, mail content.
+const PUBLIC: &[&str] = &[
+    "no index yet; run `outlook-index sync`",
+    "another sync is running on this index",
+    "index database: database is locked",
+    "no data directory found; pass --index or set OUTLOOK_INDEX_DB",
+    "no data directory found; pass --model-dir or set OUTLOOK_INDEX_MODEL_DIR",
+    "no .ost file found; pass --file or set OUTLOOK_CLI_FILE",
+    "index schema 7 is newer than this tool; upgrade outlook-index",
+    INCLUDE_NONE,
+    "invalid --max-time (use e.g. 90s, 30m, 2h)",
+    "cannot parse --since (use e.g. 2026-10-15T08:00:00Z, '2026-10-15 08:00', 2026-10-15, 2h, 3d, today)",
+    "cannot parse --until (use e.g. 2026-10-15T08:00:00Z, '2026-10-15 08:00', 2026-10-15, 2h, 3d, today)",
+    "cannot parse --embed-since (use e.g. 2026-10-15T08:00:00Z, '2026-10-15 08:00', 2026-10-15, 2h, 3d, today)",
+    "cannot parse --embed-until (use e.g. 2026-10-15T08:00:00Z, '2026-10-15 08:00', 2026-10-15, 2h, 3d, today)",
+    "--embed-since must be before --embed-until",
+    "at least one attachment type is needed",
+    "attachment max size must be 1 byte to 100 MB",
+    "folder filter 1 of 2 matches no folder in the index (run `outlook-index sync`)",
+    "the query has no word to search for",
+    "semantic and hybrid search need a query vector and its model",
+    "the index vectors are e5-small; search with --model e5-small, or embed again with --model e5-base --reembed",
+    "the index holds 1 vectors of e5-small; pass --reembed to replace them with e5-base vectors",
+    "sync would delete 1 of 2 indexed messages (limit 1); nothing changed. Pass --allow-mass-delete if this is expected",
+    "model file config.json of e5-base; run `outlook-index model fetch --model e5-base` or pass --model-dir",
+    "model file config.json does not match intfloat/multilingual-e5-base revision d128750597153bb5987e10b1c3493a34e5a4502a",
+    "curl not found; download the model files manually and pass --model-dir",
+    "embedding worker exited",
+    "embedding worker stopped",
+    "worker panicked",
+    "truncated frame header (1 of 4 bytes)",
+    "truncated frame (1 of 2 bytes)",
+    "frame of 1 bytes",
+    "worker reply of 1 bytes for 2 vectors",
+    "1 vectors for 2 passages",
+    "query vector of 1 dimensions, expected 2",
+    "stored vector of 1 bytes, expected 2",
+];
+
+/// `m` with model identifiers as `@`, then every number as `#`.
+fn template(m: &str) -> String {
+    let mut ids: Vec<&str> = model::MODELS
+        .iter()
+        .flat_map(|m| [m.repo, m.revision, m.name].into_iter().chain(m.files.iter().map(|f| f.name)))
+        .collect();
+    ids.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    let s = ids.iter().fold(m.to_string(), |s, id| s.replace(id, "@"));
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        if !c.is_ascii_digit() {
+            o.push(c);
+        } else if !o.ends_with('#') {
+            o.push('#');
+        }
+    }
+    o
+}
+
+/// The public message of `e`: as is when listed in PUBLIC, else fixed per kind.
+fn public(e: &Error) -> String {
+    let (Error::Io(m) | Error::Format(m) | Error::Corrupt(m) | Error::NotFound(m) | Error::Usage(m)) = e;
+    let t = template(m);
+    if PUBLIC.iter().any(|p| template(p) == t) {
+        return e.to_string();
+    }
+    match e {
+        Error::Usage(_) => "invalid usage; see `outlook-index <command> --help` (details: OUTLOOK_INDEX_DEBUG=1)",
+        Error::NotFound(_) => {
+            "not found: a required item is missing (the mailbox file, the index file, the model files or a folder; \
+             details: OUTLOOK_INDEX_DEBUG=1)"
+        }
+        Error::Io(_) => {
+            "I/O error: cannot read or write a file (the mailbox file, the index file, the model files or the output; \
+             details: OUTLOOK_INDEX_DEBUG=1)"
+        }
+        Error::Format(_) => {
+            "unsupported file: not a supported mailbox, index or model file (details: OUTLOOK_INDEX_DEBUG=1)"
+        }
+        Error::Corrupt(_) => {
+            "inconsistent data: the mailbox file changed during the read; retry (details: OUTLOOK_INDEX_DEBUG=1)"
+        }
+    }
+    .into()
+}
+
+/// Parser errors: the clap error kind, and for value errors the argument
+/// as defined here and its allowed values; never the user's tokens.
+fn cli_error(e: &clap::Error) -> String {
+    use clap::error::{ContextKind, ContextValue, ErrorKind as K};
+    let mut m = e.kind().as_str().unwrap_or("invalid command line").to_string();
+    let defined = [
+        K::InvalidValue,
+        K::ValueValidation,
+        K::MissingRequiredArgument,
+        K::ArgumentConflict,
+        K::WrongNumberOfValues,
+        K::TooManyValues,
+        K::TooFewValues,
+        K::NoEquals,
+    ];
+    if defined.contains(&e.kind()) {
+        let s = |v: &ContextValue| match v {
+            ContextValue::String(s) => s.clone(),
+            ContextValue::Strings(v) => v.join(", "),
+            _ => String::new(),
+        };
+        if let Some(a) = e.get(ContextKind::InvalidArg) {
+            m += &format!(": {}", s(a));
+        }
+        if let Some(v) = e.get(ContextKind::ValidValue).map(s).filter(|v| !v.is_empty()) {
+            m += &format!(" (allowed: {v})");
+        }
+    }
+    m + "; see --help"
+}
+
+/// The only error output: `{"error":{kind,message}}` on stderr, plus the raw
+/// text as `debug` with OUTLOOK_INDEX_DEBUG=1 (may hold paths and mail content).
+fn fail(e: &Error, message: String, raw: String) -> ! {
+    let mut v = json!({ "error": { "kind": e.kind(), "message": message } });
+    if std::env::var_os("OUTLOOK_INDEX_DEBUG").is_some_and(|d| d == "1") {
+        v["error"]["debug"] = json!(raw);
+    }
+    eprintln!("{v}");
+    std::process::exit(e.exit_code())
+}
+
+/// Location (file name and line) of the last panic.
+static PANIC_AT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 fn main() {
-    // Panics are reported as JSON errors (see `guarded`), not on stderr.
-    let cli = Cli::parse();
-    std::panic::set_hook(Box::new(|_| {}));
-    let r = outlook_cli::error::guarded(|| run(cli, &mut std::io::stdout().lock()));
-    if let Err(e) = r {
-        let v = json!({ "error": { "kind": e.kind(), "message": e.to_string() } });
-        eprintln!("{v}");
-        std::process::exit(e.exit_code());
+    use clap::error::ErrorKind as K;
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e)
+            if matches!(e.kind(), K::DisplayHelp | K::DisplayVersion | K::DisplayHelpOnMissingArgumentOrSubcommand) =>
+        {
+            e.exit()
+        }
+        Err(e) => fail(&Error::Usage(String::new()), cli_error(&e), e.render().to_string()),
+    };
+    // Panics are reported as JSON errors with their code location only, not on stderr.
+    std::panic::set_hook(Box::new(|i| {
+        if let (Some(l), Ok(mut at)) = (i.location(), PANIC_AT.lock()) {
+            *at = format!("{}:{}", l.file().rsplit(['/', '\\']).next().unwrap_or_default(), l.line());
+        }
+    }));
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(cli, &mut std::io::stdout().lock()))) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => fail(&e, public(&e), e.to_string()),
+        Err(p) => {
+            let raw = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()));
+            let at = PANIC_AT.lock().map(|a| a.clone()).unwrap_or_default();
+            fail(&Error::Corrupt(String::new()), format!("internal error at {at}"), raw.unwrap_or_default())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Errors carrying mailbox-derived text (attachment and folder names,
+    /// paths, reader and worker messages) get the fixed text of their kind;
+    /// listed messages with only numbers and model names pass.
+    #[test]
+    fn public_messages() {
+        let m = || "SECRET_Q3 report.pdf in /home/SECRET_USER/alice.ost: SECRET_BODY 42".to_string();
+        for e in [Error::Io(m()), Error::Format(m()), Error::Corrupt(m()), Error::NotFound(m()), Error::Usage(m())] {
+            let p = public(&e);
+            assert!(!p.contains("SECRET") && !p.contains("42"), "{p}");
+        }
+        for e in [
+            Error::NotFound("no index yet; run `outlook-index sync`".into()),
+            Error::Usage("the index holds 12 vectors of e5-small; pass --reembed to replace them with e5-base vectors".into()),
+            Error::Usage("sync would delete 300 of 1000 indexed messages (limit 200); nothing changed. Pass --allow-mass-delete if this is expected".into()),
+        ] {
+            assert_eq!(public(&e), e.to_string());
+        }
+        // A listed message with other text in a number slot is not listed.
+        let e = Error::NotFound(
+            "folder filter SECRET of 2 matches no folder in the index (run `outlook-index sync`)".into(),
+        );
+        assert!(!public(&e).contains("SECRET"));
     }
 }

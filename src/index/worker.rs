@@ -36,19 +36,25 @@ pub(crate) fn write_frame(w: &mut impl Write, payload: &[u8]) -> Result<()> {
     w.write_all(&n.to_le_bytes()).and_then(|_| w.write_all(payload)).and_then(|_| w.flush()).map_err(io)
 }
 
-/// Next frame; None at end of input.
+/// Next frame; None at end of input between frames. End of input inside a
+/// frame is a protocol (format) error.
 pub(crate) fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>> {
-    let mut n = [0u8; 4];
-    match r.read_exact(&mut n) {
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        r => r.map_err(io)?,
+    let mut n = Vec::with_capacity(4);
+    r.by_ref().take(4).read_to_end(&mut n).map_err(io)?;
+    match n.len() {
+        0 => return Ok(None),
+        4 => {}
+        k => return Err(Error::Format(format!("truncated frame header ({k} of 4 bytes)"))),
     }
-    let n = u32::from_le_bytes(n) as usize;
+    let n = u32::from_le_bytes(n.try_into().unwrap()) as usize;
     if n > MAX_FRAME {
         return Err(Error::Format(format!("frame of {n} bytes")));
     }
-    let mut b = vec![0; n];
-    r.read_exact(&mut b).map_err(io)?;
+    let mut b = Vec::with_capacity(n);
+    r.by_ref().take(n as u64).read_to_end(&mut b).map_err(io)?;
+    if b.len() < n {
+        return Err(Error::Format(format!("truncated frame ({} of {n} bytes)", b.len())));
+    }
     Ok(Some(b))
 }
 
@@ -261,6 +267,26 @@ mod tests {
         let mut r = out.as_slice();
         assert_eq!(decode(&read_frame(&mut r).unwrap().unwrap(), 0, 384).unwrap_err().kind(), "not_found");
         assert!(read_frame(&mut r).unwrap().is_none());
+    }
+
+    /// N3: EOF is clean only at a frame boundary.
+    #[test]
+    fn frame_truncation_and_size() {
+        let mut ok = Vec::new();
+        write_frame(&mut ok, b"abc").unwrap();
+        let mut r = ok.as_slice();
+        assert_eq!(read_frame(&mut r).unwrap().as_deref(), Some(&b"abc"[..]));
+        assert!(read_frame(&mut r).unwrap().is_none(), "EOF at a boundary");
+        for cut in 1..4 {
+            assert_eq!(read_frame(&mut &ok[..cut]).unwrap_err().kind(), "format", "{cut}-byte header");
+            let two = [&ok[..], &ok[..cut]].concat();
+            let mut r = two.as_slice();
+            read_frame(&mut r).unwrap();
+            assert_eq!(read_frame(&mut r).unwrap_err().kind(), "format", "{cut}-byte header after a frame");
+        }
+        assert_eq!(read_frame(&mut &ok[..5]).unwrap_err().kind(), "format", "short payload");
+        let big = ((MAX_FRAME + 1) as u32).to_le_bytes();
+        assert_eq!(read_frame(&mut &big[..]).unwrap_err().kind(), "format", "oversized");
     }
 
     #[test]

@@ -103,13 +103,18 @@ pub(super) fn folder_ids(c: &Connection, specs: &[String]) -> Result<Vec<i64>> {
         .collect::<rusqlite::Result<_>>()
         .map_err(db_err)?;
     let mut out = Vec::new();
-    for spec in specs {
+    for (i, spec) in specs.iter().enumerate() {
         let s = spec.trim().trim_matches('/').to_lowercase();
         let n = out.len();
         let under = |p: &str| p.strip_prefix(s.as_str()).is_some_and(|r| r.is_empty() || r.starts_with('/'));
         out.extend(all.iter().filter(|f| under(&f.1.to_lowercase()) || f.2.to_lowercase() == s).map(|f| f.0));
         if out.len() == n {
-            return Err(Error::NotFound(format!("folder '{}' in the index (run `outlook-index sync`)", spec.trim())));
+            // The spec is mailbox data: not in the message.
+            let n = specs.len();
+            return Err(Error::NotFound(format!(
+                "folder filter {} of {n} matches no folder in the index (run `outlook-index sync`)",
+                i + 1
+            )));
         }
     }
     Ok(out)

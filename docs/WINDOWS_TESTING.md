@@ -152,6 +152,8 @@ Nothing is ever written to the OST, and `outlook-cli` is unchanged. To drop the 
 | 5 | `status --pretty` and `scope --pretty` after the run |
 | 7 | per query: mode, `count`, time, and the kind of any warning; describe the query generically ("two French words"), not its text |
 
-Error lines are `{"error":{"kind":...,"message":...}}`: paste the `kind`, and the message only after replacing any
-path, folder or file name in it with `<redacted>`. Never paste search output, excerpts, subjects, names,
-addresses, folder names, attachment names or body text.
+Error lines are `{"error":{"kind":...,"message":...}}`; the message is a fixed text per kind (plus counts, flag
+names, model names or a code location), with no path, name or query text: paste the line whole. Do not set
+`OUTLOOK_INDEX_DEBUG=1` for feedback: it adds a `debug` field with the raw error, which may hold paths, folder or
+file names and mail text; use it only to troubleshoot locally and never paste it. Never paste search output,
+excerpts, subjects, names, addresses, folder names, attachment names or body text.

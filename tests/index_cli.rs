@@ -52,6 +52,11 @@ fn search_and_status_cli() {
         assert_eq!(o.status.code(), Some(4), "{ok:?} accepted");
     }
     assert_eq!(run(&["sync", "--include-folders", "trash"], &idx).status.code(), Some(2));
+    // `none` with another value is ambiguous (N1), in both orders.
+    for bad in ["none,deleted", "junk,none", "deleted,junk,none"] {
+        let o = run(&["sync", "--include-folders", bad, "--file", "/nonexistent.ost"], &idx);
+        assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(2), "usage"), "{bad}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

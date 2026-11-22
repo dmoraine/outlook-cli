@@ -201,10 +201,9 @@ fn curl(url: &str, part: &Path, resume: bool) -> Result<()> {
     if resume {
         c.args(["-C", "-"]);
     }
-    let o = c
-        .arg(url)
-        .output()
-        .map_err(|e| Error::NotFound(format!("curl ({e}); download the model files manually and pass --model-dir")))?;
+    let o = c.arg(url).output().map_err(|_| {
+        Error::NotFound("curl not found; download the model files manually and pass --model-dir".into())
+    })?;
     if o.status.success() {
         Ok(())
     } else {

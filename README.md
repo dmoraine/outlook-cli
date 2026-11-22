@@ -161,6 +161,15 @@ Commandes : `doctor`, `sync`, `embed`, `search`, `status`, `scope`, `model list|
 globales comme `outlook-cli` : `-f/--file`, `--pretty`, `--local-time`, `--ascii`, plus `--index`. Mêmes
 conventions : JSON sur stdout, erreurs `{"error":{"kind","message"}}` sur stderr, mêmes codes de retour.
 
+Erreurs sans contenu : le `message` d'une erreur est un texte fixe par type, complété au plus de nombres, de noms
+d'options, de valeurs autorisées, de noms de modèles ou d'un emplacement dans le code (un plantage donne
+`inconsistent`, `internal error at <fichier>.rs:<ligne>`). Jamais de chemin (fichier de la boîte, index, modèles),
+de nom de dossier ou de pièce jointe, de texte de requête ou de filtre, ni de texte venant de la boîte, de `curl` ou
+d'un processus fils : une ligne `{"error":...}` peut être recopiée telle quelle. Les erreurs de syntaxe des options
+sont aussi en JSON (`usage`, code 2) et ne reprennent pas la valeur saisie. Diagnostic local uniquement :
+`OUTLOOK_INDEX_DEBUG=1` ajoute à l'erreur un champ `debug` (stderr) avec le texte brut, qui peut contenir des
+chemins, des noms et du contenu de mails ; ne jamais le transmettre.
+
 Fichier d'index : `--index` / `OUTLOOK_INDEX_DB`, par défaut `%LOCALAPPDATA%\outlook-cli\index.sqlite` (Linux :
 `$XDG_DATA_HOME/outlook-cli/index.sqlite`). Un chemin sous OneDrive provoque un avertissement
 `{"warning":{"kind":"onedrive",...}}` sur stderr. Un seul `sync`, `embed` ou changement de `scope` à la fois par
