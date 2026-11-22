@@ -1,6 +1,6 @@
 ---
 name: outlook-cli
-description: Lire les e-mails Outlook locaux (fichier .ost/.pst) avec le CLI outlook-cli — lister les derniers messages, filtrer par date/expéditeur/sujet/dossier, lire un message complet, extraire les pièces jointes, et surveiller l'arrivée de nouveaux e-mails (new --state, watch). À utiliser dès qu'une tâche demande de consulter, rechercher ou surveiller la boîte mail Outlook de l'utilisateur sur ce poste Windows/WSL, ou d'installer ce CLI.
+description: Lire les e-mails Outlook locaux (fichier .ost/.pst) avec le CLI outlook-cli — lister les derniers messages, filtrer par date/expéditeur/sujet/dossier, lire un message complet, extraire les pièces jointes, surveiller l'arrivée de nouveaux e-mails (new --state, watch), et rechercher dans toute la boîte par mots-clés ou par sens avec l'index local outlook-index. À utiliser dès qu'une tâche demande de consulter, rechercher ou surveiller la boîte mail Outlook de l'utilisateur sur ce poste Windows/WSL, ou d'installer ce CLI.
 ---
 
 # outlook-cli
@@ -23,8 +23,8 @@ Si la commande est absente, construire et installer depuis les sources (sous WSL
 ```bash
 git clone https://github.com/dmoraine/outlook-cli.git && cd outlook-cli
 scripts/setup-toolchain.sh   # une seule fois : rustup, cible x86_64-pc-windows-gnullvm, linker llvm-mingw
-scripts/build.sh             # tests + dist/outlook-cli.exe
-scripts/install.sh           # copie dans %LOCALAPPDATA%\Programs\outlook-cli\ + lien ~/.local/bin/outlook-cli
+scripts/build.sh             # tests + dist/outlook-cli.exe, dist/outlook-index.exe
+scripts/install.sh           # copie dans %LOCALAPPDATA%\Programs\outlook-cli\ + liens ~/.local/bin/outlook-cli, outlook-index
 ```
 
 Règle importante : il faut toujours exécuter le **`.exe` Windows**, y compris depuis WSL. Le binaire Linux
@@ -148,3 +148,67 @@ Code de retour, et sur stderr `{"error":{"kind":"...","message":"..."}}` :
 - Une valeur commençant par `-` ou contenant des espaces doit être mise entre guillemets :
   `--subject "Re: projet"`, `--since "2026-10-15 08:00"`.
 - Le corps des invitations et des réponses aux réunions est souvent vide : ce n'est pas une erreur.
+
+## 9. outlook-index : recherche dans l'index local (preview)
+
+`outlook-index` (installé avec `outlook-cli`, `~/.local/bin/outlook-index`) cherche dans un index SQLite local de
+toute la boîte : mots-clés (FTS5) et sens (embeddings calculés sur le CPU, aucun accès réseau). Mêmes conventions
+que `outlook-cli` : JSON sur stdout, `--pretty`, `--ascii`, `--local-time`, mêmes codes de retour et
+`{"error":{"kind","message"}}`. Toujours le `.exe` Windows, comme pour `outlook-cli`.
+
+**Quand l'utiliser** :
+
+| Besoin | Commande |
+|---|---|
+| Messages récents, nouveaux, d'un dossier, filtres exacts sur les métadonnées | `outlook-cli list` / `new` (toujours à jour, ~50 ms) |
+| Retrouver un sujet dans toute la boîte, sur des années, y compris dans les pièces jointes | `outlook-index search "<requête>"` |
+| Formulation inconnue, autre langue (requête française, mail anglais) | `outlook-index search "<requête>" --mode semantic` |
+| Lire le message trouvé | `outlook-cli get <id>` (ou `get "<message_id>"` si l'id a changé) |
+
+L'index n'est à jour qu'après le dernier `sync` : un message arrivé depuis est absent. Vérifier `status` →
+`last_sync.at` avant de conclure qu'un message n'existe pas.
+
+**Modes** (`--mode`) : `keyword` (tous les mots requis, insensible aux accents), `semantic` (proximité de sens),
+`hybrid` (fusion RRF des deux ; la recherche par mots y prend au moins un mot). Défaut : `hybrid` si l'index a des
+vecteurs, sinon `keyword` ; un repli sur `keyword` est signalé sur stderr par
+`{"warning":{"kind":"keyword_fallback",...}}`. Le mode sémantique ne voit que les messages de la portée des
+embeddings (`outlook-index scope`).
+
+**Filtres** : `-F/--folder` (nom, ou chemin avec ses sous-dossiers ; répétable), `-s/--since`, `-u/--until` (même
+syntaxe que `outlook-cli`), `--from`, `--to` (To/Cc), `--has-attachments`, `-n/--limit` (défaut 10),
+`--excerpt-max` (défaut 300, max 2000), `--format json|jsonl`. Les Éléments supprimés et le Courrier indésirable ne
+sont pas indexés par défaut.
+
+```bash
+outlook-index search "renouvellement contrat assurance" -n 5 --since 2024-01-01
+outlook-index search "facture" --mode keyword -F Inbox --from dupont --format jsonl
+```
+
+**Sortie** : `{count, mode, hits}`, un résultat par message (son meilleur chunk) : `id`, `message_id`, `folder`,
+`received`, `subject`, `from`, `to`, `cc`, `read`, `has_attachments`, `excerpt` (borné), `source`, `ranks`,
+`scores`. `source` = `"body"` ou `{"kind":"attachment","index","name","type"}` : l'extrait vient alors de la pièce
+jointe `index` (à récupérer avec `outlook-cli attachments <id> -i <index>`). `ranks`/`scores` : `keyword` (bm25),
+`semantic` (cosinus), et en hybride `hybrid`/`rrf` ; les résultats hybrides ont aussi `keyword_rank`,
+`semantic_rank` (`null` si cette recherche ne l'a pas trouvé) et `score`. `id` est valable pour `outlook-cli get`
+tant que le message n'a pas été déplacé ; dédupliquer sur `message_id`.
+
+**Suivre un sync en cours** : `outlook-index status` → `running` (`null` si aucun run ; sinon `phase`, `done`,
+`total`, `percent`, `eta_s`… ; `stale: true` = processus disparu, le `sync` suivant reprend), ou
+`outlook-index status --watch` (une ligne JSON toutes les 10 s jusqu'à la fin). Un run lancé avec `--progress jsonl`
+(défaut hors terminal) écrit des lignes `{"progress":{...}}` sur stderr ; stdout ne reçoit que le résumé final.
+
+**Règles pour un agent** :
+
+- **Ne pas lancer `sync`, `embed` ni modifier `scope`** sans la demande du propriétaire, et jamais pendant qu'un
+  autre run tourne (`status` → `running` non `null` et non `stale`) : un premier sync dure des heures et occupe le
+  CPU. Un second run échoue d'ailleurs avec `usage` (« another sync is running »).
+- `search`, `status`, `scope` sans option et `doctor` sont en lecture seule et peuvent tourner pendant un sync.
+- **Confidentialité** : les résultats de `search` contiennent des sujets, adresses et extraits de mails. Ne jamais
+  les transmettre à un outil ou service tiers (API externe, ticket, dépôt, log partagé) sans l'accord du
+  propriétaire. `doctor`, `status`, `scope` et les résumés de `sync` ne contiennent que des agrégats.
+
+**Erreurs** : `usage` (2 : requête sans mot, option invalide, autre run en cours, suppression massive refusée),
+`not_found` (3 : pas encore d'index → `sync` ; dossier inconnu de l'index ; fichiers de modèle absents avec
+`--mode semantic|hybrid` explicite → `outlook-index model fetch`), `io` (4), `format` (5), `inconsistent` (6 :
+réessayer). Détails : [README](../../README.md#outlook-index-preview), procédure de test :
+[docs/WINDOWS_TESTING.md](../../docs/WINDOWS_TESTING.md).

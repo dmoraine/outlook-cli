@@ -22,8 +22,8 @@ Prérequis de compilation (sous WSL/Linux, sans droits root) :
 
 ```bash
 scripts/setup-toolchain.sh   # rustup + cible x86_64-pc-windows-gnullvm + linker llvm-mingw (~/opt)
-scripts/build.sh             # tests + dist/outlook-cli.exe (Windows) et dist/outlook-cli (Linux)
-scripts/install.sh           # %LOCALAPPDATA%\Programs\outlook-cli\outlook-cli.exe + lien ~/.local/bin/outlook-cli
+scripts/build.sh             # tests + dist/outlook-cli.exe, dist/outlook-index.exe (Windows) et dist/outlook-cli (Linux)
+scripts/install.sh           # %LOCALAPPDATA%\Programs\outlook-cli\ (les deux .exe) + liens ~/.local/bin/outlook-cli, outlook-index
 ```
 
 PowerShell : `& "$env:LOCALAPPDATA\Programs\outlook-cli\outlook-cli.exe" info`
@@ -143,277 +143,247 @@ $r.messages | Select-Object id, received, subject
 
 ## outlook-index (preview)
 
-Separate binary for a local mailbox index (cargo feature `index`, bundled SQLite with FTS5). Read-only on the OST.
-Built by `scripts/build.sh` as `dist/outlook-index.exe`. Commands: `doctor`, `sync`, `search`, `status`, `scope`,
-`embed`, `model`, `bench-embed`.
+Binaire séparé qui construit un index local de la boîte mail (feature cargo `index`) : métadonnées, index plein
+texte FTS5 et vecteurs dans un seul fichier SQLite, embeddings calculés localement sur le CPU. Lecture seule sur
+l'OST, aucun accès réseau hors `model fetch`. Construit par `scripts/build.sh` (`dist/outlook-index.exe`), installé
+par `scripts/install.sh` à côté de `outlook-cli.exe` (lien `~/.local/bin/outlook-index`). Procédure de test complète
+pour le poste Windows : [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md).
 
-```powershell
-outlook-index.exe doctor --pretty                # samples 200 messages
-outlook-index.exe doctor --sample 1000 --pretty  # more precise, slower
+```bash
+outlook-index doctor --pretty                    # diagnostic agrégé (aucun contenu)
+outlook-index model fetch                        # modèle e5-base (~1,1 Go), seul accès réseau
+outlook-index sync                               # indexe, extrait les pièces jointes, puis calcule les embeddings
+outlook-index status --pretty                    # compteurs, taille, run en cours
+outlook-index search "facture impayée" -n 5      # hybride dès que des vecteurs existent
 ```
 
-`doctor` prints aggregate JSON only: machine (OS, arch, CPUs, total RAM bytes), SQLite/FTS5, index location status,
-file kind/size, folder and message counts by class prefix (`IPM.Note`, `IPF.Note`, unknown segments → `other`)/depth/
-year, full-scan time, and for `--sample` messages picked at random: open+text, open and text-extraction times (µs),
-text lengths, a chunk estimate, Message-ID coverage of the scanned rows (`messages.with_message_id` /
-`without_message_id`), attachment counts by extension/method and sizes, and `well_known`: for the Inbox, Deleted
-Items and Junk E-mail, `found`, `method` (`entry_ids`, `entry_id_nid`, `entry_id_source_key`, `name`, `not_found`)
-and the message count; Deleted Items and Junk add `entry_id` facts on the entry-id path (`present`, `length`,
-`tail_nid_exists`, `tail_nid_is_folder`, `folders_with_source_key`, `source_key_match`, `source_key_in_entry_id`;
-booleans and counts only). Distributions are
-`{min, p50, p95, max, sum}`. Errors: counts by kind only; a fatal error prints `{"error":{"kind","message"}}` with a
-fixed message. No subjects, addresses, names, folder or attachment names, body text or paths.
+Commandes : `doctor`, `sync`, `embed`, `search`, `status`, `scope`, `model list|fetch`, `bench-embed`. Options
+globales comme `outlook-cli` : `-f/--file`, `--pretty`, `--local-time`, `--ascii`, plus `--index`. Mêmes
+conventions : JSON sur stdout, erreurs `{"error":{"kind","message"}}` sur stderr, mêmes codes de retour.
 
-**Paste back**: the whole stdout JSON, plus any stderr line (`{"warning":...}` or `{"error":...}`). Read it first.
+Fichier d'index : `--index` / `OUTLOOK_INDEX_DB`, par défaut `%LOCALAPPDATA%\outlook-cli\index.sqlite` (Linux :
+`$XDG_DATA_HOME/outlook-cli/index.sqlite`). Un chemin sous OneDrive provoque un avertissement
+`{"warning":{"kind":"onedrive",...}}` sur stderr. Un seul `sync`, `embed` ou changement de `scope` à la fois par
+index (verrou `index.sqlite.lock`) ; un second échoue aussitôt (`usage`). L'index se reconstruit toujours depuis
+l'OST : le supprimer suffit à revenir en arrière.
 
-### Attachment text (diagnostic)
+### doctor
 
-Used by `sync` (see *Attachments in the index*) and by this diagnostic. Supported: PDF (text layer, pages separated by a blank line; no OCR), DOCX (paragraphs), PPTX (slides in number
-order), XLSX (sheet name line, one line per row, cells tab-separated; at most 20,000 rows per sheet and 200,000
-cells), TXT and CSV (UTF-8, UTF-16 with BOM, else Windows-1252), HTML. The type comes from the extension, then the
-magic bytes, then the MIME type. Text is whitespace-normalised and capped at 2,000,000 characters (`truncated`).
-Skip reasons: `image`, `inline`, `too_large` (> 20 MB), `unsupported_type` (including archives and old `.doc`/`.xls`),
-`embedded_message`, `encrypted`, `empty_text` (e.g. a scanned PDF), `failed` (malformed file, parser panic or worker
-crash), `timeout`. Each file is parsed in a child process (`outlook-index extract-worker`, internal), killed after
-30 s and restarted for the next file.
-
-```powershell
-outlook-index.exe doctor --attachments --pretty               # 300 attachments of random messages
-outlook-index.exe doctor --attachments --sample 1000 --pretty # more precise, slower
+```bash
+outlook-index doctor --pretty                    # 200 messages tirés au hasard
+outlook-index doctor --sample 1000 --pretty      # plus précis, plus lent
+outlook-index doctor --attachments --pretty      # extraction de 300 pièces jointes (--sample N)
 ```
 
-It opens random messages with attachments (whole messages) until `--sample` attachments are seen and prints
-aggregates only: `by_kind` (`pdf`, `docx`, ..., `image`, `other`) × outcome (`ok` or a skip reason), `by_outcome`,
-`extracted` (distinct contents that gave text: chars and extraction time `{min, p50, p95, max, sum}` in µs, count
-truncated), `chunks` per kind (same chunking as bodies, sample and mailbox estimate), `dedupe` (`hashed` attachments,
-`distinct` SHA-256, `distinct_ratio`; the same content is extracted once), `limits`, `workers_started` (more than 1 =
-restarts after a timeout or crash), and error counts by kind. No file names, text or subjects.
+`doctor` n'affiche que des agrégats : machine (OS, architecture, CPU, RAM), SQLite/FTS5, état de l'index
+(`exists`, `bytes`, `under_onedrive`), type et taille du fichier, nombre de dossiers et de messages par préfixe de
+classe, profondeur et année, durée du scan complet, et pour l'échantillon : temps d'ouverture et d'extraction du
+texte (µs), longueurs de texte, estimation du nombre de chunks, couverture Message-ID, pièces jointes par
+extension et méthode. `well_known` donne pour l'Inbox, les Éléments supprimés et le Courrier indésirable `found`,
+`method` (`entry_ids`, `entry_id_nid`, `entry_id_source_key`, `name`, `not_found`) et le nombre de messages, plus
+des indicateurs booléens/numériques sur leurs entry ids. Distributions : `{min, p50, p95, max, sum}`. Erreurs :
+comptées par type ; une erreur fatale a un message fixe. Ni sujet, ni adresse, ni nom, ni nom de dossier ou de
+fichier, ni texte, ni chemin : la sortie complète peut être recopiée telle quelle.
 
-**Paste back**: the whole stdout JSON and any stderr line.
+`doctor --attachments` ouvre des messages au hasard ayant des pièces jointes et extrait chaque pièce dans un
+processus fils : `by_kind` (`pdf`, `docx`, …, `image`, `other`) × issue (`ok` ou motif d'exclusion), `by_outcome`,
+`extracted` (caractères et temps d'extraction), `chunks` par type (échantillon et estimation pour la boîte),
+`dedupe` (`hashed`, `distinct`, `distinct_ratio` par SHA-256), `limits`, `workers_started`.
 
-Index file: `--index` / `OUTLOOK_INDEX_DB`, default `%LOCALAPPDATA%\outlook-cli\index.sqlite` (Linux:
-`$XDG_DATA_HOME/outlook-cli/index.sqlite`). A path under OneDrive gets a warning. `doctor` does not create it.
+### sync
 
-```powershell
-outlook-index.exe sync                    # mail folders but Deleted Items and Junk; counts only on stdout
-outlook-index.exe sync --include-folders deleted,junk   # index them too (stored; `none` = the default)
-outlook-index.exe sync --max-time 30m     # stop after 30 min; the next sync resumes
-outlook-index.exe status --pretty         # counts and size only
-outlook-index.exe search "budget café" -n 5 -F Inbox --since 30d --from alice
-outlook-index.exe search "budget" --format jsonl   # one hit per line
+```bash
+outlook-index sync                                    # tous les dossiers de mails sauf Éléments supprimés et Courrier indésirable
+outlook-index sync --include-folders deleted,junk     # les inclure (choix mémorisé ; none = défaut)
+outlook-index sync --max-time 30m                     # s'arrête après 30 min, embeddings compris ; le suivant reprend
+outlook-index sync --no-embed                         # indexation seule
+outlook-index sync --no-attachments                   # sans les pièces jointes ; un sync ultérieur rattrape
 ```
 
-`sync` is a full reconciliation against the folders' contents tables: new, deleted, moved/copied messages and
-read/unread changes. Only new messages are opened. A message is identified by its Internet Message-ID, else by a
-fingerprint (sender, submit time, subject, size); the same message in two folders is indexed once. Nothing is done
-when the file has not changed since the last complete sync. New messages are committed in batches, so `Ctrl-C` or
-`--max-time` lose nothing. A sync that would delete more than max(100, 20%) of the indexed messages aborts with no
-change (usage error, counts only) unless `--allow-mass-delete` is passed. One sync at a time per index (lock file
-`index.sqlite.lock`). Quoted replies, forward headers and signature/disclaimer tails (French and English) are
-stripped; the rest is cut into ~1750-character chunks with ~200 characters of overlap; each chunk keeps its character
-range in the stripped body.
+`sync` réconcilie entièrement l'index avec les tables de contenus des dossiers : messages nouveaux, supprimés,
+déplacés/copiés, changements lu/non lu. Seuls les nouveaux messages sont ouverts. Un message est identifié par son
+Message-ID Internet, sinon par une empreinte (expéditeur, date d'envoi, sujet, taille) ; le même message dans deux
+dossiers est indexé une fois. Rien n'est fait si le fichier n'a pas changé depuis le dernier sync complet. Les
+messages sont validés par lots : `Ctrl-C` ou `--max-time` ne perdent que le lot en cours, le sync suivant reprend.
+Un sync qui supprimerait plus de max(100, 20 %) des messages indexés s'arrête sans rien changer (erreur `usage`),
+sauf avec `--allow-mass-delete`.
 
-Deleted Items and Junk E-mail (with their subfolders) are not indexed by default. They are found by the store's
-well-known entry ids (Deleted Items: wastebasket entry id; Junk: additional REN entry ids, by NID or source key),
-else by their default localized name at the top level. `--include-folders deleted,junk` (or `deleted`, `junk`,
-`none`) changes the choice; it is stored in the index and reused by later syncs (`status.include`). A changed choice
-forces a full reconciliation. Messages leaving the index because of the exclusion are reported as
-`excluded_removed`, not `deleted`, and do not count for the mass-deletion limit.
+Avant découpage, les citations (en-têtes « De : / From: », « Le … a écrit : », « On … wrote: », lignes `>`) et les
+signatures/mentions légales courantes (français et anglais) sont retirées ; le reste est découpé en chunks
+d'environ 1 750 caractères avec ~200 caractères de recouvrement.
 
-### Attachments in the index
+Les Éléments supprimés et le Courrier indésirable (avec leurs sous-dossiers) sont exclus par défaut. Ils sont
+reconnus par les entry ids bien connus du store, sinon par leur nom localisé au premier niveau.
+`--include-folders deleted,junk` (ou `deleted`, `junk`, `none`) est mémorisé dans l'index (`status.include`). Les
+messages qui sortent de l'index à cause de l'exclusion sont comptés dans `excluded_removed`, pas dans `deleted`,
+et n'entrent pas dans la limite de suppression massive.
 
-`sync` then reads the attachments of new messages (and, once, of messages indexed before attachments existed: a
-backfill, newest first, in batches, resumable with `--max-time`). Inline attachments, images, files over the max
-size, embedded messages, links and unknown extensions are skipped from their properties, without reading the data;
-the rest is read, hashed (SHA-256) and, for a content not seen before, extracted in the child process (30 s
-timeout, restarted after a failure). A content is stored and chunked once, shared by every message carrying it, and
-deleted with its last message. A `failed` or `timeout` extraction is retried by the next syncs, 3 attempts in
-all. FTS covers the whole extracted text; only the first chunks of each content are embedded (see *Embeddings:
-scope and runs*). `--no-attachments` skips the step.
-Summary: `attachments_extracted`, `attachments_deduplicated`, `attachments_failed`,
-`attachments_skipped_by_reason` (`inline`, `image`, `too_large`, `unsupported_type`, `excluded_type`,
-`embedded_message`, `encrypted`, `empty_text`), `attachments_errors`, `attachments_remaining` (messages).
+Pièces jointes : `sync` lit ensuite celles des nouveaux messages (et, une fois, celles des messages indexés
+avant, du plus récent au plus ancien, par lots). Pièces inline, images, fichiers trop gros, messages joints, liens
+et extensions inconnues sont écartés d'après leurs propriétés, sans lire les données. Le reste est lu, haché
+(SHA-256) et, pour un contenu inédit, extrait dans un processus fils (`outlook-index extract-worker`, interne ;
+30 s maximum, relancé après un échec). Un contenu est stocké et découpé une fois, partagé par tous les messages qui
+le portent, supprimé avec le dernier. Une extraction `failed` ou `timeout` est retentée par les syncs suivants
+(3 essais en tout).
 
-```powershell
-outlook-index.exe scope --attachment-types pdf,docx,xlsx,pptx,txt,csv,html --attachment-max-mb 20   # the defaults
-outlook-index.exe sync --no-attachments                            # bodies only; a later sync catches up
+Formats extraits : PDF (couche texte, pas d'OCR), DOCX, PPTX, XLSX (au plus 20 000 lignes par feuille et 200 000
+cellules), TXT et CSV (UTF-8, UTF-16 avec BOM, sinon Windows-1252), HTML. Le type vient de l'extension, puis des
+octets magiques, puis du type MIME. Texte limité à 2 000 000 caractères. Motifs d'exclusion : `inline`, `image`,
+`too_large`, `unsupported_type` (archives, `.doc`/`.xls` anciens, Markdown…), `excluded_type`,
+`embedded_message`, `encrypted`, `empty_text` (PDF scanné), `failed`, `timeout`.
+
+Résumé (stdout, compteurs seulement), notamment : `complete`, `new`, `deleted`, `excluded_removed`, `moved`,
+`flags_changed`, `chunks_added`, `failed`, `remaining`, `errors` (par type), `totals`, `attachments_extracted`,
+`attachments_deduplicated`, `attachments_failed`, `attachments_skipped_by_reason`, `attachments_errors`, `attachments_remaining`, puis
+`embedding` (résultat de l'étape `embed`, ou `{"skipped": ...}` avec `--no-embed`, sans fichiers de modèle ou
+quand `--max-time` est atteint).
+
+### Modèle d'embedding (local, CPU)
+
+`intfloat/multilingual-e5-base` (défaut d'un nouvel index, 768 dimensions) ou `multilingual-e5-small` (384
+dimensions), exécutés sur le CPU avec candle (Rust pur, pas de DLL). Le modèle n'est pas dans l'exe ; ses fichiers
+(`config.json`, `tokenizer.json`, `model.safetensors`) sont figés sur une révision Hugging Face et vérifiés par
+SHA-256 avant chaque chargement. L'index mémorise son modèle : `sync`, `embed`, `model fetch` et `bench-embed`
+l'utilisent sans `--model` (sinon e5-base).
+
+```bash
+outlook-index model list --pretty                # révisions figées, fichiers présents
+outlook-index model fetch                        # modèle de l'index, sinon e5-base (~1,1 Go)
+outlook-index model fetch --model e5-small       # ~490 Mo
+outlook-index bench-embed --pretty               # ~30 s de passages synthétiques sur ce CPU
+outlook-index bench-embed --model e5-small --seconds 60 --workers 4 --threads 3 --pretty
 ```
 
-The attachment scope is stored in the index. Narrowing it keeps stored texts (`attachments.out_of_scope`);
-attachments skipped as `too_large` or `excluded_type` are read again by the next sync after a change
-(`requeued_messages`). `status` and `scope` print `attachments`: links, `contents` (hashed), `distinct`, `chunks`,
-`by_outcome`, `skipped_by_reason`, `pending_messages`, `scope`.
+`model fetch` télécharge en HTTPS depuis huggingface.co avec `curl` (fourni avec Windows 10+), reprend un
+téléchargement interrompu (`<nom>.part`) et n'installe un fichier que si son SHA-256 est correct. Téléchargement
+manuel : mettre les trois fichiers de la révision figée dans un dossier et passer `--model-dir` (ou
+`OUTLOOK_INDEX_MODEL_DIR`). Dossier par défaut : `%LOCALAPPDATA%\outlook-cli\models\multilingual-e5-base` (ou
+`-small`). Les textes reçoivent le préfixe e5 obligatoire (`query: ` / `passage: `), sont coupés à 512 tokens,
+puis moyennés et normalisés.
 
-`search` modes (`--mode`):
+**Workers et threads.** `--workers N` (sur `sync`, `embed` et `bench-embed`) calcule N lots à la fois ;
+`--threads` est le nombre de threads *par worker*. Défauts : workers = max(1, (CPU logiques − 2) / 3), threads = 3,
+soit 4 × 3 pour 14 CPU. Au-delà d'un worker, chacun est un processus fils (`outlook-index embed-worker`, interne)
+avec sa propre copie du modèle : la mémoire croît avec N (VPS, e5-small : ~1,25 Go de RSS par processus).
+Plusieurs petits processus passent mieux à l'échelle qu'un seul avec beaucoup de threads. Portable du
+propriétaire (Intel i5, 14 CPU logiques, e5-small, ~311 tokens par passage) : un processus à 2 / 4 / 6 / 8 / 13
+threads donne 2,39 / 2,96 / 3,71 / 3,81 / 4,48 passages/s ; 4 processus × 3 threads 8,19 au total, 6 × 2 7,42 ;
+la taille de lot (`--batch` 1/8/16) ne change rien.
 
-- `keyword` matches every word, accent- and case-insensitive (FTS5 `unicode61 remove_diacritics 2`), over subject
-  and body, or within one attachment chunk. Query operators and quotes are plain words.
-- `semantic` embeds the query locally (`query: ` prefix, model of the stored vectors) and ranks the embedded chunks
-  by cosine similarity (brute force over the vectors, streamed from SQLite; no ANN index). It finds other wordings
-  and the other language (a French query finds an English mail). Body and attachment vectors are scanned; a
-  message ranks by its best chunk, from the body or an attachment it carries. Only embedded chunks (the embedding
-  scope, the attachment chunk cap) are searched.
-- `hybrid` fuses the top 200 of an any-word keyword search (every query word, OR) and the top 200 semantic hits
-  by Reciprocal Rank Fusion (k = 60); each leg stays at 200 whatever `-n`, so at most their union is returned.
-  Messages outside the embedding scope are still found by their words.
-- Default: `hybrid` when the index holds vectors of its model, else `keyword`. `semantic`/`hybrid` with no such
-  vectors run `keyword` and print `{"warning":{"kind":"keyword_fallback",...}}` on stderr; so does the default mode
-  when the model files are missing (an explicit `--mode semantic|hybrid` is then a `not_found` error). `--model`
-  other than the model of the stored vectors is a usage error naming the expected model.
+### Portée des embeddings et calcul
 
-```powershell
-outlook-index.exe search "budget café" -n 5 -F Inbox --since 30d --from alice   # hybrid once embedded
-outlook-index.exe search "facture impayée" --mode keyword                         # every word, exact
-outlook-index.exe search "unpaid invoice" --mode semantic                         # finds "Facture impayée"
-outlook-index.exe search "server outage" --mode hybrid --format jsonl
+La recherche couvre tous les dossiers indexés ; les embeddings sont limités par une portée (défaut : tout
+l'index) mémorisée dans l'index et réutilisée par chaque run.
+
+```bash
+outlook-index scope --pretty                                         # portées + compteurs
+outlook-index scope --embed-since 2025-01-01 --embed-until 2026-03-31 -F Inbox -F "Archive/2026"
+outlook-index scope --attachment-chunks 10                           # chunks embeddés par pièce jointe (défaut 30)
+outlook-index scope --attachment-types pdf,docx,xlsx,pptx,txt,csv,html --attachment-max-mb 20   # les défauts
+outlook-index scope --clear                                          # tout remettre par défaut
+outlook-index embed --max-time 30m                                   # plus récents d'abord ; reprend où il s'est arrêté
+outlook-index embed --model e5-small --reembed                       # changer de modèle : supprime les vecteurs e5-base
 ```
 
-Filters apply to every mode: `-F` folder name, or path with its subfolders (`Inbox` matches `Inbox/Projects`, not
-`Inboxes`; repeatable), `--since`/`--until`, `--from`, `--to`, `--has-attachments`. Output: `{count, mode, hits}`
-(`--format jsonl`: one hit per line). One hit per message (its best chunk): `{id, message_id, folder, received,
-subject, from, excerpt, source, ranks, scores}`; `source` is `"body"` or `{"kind": "attachment", "index", "name",
-"type"}` with the excerpt from the attachment; `ranks`/`scores` hold `keyword` (bm25), `semantic` (cosine) and,
-in hybrid, `hybrid` and `rrf`, for the legs that found the message. Hybrid hits also carry `keyword_rank` and
-`semantic_rank` (`null` when that leg missed the message) and `score` (the RRF score). `id` works with `outlook-cli get` until the
-message moves (then run `sync`). Excerpts: 300 characters by default, `--excerpt-max` up to 2000; a keyword excerpt
-is a snippet around the words, a semantic one the start of the best chunk (without the overlap with the previous
-chunk).
+`scope` : `--embed-since` (inclus) et `--embed-until` (exclu) sur la date de réception, même syntaxe que
+`outlook-cli --since/--until`, stockés en dates absolues (`90d` reste la date qu'il désignait) ; `-F` comme
+`search -F`, répétable, remplace les dossiers mémorisés ; les options absentes sont conservées. `--clear` remet
+les deux portées par défaut et ne se combine pas avec les autres options. Sortie : `chunks_in_scope`, `embedded`,
+`pending`, `embedded_pct`, `out_of_scope`, `out_of_scope_embedded` (un changement de portée ne supprime jamais de
+vecteur), `attachment_chunks` et `attachments`. Les dossiers sont comptés, pas affichés.
 
-Latency (VPS, 4 vCPU, 3 threads, release build): a semantic or hybrid search loads the model first, which takes
-~1.4 s (SHA-256 check of the files included); the query embedding then takes ~30 ms. The vector scan is ~80 ms per
-50,000 vectors and ~320 ms per 200,000 (e5-small, warm page cache, linear in the number of vectors); a whole hybrid
-search ~0.17 s at 50,000 and ~0.7 s at 200,000 (worst case: every chunk matches a word). Measured with the ignored
-tests `semantic_bench` (synthetic index) and `real_e5_search` (30 fictitious French/English mails, cross-lingual
-hits in the top 3):
-`E5_SMALL_DIR=... cargo test --release --features index --lib -- --ignored --nocapture semantic_bench real_e5_search`.
+Portée des pièces jointes : `--attachment-types` (liste qui remplace la précédente) et `--attachment-max-mb`
+(1 à 100, défaut 20). La restreindre conserve les textes déjà extraits ; les pièces écartées en `too_large` ou
+`excluded_type` sont relues au sync suivant après un changement (`requeued_messages`).
+`--attachment-chunks N` (défaut 30, ~50 000 caractères ; `0` = aucune) : seuls les chunks 0 à N−1 de chaque
+contenu distinct sont embeddés ; la recherche par mots couvre tout le texte. Augmenter N embedde le reste au run
+suivant ; le baisser conserve les vecteurs.
 
-### Embedding model (local, CPU)
+`embed` calcule les chunks de corps en attente dans la portée, du message le plus récent au plus ancien (passage :
+sujet, saut de ligne, texte du chunk), puis les chunks de pièces jointes sous le plafond (passage : nom du
+fichier, saut de ligne, texte). Chaque lot (`--batch`, défaut 8) est validé dès son retour : `Ctrl-C` ne perd que
+les lots en cours (un par worker) ; `--max-time` ne lance plus de lot une fois atteint. Priorité basse par défaut
+(Windows `BELOW_NORMAL_PRIORITY_CLASS`, Linux nice 10 ; `--priority normal` pour l'éviter). Un autre modèle que
+celui des vecteurs existants est refusé sans `--reembed`. Fichiers de modèle absents : erreur `not_found` pour
+`embed`, étape sautée pour `sync`. Sortie : `embedded`, `pending`, `attachment_chunks`, `dropped`, `complete`,
+`interrupted`, `passages_per_s`, `load_ms`, `elapsed_ms`, modèle, `workers`, `threads`, `priority`.
 
-`intfloat/multilingual-e5-base` (default for a new index, 768 dims, XLM-RoBERTa) or `multilingual-e5-small` (384
-dims, BERT), run on
-the CPU with candle (pure Rust). The model is not in the exe. Its files (`config.json`, `tokenizer.json`,
-`model.safetensors`) are pinned to a Hugging Face revision and checked by SHA-256 before every load.
+Estimation de durée : (`pending` + `attachment_chunks.pending` de `scope`) ÷ passages/s (`bench-embed` avec les
+mêmes `--workers` et `--threads`) = secondes. Exemple : 50 000 chunks à 8,19 passages/s (portable, 4 × 3,
+e5-small) ≈ 1 h 42 min ; e5-base est plus lent, prendre son propre débit `bench-embed`. Taille : environ 2 Mo par
+1 000 vecteurs e5-small.
 
-```powershell
-outlook-index.exe model list --pretty                   # pinned revisions, files present in the default dirs
-outlook-index.exe model fetch                           # model of the index, else e5-base (~1.1 GB); the only network access
-outlook-index.exe model fetch --model e5-small          # ~490 MB
-outlook-index.exe bench-embed --pretty                  # ~30 s of synthetic passages on this CPU
-outlook-index.exe bench-embed --model e5-small --seconds 60 --workers 4 --threads 3 --pretty
-```
+### Suivi des runs longs
 
-`model fetch` downloads over HTTPS from huggingface.co with `curl` (shipped with Windows 10+) into `<name>.part`,
-resumes an interrupted download and installs a file only when its SHA-256 matches. Manual download: put the three
-files of the pinned revision (`model list`) in a directory and pass `--model-dir` (or `OUTLOOK_INDEX_MODEL_DIR`).
-Default directory: `%LOCALAPPDATA%\outlook-cli\models\multilingual-e5-base` (or `-small`; Linux: under
-`$XDG_DATA_HOME/outlook-cli`). Texts get the mandatory e5 prefix (`query: ` / `passage: `), are cut at 512 tokens,
-embedded in length-sorted batches (`--batch`, default 8) and mean-pooled over the tokens, then L2-normalized.
-`bench-embed` prints load time (hash check included), query latency and passages/s on synthetic text only (with
-`--workers` above 1: aggregate passages/s, no token or query figures). **Paste back** its whole JSON for both models.
-
-**Workers and threads.** `--workers N` (on `embed`, `sync` and `bench-embed`) embeds N batches at once; `--threads`
-is the compute threads *per worker*. Defaults: workers = max(1, (logical CPUs − 2) / 3), threads = 3, so 14 CPUs
-give 4 × 3 and 4 CPUs 1 × 3; two CPUs stay free. Summaries print the effective `workers` and `threads`. One worker
-runs in the process. More workers run as child processes (`outlook-index embed-worker`, internal), each with its own
-copy of the model: memory grows with N (VPS, e5-small: ~1.25 GB RSS per process). One process with more threads
-scales badly; several small ones scale well. Owner's laptop (Intel i5, 14 logical CPUs, e5-small, ~311
-tokens/passage): one process with 2 / 4 / 6 / 8 / 13 threads gave 2.39 / 2.96 / 3.71 / 3.81 / 4.48 passages/s; 4
-processes × 3 threads 8.19 in total, 6 × 2 7.42; batch size 1/8/16 made no difference. On the VPS (4 vCPU) the same
-model in one process with 2 workers sharing the weights reached 3.5–3.6 passages/s against 4.5 for two processes ×
-2 threads, hence processes.
-
-### Embeddings: scope and runs
-
-Search covers every indexed mail folder; embeddings are limited by a scope (default: the whole index) stored in
-the index and reused by every run.
-
-```powershell
-outlook-index.exe scope --pretty                                   # scope + counts
-outlook-index.exe scope --embed-since 2025-01-01 --embed-until "2026-03-31" -F Inbox -F "Archive/2026"
-outlook-index.exe scope --attachment-chunks 10                     # attachment chunks embedded per content (default 30)
-outlook-index.exe scope --clear                                    # back to everything
-outlook-index.exe embed --max-time 30m                             # newest first; resumable
-outlook-index.exe embed --model e5-small --reembed                 # change model: drops the e5-base vectors
-outlook-index.exe sync --max-time 1h                               # index, then embed in the time left
-outlook-index.exe sync --no-embed                                  # index only
-```
-
-`scope`: `--embed-since` (inclusive) and `--embed-until` (exclusive) on the received time, same syntax as
-`outlook-cli --since/--until`, stored as absolute times (the typed text is shown too: `90d` stays the date it meant
-when set); `-F` as in `search -F`, repeatable, replaces the stored folders; options not given are kept. Output:
-`chunks_in_scope`, `embedded`, `pending`, `embedded_pct`, `out_of_scope`, and `out_of_scope_embedded` (vectors are
-never deleted by a scope change). Folder specs are counted, not printed. A folder spec is checked against the
-indexed folders once a sync has run.
-
-`--attachment-chunks N` (default 30, about 50,000 characters; `0` = attachments not embedded) is stored with the
-scope: only chunks 0 to N-1 of each distinct attachment content are embedded, keyword search covers the whole
-text. Raising it embeds the newly eligible chunks on the next run; lowering it keeps the vectors already stored. A
-content is in scope when at least one in-scope message (dates, folders) carries it and its type and size are in
-the attachment scope; it is embedded once, whatever the number of messages carrying it. Output
-`attachment_chunks` (in `status`: `embedding.attachment_chunks`): `cap`, `vectors`, `chunks`, `in_scope`,
-`eligible` (in scope, under the cap), `embedded`, `pending`, `beyond_cap` (keyword only), `beyond_cap_embedded`
-(kept from a higher cap), `out_of_scope_embedded`. The other counts above are body chunks.
-
-`embed` embeds the pending in-scope body chunks, newest message first (passage: the subject, a newline and the
-chunk text), then the pending attachment chunks under the cap, contents ordered by the newest message carrying
-them (passage: the file name, a newline and the chunk text); both get the `passage: ` prefix. Attachment vectors
-have their own table, follow the same model rules (`--reembed` drops both kinds) and go with their content. Each batch (`--batch`, default 8) is one commit made by the parent process (the
-only DB writer) as soon as a worker returns it, so with several workers commits may land slightly out of
-newest-first order; `Ctrl-C` loses at most the batches in flight (one per worker) and `--max-time` starts no new batch
-once reached (batches in flight finish); the next run resumes. A failing worker stores nothing of its batch: the
-run stops dispatching, commits the batches still in flight and exits with the error. It runs at below-normal
-priority (Windows `BELOW_NORMAL_PRIORITY_CLASS`, Linux nice 10, inherited by worker processes; `--priority normal`
-to opt out) with `--workers` × `--threads`. The model defaults to the one of the index (else e5-base; also for `model fetch` and `bench-embed`); another model is refused unless
-`--reembed`, which drops the old vectors. Missing model files are a `not_found` error. Output: `embedded`, `pending`
-(body and attachment chunks; `attachment_chunks: {embedded, pending}` for the attachment part), `dropped`,
-`complete`, `interrupted`, `passages_per_s`, `load_ms`, `elapsed_ms`, model, workers, threads, priority.
-
-`sync` runs the same step after indexing, within what is left of `--max-time`, with the same options. Without model
-files indexing still completes and the summary says `"embedding": {"skipped": "model files missing; run outlook-index
-model fetch"}`. `status` adds `embedding`: model, revision, dims, vectors, the scope counts above and a scope
-summary.
-
-Time estimate: chunks to embed (`pending` + `attachment_chunks.pending` from `scope`, i.e. body chunks plus
-min(chunks, cap) per distinct attachment content) ÷ passages/s (from `bench-embed` with the same `--workers`
-and `--threads`) = seconds; e.g. 40,000 chunks at 8.19 passages/s (laptop above, 4 × 3, e5-small) ≈ 81 min. With
-attachments, the owner's mailbox adds at most ~10,000 chunks (doctor estimate; the 2 M-character TXT counts 30, not
-~190,000): ~50,000 chunks ≈ 1 h 42 min at that rate (e5-base is slower: use its `bench-embed` rate). Size: about
-2 MB per 1,000 e5-small vectors (measured: 384 × 4 bytes plus row and page overhead).
-
-### Progress of long runs
-
-`sync` and `embed` report progress on stderr; stdout still gets only the final JSON summary.
-`--progress auto|bar|jsonl|none` (default `auto`: `bar` when stderr is a terminal, else `jsonl`, e.g. a pipe, an
-agent or a log file). Reports at each phase change, at most every `--progress-interval` seconds (default 10) in
-between, and a final `done`. Phases in order: `scan` (folders), `index` (new messages), `attachments` (messages
-with attachments to read), `embed_bodies` (pending body chunks in scope), `embed_attachments` (pending attachment
-chunks under the cap); totals are taken at phase start.
+`sync` et `embed` écrivent leur progression sur stderr ; stdout ne reçoit que le résumé final.
+`--progress auto|bar|jsonl|none` (défaut `auto` : `bar` sur un terminal, sinon `jsonl`), un rapport à chaque
+changement de phase et au plus toutes les `--progress-interval` secondes (défaut 10), puis `done`. Phases :
+`scan`, `index`, `attachments`, `embed_bodies`, `embed_attachments`.
 
 ```text
 {"progress":{"phase":"embed_bodies","done":12345,"total":30112,"percent":40.9,"rate":3.9,"eta_s":4556,"elapsed_s":5210,"workers":4,"model":"e5-base"}}
 embed_bodies       41 % 12,345/30,112  3.9/s  ETA 1h15m
 ```
 
-`jsonl`: one whole line per event, so lines stay parseable among `{"warning":...}` lines. `rate` is items/s over
-the last minute of the phase, `eta_s` derives from it (`null` until known), `elapsed_s` counts from the start of the
-run; `workers` and `model` are `null` without embedding. `bar`: one self-overwriting line per phase, plain ASCII
-(Windows Terminal, PowerShell, WSL). Counts and durations only: no names, subjects or text.
+Le même enregistrement (plus `pid`, `started_at`, `updated_at`, `interval_s`) est conservé dans l'index et lisible
+par un autre processus pendant le run :
 
-The same record (plus `pid`, `started_at`, `updated_at`, `interval_s`) is stored in the index (meta `sync_progress`)
-inside the run's batch transactions, so another process can read it:
-
-```powershell
-outlook-index.exe status            # "running": null, or {phase, done, total, percent, rate, eta_s, elapsed_s, pid, updated_at, stale}
-outlook-index.exe status --watch    # {"running": ...} every 10 s (--watch 30: every 30 s) until the run ends
+```bash
+outlook-index status              # "running": null, ou {phase, done, total, percent, rate, eta_s, ..., stale}
+outlook-index status --watch      # une ligne {"running": ...} toutes les 10 s (--watch 30 : 30 s) jusqu'à la fin
 ```
 
-`status` reads while a sync runs (WAL, no wait). `running` is `null` when no run was recorded or the last one
-finished; `stale: true` means the run's process is gone (no process holds the index lock) and the record is older
-than twice its interval: a crashed or killed run, resumed by the next `sync`. `status --watch` prints one line per
-tick (jsonl, even with `--pretty`) and stops after a line whose record is `null`, `done` or stale. **Agents**: read
-`running` from `status` (or poll `status --watch`), or parse the `{"progress":...}` lines of the run's stderr.
+`running` vaut `null` sans run en cours ; `stale: true` signale un run dont le processus a disparu (arrêté ou
+planté) : le `sync` suivant reprend. `status --watch` écrit une ligne par tick (même avec `--pretty`) et s'arrête
+sur `null`, `done` ou `stale`. Compteurs et durées seulement.
 
-Parity with sentence-transformers (`scripts/e5_reference.py` → `tests/fixtures/e5_reference.json`):
+`status` : `messages`, `chunks`, `folders`, `locations`, `schema`, `embedding` (modèle, révision, dimensions,
+vecteurs, compteurs de portée), `include`, `attachments`, `db_bytes`, `last_sync`, `running`.
+
+### search
+
+```bash
+outlook-index search "budget café" -n 5 -F Inbox --since 30d --from alice   # hybride une fois embeddé
+outlook-index search "facture impayée" --mode keyword                        # tous les mots
+outlook-index search "unpaid invoice" --mode semantic                        # trouve « Facture impayée »
+outlook-index search "server outage" --mode hybrid --format jsonl            # un résultat par ligne
+```
+
+Modes (`--mode`) :
+
+- `keyword` : tous les mots requis, insensible aux accents et à la casse (FTS5), dans le sujet et le corps, ou dans
+  un même chunk de pièce jointe. Opérateurs et guillemets sont traités comme des mots.
+- `semantic` : la requête est embeddée localement (préfixe `query: `, modèle des vecteurs stockés) et comparée par
+  cosinus à tous les chunks embeddés (force brute, sans index ANN). Trouve d'autres formulations et l'autre langue.
+  Seuls les chunks embeddés (portée, plafond des pièces jointes) sont cherchés.
+- `hybrid` : fusion RRF (k = 60) des 200 premiers résultats d'une recherche par mots « au moins un mot » (OU, tous
+  les mots de la requête gardés) et des 200 premiers résultats sémantiques. Les messages hors portée des
+  embeddings restent trouvés par leurs mots.
+- Défaut : `hybrid` si l'index contient des vecteurs de son modèle, sinon `keyword`. `semantic`/`hybrid` sans ces
+  vecteurs se rabattent sur `keyword` avec `{"warning":{"kind":"keyword_fallback",...}}` sur stderr ; le mode par
+  défaut aussi quand les fichiers de modèle manquent (un `--mode semantic|hybrid` explicite donne alors une erreur
+  `not_found`). Un `--model` différent de celui des vecteurs est une erreur `usage`.
+
+Filtres, valables dans tous les modes : `-F/--folder` (nom, ou chemin avec ses sous-dossiers : `Inbox` couvre
+`Inbox/Projets`, pas `Inboxes` ; répétable = OU), `-s/--since`, `-u/--until`, `--from` (expéditeur),
+`--to` (destinataire To/Cc), `--has-attachments`. `-n/--limit` (défaut 10), `--excerpt-max` (défaut 300, max 2000),
+`--format json|jsonl`.
+
+Sortie : `{count, mode, hits}` (`jsonl` : un résultat par ligne). Un résultat par message, son meilleur chunk :
+`id`, `message_id`, `folder`, `received`, `sent`, `subject`, `from` `{name, email}`, `to`, `cc`, `size`, `class`,
+`has_attachments`, `read`, `excerpt`, `source`, `ranks`, `scores`. `source` vaut `"body"` ou
+`{"kind":"attachment","index","name","type"}` (extrait tiré de la pièce jointe). `ranks`/`scores` contiennent
+`keyword` (bm25) et/ou `semantic` (cosinus) pour les recherches qui ont trouvé le message, et en hybride `hybrid`
+et `rrf` ; les résultats hybrides ont aussi `keyword_rank`, `semantic_rank` (`null` si absent de cette recherche)
+et `score` (score RRF). `id` fonctionne avec `outlook-cli get` tant que le message n'est pas déplacé (sinon relancer
+`sync`). Extrait : en `keyword`, autour des mots ; en `semantic`, le début du meilleur chunk.
+
+Latence (VPS, 4 vCPU, 3 threads, build release, e5-small) : chargement du modèle ~1,4 s (vérification SHA-256
+comprise), embedding de la requête ~30 ms, parcours des vecteurs ~80 ms pour 50 000 et ~320 ms pour 200 000 ;
+recherche hybride complète ~0,17 s à 50 000 et ~0,7 s à 200 000 (pire cas : chaque chunk contient un mot). Mesuré
+par les tests ignorés `semantic_bench` et `real_e5_search` :
+`E5_SMALL_DIR=... cargo test --release --features index --lib -- --ignored --nocapture semantic_bench real_e5_search`.
+Parité avec sentence-transformers (`scripts/e5_reference.py` → `tests/fixtures/e5_reference.json`) :
 `E5_SMALL_DIR=... E5_BASE_DIR=... cargo test --release --features index --test embed_parity -- --ignored --nocapture`.
 
 ## Fonctionnement
