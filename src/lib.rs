@@ -1,7 +1,10 @@
 pub mod body;
 pub mod crypt;
 pub mod error;
+#[cfg(feature = "index")]
+pub mod index;
 pub mod ltp;
 pub mod ndb;
+pub mod paths;
 pub mod store;
 pub mod timeutil;

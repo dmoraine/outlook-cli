@@ -468,3 +468,67 @@ impl<'a> Message<'a> {
         }
     }
 }
+
+pub fn is_mail_folder(f: &Folder) -> bool {
+    f.class.as_deref().is_none_or(|c| {
+        (c.starts_with("IPF.Note") && !c.starts_with("IPF.Note.OutlookHomepage")) || c.starts_with("IPF.Imap")
+    })
+}
+
+pub fn resolve_folders(store: &Store, specs: &[String]) -> Result<Vec<Folder>> {
+    let folders = store.folders(false)?;
+    let inbox = |folders: &[Folder]| -> Result<Folder> {
+        let nid = store.inbox(folders).ok_or_else(|| Error::NotFound("Inbox folder".into()))?;
+        Ok(folders.iter().find(|f| f.nid == nid).unwrap().clone())
+    };
+    if specs.is_empty() {
+        return Ok(vec![inbox(&folders)?]);
+    }
+    let mut out: Vec<Folder> = Vec::new();
+    for spec in specs {
+        let s = spec.trim().trim_matches('/');
+        let lower = s.to_lowercase();
+        let found: Vec<Folder> = if lower == "all" || s == "*" {
+            for f in folders.iter().filter(|f| is_mail_folder(f)) {
+                if !out.iter().any(|o| o.nid == f.nid) {
+                    out.push(f.clone());
+                }
+            }
+            continue;
+        } else if lower == "inbox" {
+            vec![inbox(&folders)?]
+        } else if let Some(f) = parse_id(s).ok().and_then(|id| folders.iter().find(|f| f.nid == id)) {
+            vec![f.clone()]
+        } else {
+            let by_path: Vec<_> = folders.iter().filter(|f| f.path.to_lowercase() == lower).cloned().collect();
+            if !by_path.is_empty() {
+                by_path
+            } else {
+                let by_name: Vec<_> = folders.iter().filter(|f| f.name.to_lowercase() == lower).cloned().collect();
+                if by_name.len() > 1 {
+                    let paths: Vec<_> = by_name.iter().map(|f| f.path.as_str()).collect();
+                    return Err(Error::Usage(format!("folder '{s}' is ambiguous: {}", paths.join(", "))));
+                }
+                by_name
+            }
+        };
+        if found.is_empty() {
+            return Err(Error::NotFound(format!("folder '{s}' (see `outlook-cli folders`)")));
+        }
+        for f in found {
+            if !out.iter().any(|o| o.nid == f.nid) {
+                out.push(f);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn parse_id(s: &str) -> Result<Nid> {
+    let s = s.trim();
+    let r = match s.strip_prefix("0x") {
+        Some(h) => u32::from_str_radix(h, 16),
+        None => s.parse(),
+    };
+    r.map_err(|_| Error::Usage(format!("invalid message id '{s}'")))
+}

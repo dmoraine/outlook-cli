@@ -20,6 +20,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --release -- -D warnings
       - run: cargo test --release
+      - run: cargo clippy --release --all-targets --features index -- -D warnings
+      - run: cargo test --release --features index
+      # outlook-cli must not depend on SQLite.
+      - run: "! cargo tree -e normal | grep -i sqlite"
 
   windows:
     runs-on: windows-latest
@@ -33,6 +37,13 @@ jobs:
         with:
           name: outlook-cli-windows-x64
           path: target/release/outlook-cli.exe
+      - run: cargo test --release --features index
+      - run: cargo build --release --features index --bin outlook-index
+      - run: target/release/outlook-index.exe --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: outlook-index-windows-x64
+          path: target/release/outlook-index.exe
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub enum Error {
@@ -49,6 +50,35 @@ impl Error {
             Error::Io(_) => "io",
             Error::Format(_) => "format",
             Error::Corrupt(_) => "inconsistent",
+        }
+    }
+}
+
+/// Run `f`, turning a panic into an inconsistency error. Bounds are checked
+/// throughout the parser, but the file is live: a structure rewritten by
+/// Outlook in the middle of a read must never crash the process.
+pub fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let msg = p
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "internal error".into());
+        Err(Error::Corrupt(msg))
+    })
+}
+
+/// Retry an operation when it reads inconsistent data, which happens when
+/// Outlook rewrites part of the file during the read.
+pub fn with_retry<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0;
+    loop {
+        match guarded(&mut f) {
+            Err(Error::Corrupt(_)) if attempt < 5 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(50 * attempt));
+            }
+            r => return r,
         }
     }
 }

@@ -141,6 +141,28 @@ $r.messages | Select-Object id, received, subject
 
 (Alternative : `[Console]::OutputEncoding = [Text.Encoding]::UTF8`.) Inutile dans WSL ou PowerShell 7.
 
+## outlook-index (preview)
+
+Separate binary for a local mailbox index (cargo feature `index`, bundled SQLite with FTS5). Read-only on the OST.
+Built by `scripts/build.sh` as `dist/outlook-index.exe`. One command so far:
+
+```powershell
+outlook-index.exe doctor --pretty                # samples 200 messages
+outlook-index.exe doctor --sample 1000 --pretty  # more precise, slower
+```
+
+`doctor` prints aggregate JSON only: machine (OS, arch, CPUs, total RAM bytes), SQLite/FTS5, index location status,
+file kind/size, folder and message counts by class prefix (`IPM.Note`, `IPF.Note`, unknown segments → `other`)/depth/
+year, full-scan time, and for `--sample` messages picked at random: open+text, open and text-extraction times (µs),
+text lengths, a chunk estimate, attachment counts by extension/method and sizes. Distributions are
+`{min, p50, p95, max, sum}`. Errors: counts by kind only; a fatal error prints `{"error":{"kind","message"}}` with a
+fixed message. No subjects, addresses, names, folder or attachment names, body text or paths.
+
+**Paste back**: the whole stdout JSON, plus any stderr line (`{"warning":...}` or `{"error":...}`). Read it first.
+
+Index file: `--index` / `OUTLOOK_INDEX_DB`, default `%LOCALAPPDATA%\outlook-cli\index.sqlite` (Linux:
+`$XDG_DATA_HOME/outlook-cli/index.sqlite`). A path under OneDrive gets a warning. `doctor` does not create it.
+
 ## Fonctionnement
 
 - `src/ndb.rs` : couche NDB de [MS-PST] — en-tête, B-trees des nœuds (NBT) et des blocs (BBT), blocs de données

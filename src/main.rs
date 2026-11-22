@@ -6,10 +6,13 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Map, Value as Json, json};
 
-use outlook_cli::body::{self, Rtf};
-use outlook_cli::error::{Error, Result};
+use outlook_cli::body::{html_of, text_of, truncate};
+use outlook_cli::error::{Error, Result, guarded, with_retry};
 use outlook_cli::ndb::Nid;
-use outlook_cli::store::{Folder, MSGFLAG_HASATTACH, MSGFLAG_READ, Message, RowSummary, Store, tag};
+use outlook_cli::paths::{default_file, native_path};
+use outlook_cli::store::{
+    Folder, MSGFLAG_HASATTACH, MSGFLAG_READ, Message, RowSummary, Store, is_mail_folder, parse_id, resolve_folders, tag,
+};
 use outlook_cli::timeutil::{format_ft, now_ft, parse_when};
 
 /// Read e-mails from an Outlook OST/PST file (works while Outlook is running).
@@ -233,35 +236,6 @@ fn io_err(e: std::io::Error) -> Error {
     Error::Io(e.to_string())
 }
 
-/// Run `f`, turning a panic into an inconsistency error. Bounds are checked
-/// throughout the parser, but the file is live: a structure rewritten by
-/// Outlook in the middle of a read must never crash the process.
-fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
-        let msg = p
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_else(|| "internal error".into());
-        Err(Error::Corrupt(msg))
-    })
-}
-
-/// Retry an operation when it reads inconsistent data, which happens when
-/// Outlook rewrites part of the file during the read.
-fn with_retry<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
-    let mut attempt = 0;
-    loop {
-        match guarded(&mut f) {
-            Err(Error::Corrupt(_)) if attempt < 5 => {
-                attempt += 1;
-                std::thread::sleep(Duration::from_millis(50 * attempt));
-            }
-            r => return r,
-        }
-    }
-}
-
 /// Writer that escapes non-ASCII characters as JSON \uXXXX sequences. JSON
 /// output only has non-ASCII inside strings, so the result stays valid JSON.
 struct AsciiEscape<W: Write> {
@@ -295,125 +269,6 @@ impl<W: Write> Write for AsciiEscape<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
-}
-
-/// Accept WSL-style paths when running as a Windows executable.
-fn native_path(p: &str) -> PathBuf {
-    if cfg!(windows) && p.starts_with('/') {
-        let b = p.as_bytes();
-        if p.len() >= 6 && p.starts_with("/mnt/") && b[5].is_ascii_alphabetic() && (p.len() == 6 || b[6] == b'/') {
-            return PathBuf::from(format!(
-                "{}:\\{}",
-                (b[5] as char).to_ascii_uppercase(),
-                p[6..].trim_start_matches('/').replace('/', "\\")
-            ));
-        }
-        // Other absolute Linux paths: reach them through the WSL share of the
-        // distribution we were started from (the current directory tells which).
-        if let Ok(cwd) = std::env::current_dir() {
-            let c = cwd.to_string_lossy().to_string();
-            for prefix in [r"\\wsl.localhost\", r"\\wsl$\"] {
-                if let Some(rest) = c.strip_prefix(prefix) {
-                    let distro = rest.split('\\').next().unwrap_or("");
-                    return PathBuf::from(format!("{prefix}{distro}{}", p.replace('/', "\\")));
-                }
-            }
-        }
-    }
-    PathBuf::from(p)
-}
-
-fn default_file() -> Result<PathBuf> {
-    let mut dirs = Vec::new();
-    if cfg!(windows) {
-        if let Some(d) = std::env::var_os("LOCALAPPDATA") {
-            dirs.push(PathBuf::from(d).join("Microsoft").join("Outlook"));
-        }
-    } else if let Ok(users) = std::fs::read_dir("/mnt/c/Users") {
-        for u in users.flatten() {
-            dirs.push(u.path().join("AppData/Local/Microsoft/Outlook"));
-        }
-    }
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for d in dirs {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ost")) {
-                let t = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-                if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
-                    best = Some((t, p));
-                }
-            }
-        }
-    }
-    best.map(|b| b.1).ok_or_else(|| Error::Usage("no .ost file found; pass --file or set OUTLOOK_CLI_FILE".into()))
-}
-
-fn parse_id(s: &str) -> Result<Nid> {
-    let s = s.trim();
-    let r = match s.strip_prefix("0x") {
-        Some(h) => u32::from_str_radix(h, 16),
-        None => s.parse(),
-    };
-    r.map_err(|_| Error::Usage(format!("invalid message id '{s}'")))
-}
-
-// ---------------------------------------------------------------- folders
-
-fn is_mail_folder(f: &Folder) -> bool {
-    f.class.as_deref().is_none_or(|c| {
-        (c.starts_with("IPF.Note") && !c.starts_with("IPF.Note.OutlookHomepage")) || c.starts_with("IPF.Imap")
-    })
-}
-
-fn resolve_folders(store: &Store, specs: &[String]) -> Result<Vec<Folder>> {
-    let folders = store.folders(false)?;
-    let inbox = |folders: &[Folder]| -> Result<Folder> {
-        let nid = store.inbox(folders).ok_or_else(|| Error::NotFound("Inbox folder".into()))?;
-        Ok(folders.iter().find(|f| f.nid == nid).unwrap().clone())
-    };
-    if specs.is_empty() {
-        return Ok(vec![inbox(&folders)?]);
-    }
-    let mut out: Vec<Folder> = Vec::new();
-    for spec in specs {
-        let s = spec.trim().trim_matches('/');
-        let lower = s.to_lowercase();
-        let found: Vec<Folder> = if lower == "all" || s == "*" {
-            for f in folders.iter().filter(|f| is_mail_folder(f)) {
-                if !out.iter().any(|o| o.nid == f.nid) {
-                    out.push(f.clone());
-                }
-            }
-            continue;
-        } else if lower == "inbox" {
-            vec![inbox(&folders)?]
-        } else if let Some(f) = parse_id(s).ok().and_then(|id| folders.iter().find(|f| f.nid == id)) {
-            vec![f.clone()]
-        } else {
-            let by_path: Vec<_> = folders.iter().filter(|f| f.path.to_lowercase() == lower).cloned().collect();
-            if !by_path.is_empty() {
-                by_path
-            } else {
-                let by_name: Vec<_> = folders.iter().filter(|f| f.name.to_lowercase() == lower).cloned().collect();
-                if by_name.len() > 1 {
-                    let paths: Vec<_> = by_name.iter().map(|f| f.path.as_str()).collect();
-                    return Err(Error::Usage(format!("folder '{s}' is ambiguous: {}", paths.join(", "))));
-                }
-                by_name
-            }
-        };
-        if found.is_empty() {
-            return Err(Error::NotFound(format!("folder '{s}' (see `outlook-cli folders`)")));
-        }
-        for f in found {
-            if !out.iter().any(|o| o.nid == f.nid) {
-                out.push(f);
-            }
-        }
-    }
-    Ok(out)
 }
 
 // ---------------------------------------------------------------- filters
@@ -546,44 +401,6 @@ impl Content {
             html: false,
             headers: false,
         }
-    }
-}
-
-fn html_of(m: &Message) -> Option<String> {
-    let cpid = m.pc.int(tag::INTERNET_CPID);
-    if let Some(b) = m.pc.bytes(tag::HTML).filter(|b| !b.is_empty()) {
-        return Some(body::decode_text(&b, cpid));
-    }
-    let rtf = body::decompress_rtf(&m.pc.bytes(tag::RTF_COMPRESSED)?)?;
-    match body::rtf_to_text(&rtf) {
-        Rtf::Html(h) => Some(h),
-        Rtf::Text(_) => None,
-    }
-}
-
-/// Plain-text body: PR_BODY, else the HTML body converted, else the RTF body.
-fn text_of(m: &Message) -> Option<String> {
-    if let Some(t) = m.pc.str(tag::BODY) {
-        return Some(body::tidy(&t));
-    }
-    let cpid = m.pc.int(tag::INTERNET_CPID);
-    if let Some(b) = m.pc.bytes(tag::HTML).filter(|b| !b.is_empty()) {
-        return Some(body::html_to_text(&body::decode_text(&b, cpid)));
-    }
-    let rtf = body::decompress_rtf(&m.pc.bytes(tag::RTF_COMPRESSED)?)?;
-    Some(match body::rtf_to_text(&rtf) {
-        Rtf::Html(h) => body::html_to_text(&h),
-        Rtf::Text(t) => t,
-    })
-}
-
-fn truncate(s: String, max: usize) -> (String, bool) {
-    if max == 0 {
-        return (s, false);
-    }
-    match s.char_indices().nth(max) {
-        Some((i, _)) => (s[..i].to_string(), true),
-        None => (s, false),
     }
 }
 

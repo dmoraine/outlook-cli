@@ -2,6 +2,7 @@
 //! ([MS-OXRTFCP] LZFu, [MS-OXRTFEX] HTML de-encapsulation).
 
 use crate::ltp::ansi;
+use crate::store::{Message, tag};
 
 /// Decode bytes of an HTML body according to PR_INTERNET_CPID.
 pub fn decode_text(b: &[u8], cpid: Option<i64>) -> String {
@@ -436,6 +437,44 @@ pub fn rtf_to_text(rtf: &[u8]) -> Rtf {
     }
     flush(&mut bytes, &mut out);
     if from_html { Rtf::Html(out) } else { Rtf::Text(tidy(&out)) }
+}
+
+pub fn html_of(m: &Message) -> Option<String> {
+    let cpid = m.pc.int(tag::INTERNET_CPID);
+    if let Some(b) = m.pc.bytes(tag::HTML).filter(|b| !b.is_empty()) {
+        return Some(decode_text(&b, cpid));
+    }
+    let rtf = decompress_rtf(&m.pc.bytes(tag::RTF_COMPRESSED)?)?;
+    match rtf_to_text(&rtf) {
+        Rtf::Html(h) => Some(h),
+        Rtf::Text(_) => None,
+    }
+}
+
+/// Plain-text body: PR_BODY, else the HTML body converted, else the RTF body.
+pub fn text_of(m: &Message) -> Option<String> {
+    if let Some(t) = m.pc.str(tag::BODY) {
+        return Some(tidy(&t));
+    }
+    let cpid = m.pc.int(tag::INTERNET_CPID);
+    if let Some(b) = m.pc.bytes(tag::HTML).filter(|b| !b.is_empty()) {
+        return Some(html_to_text(&decode_text(&b, cpid)));
+    }
+    let rtf = decompress_rtf(&m.pc.bytes(tag::RTF_COMPRESSED)?)?;
+    Some(match rtf_to_text(&rtf) {
+        Rtf::Html(h) => html_to_text(&h),
+        Rtf::Text(t) => t,
+    })
+}
+
+pub fn truncate(s: String, max: usize) -> (String, bool) {
+    if max == 0 {
+        return (s, false);
+    }
+    match s.char_indices().nth(max) {
+        Some((i, _)) => (s[..i].to_string(), true),
+        None => (s, false),
+    }
 }
 
 #[cfg(test)]

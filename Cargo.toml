@@ -14,6 +14,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4.6.7", features = ["derive", "env"] }
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 memmap2 = "0.9.11"
+rusqlite = { version = "0.43.0", features = ["bundled"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 
@@ -22,3 +23,16 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[features]
+# Local mail index (outlook-index binary). Off by default: outlook-cli keeps its dependency set.
+index = ["dep:rusqlite"]
+
+[[bin]]
+name = "outlook-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "outlook-index"
+path = "src/bin/outlook-index.rs"
+required-features = ["index"]
