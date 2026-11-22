@@ -135,6 +135,23 @@ fn scope_and_embed_cli() {
     }
     assert_eq!(json(&run(&["scope", "--clear"], &idx))["scope"]["all"], true);
 
+    // Attachment chunk cap: default 30, persisted with the scope, 0 allowed.
+    let v = json(&run(&["scope"], &idx));
+    assert_eq!(
+        (v["scope"]["attachment_chunks"].as_u64(), v["attachment_chunks"]["cap"].as_u64()),
+        (Some(30), Some(30))
+    );
+    let v = json(&run(&["scope", "--attachment-chunks", "0"], &idx));
+    assert_eq!((v["attachment_chunks"]["cap"].as_u64(), v["scope"]["all"].as_bool()), (Some(0), Some(true)), "{v}");
+    let v = json(&run(&["scope", "--embed-since", "2026-01-01"], &idx));
+    assert_eq!(v["scope"]["attachment_chunks"], 0, "kept: {v}");
+    let v = json(&run(&["status"], &idx));
+    assert_eq!(v["embedding"]["attachment_chunks"]["pending"], 0, "{v}");
+    assert_eq!(json(&run(&["scope", "--clear"], &idx))["scope"]["attachment_chunks"], 30);
+    for bad in [&["scope", "--attachment-chunks", "-1"][..], &["scope", "--clear", "--attachment-chunks", "5"]] {
+        assert_eq!(run(bad, &idx).status.code(), Some(2), "{bad:?}");
+    }
+
     let empty = dir.join("empty");
     std::fs::create_dir_all(&empty).unwrap();
     let o = run(&["embed", "--model-dir", empty.to_str().unwrap()], &idx);

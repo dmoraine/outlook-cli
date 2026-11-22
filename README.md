@@ -228,7 +228,8 @@ size, embedded messages, links and unknown extensions are skipped from their pro
 the rest is read, hashed (SHA-256) and, for a content not seen before, extracted in the child process (30 s
 timeout, restarted after a failure). A content is stored and chunked once, shared by every message carrying it, and
 deleted with its last message. A `failed` or `timeout` extraction is retried by the next syncs, 3 attempts in
-all. FTS covers the whole extracted text; attachment chunks are not embedded yet. `--no-attachments` skips the step.
+all. FTS covers the whole extracted text; only the first chunks of each content are embedded (see *Embeddings:
+scope and runs*). `--no-attachments` skips the step.
 Summary: `attachments_extracted`, `attachments_deduplicated`, `attachments_failed`,
 `attachments_skipped_by_reason` (`inline`, `image`, `too_large`, `unsupported_type`, `excluded_type`,
 `embedded_message`, `encrypted`, `empty_text`), `attachments_errors`, `attachments_remaining` (messages).
@@ -249,8 +250,9 @@ attachments skipped as `too_large` or `excluded_type` are read again by the next
   and body, or within one attachment chunk. Query operators and quotes are plain words.
 - `semantic` embeds the query locally (`query: ` prefix, model of the stored vectors) and ranks the embedded chunks
   by cosine similarity (brute force over the vectors, streamed from SQLite; no ANN index). It finds other wordings
-  and the other language (a French query finds an English mail). Only embedded chunks (the embedding scope) are
-  searched.
+  and the other language (a French query finds an English mail). Body and attachment vectors are scanned; a
+  message ranks by its best chunk, from the body or an attachment it carries. Only embedded chunks (the embedding
+  scope, the attachment chunk cap) are searched.
 - `hybrid` fuses the top 200 of an any-word keyword search (every query word, OR) and the top 200 semantic hits
   by Reciprocal Rank Fusion (k = 60); each leg stays at 200 whatever `-n`, so at most their union is returned.
   Messages outside the embedding scope are still found by their words.
@@ -328,6 +330,7 @@ the index and reused by every run.
 ```powershell
 outlook-index.exe scope --pretty                                   # scope + counts
 outlook-index.exe scope --embed-since 2025-01-01 --embed-until "2026-03-31" -F Inbox -F "Archive/2026"
+outlook-index.exe scope --attachment-chunks 10                     # attachment chunks embedded per content (default 30)
 outlook-index.exe scope --clear                                    # back to everything
 outlook-index.exe embed --max-time 30m                             # newest first; resumable
 outlook-index.exe embed --model e5-small --reembed                 # change model: drops the e5-base vectors
@@ -342,15 +345,27 @@ when set); `-F` as in `search -F`, repeatable, replaces the stored folders; opti
 never deleted by a scope change). Folder specs are counted, not printed. A folder spec is checked against the
 indexed folders once a sync has run.
 
-`embed` embeds the pending in-scope chunks, newest message first; the passage is the subject, a newline and the chunk
-text (with the `passage: ` prefix). Each batch (`--batch`, default 8) is one commit made by the parent process (the
+`--attachment-chunks N` (default 30, about 50,000 characters; `0` = attachments not embedded) is stored with the
+scope: only chunks 0 to N-1 of each distinct attachment content are embedded, keyword search covers the whole
+text. Raising it embeds the newly eligible chunks on the next run; lowering it keeps the vectors already stored. A
+content is in scope when at least one in-scope message (dates, folders) carries it and its type and size are in
+the attachment scope; it is embedded once, whatever the number of messages carrying it. Output
+`attachment_chunks` (in `status`: `embedding.attachment_chunks`): `cap`, `vectors`, `chunks`, `in_scope`,
+`eligible` (in scope, under the cap), `embedded`, `pending`, `beyond_cap` (keyword only), `beyond_cap_embedded`
+(kept from a higher cap), `out_of_scope_embedded`. The other counts above are body chunks.
+
+`embed` embeds the pending in-scope body chunks, newest message first (passage: the subject, a newline and the
+chunk text), then the pending attachment chunks under the cap, contents ordered by the newest message carrying
+them (passage: the file name, a newline and the chunk text); both get the `passage: ` prefix. Attachment vectors
+have their own table, follow the same model rules (`--reembed` drops both kinds) and go with their content. Each batch (`--batch`, default 8) is one commit made by the parent process (the
 only DB writer) as soon as a worker returns it, so with several workers commits may land slightly out of
 newest-first order; `Ctrl-C` loses at most the batches in flight (one per worker) and `--max-time` starts no new batch
 once reached (batches in flight finish); the next run resumes. A failing worker stores nothing of its batch: the
 run stops dispatching, commits the batches still in flight and exits with the error. It runs at below-normal
 priority (Windows `BELOW_NORMAL_PRIORITY_CLASS`, Linux nice 10, inherited by worker processes; `--priority normal`
 to opt out) with `--workers` × `--threads`. The model defaults to the one of the index (else e5-base; also for `model fetch` and `bench-embed`); another model is refused unless
-`--reembed`, which drops the old vectors. Missing model files are a `not_found` error. Output: `embedded`, `pending`,
+`--reembed`, which drops the old vectors. Missing model files are a `not_found` error. Output: `embedded`, `pending`
+(body and attachment chunks; `attachment_chunks: {embedded, pending}` for the attachment part), `dropped`,
 `complete`, `interrupted`, `passages_per_s`, `load_ms`, `elapsed_ms`, model, workers, threads, priority.
 
 `sync` runs the same step after indexing, within what is left of `--max-time`, with the same options. Without model
@@ -358,9 +373,12 @@ files indexing still completes and the summary says `"embedding": {"skipped": "m
 model fetch"}`. `status` adds `embedding`: model, revision, dims, vectors, the scope counts above and a scope
 summary.
 
-Time estimate: chunks to embed (`pending` from `scope`) ÷ passages/s (from `bench-embed` with the same `--workers`
-and `--threads`) = seconds; e.g. 40,000 chunks at 8.19 passages/s (laptop above, 4 × 3, e5-small) ≈ 81 min. Size: about 2 MB per 1,000 e5-small vectors (measured: 384 × 4 bytes plus row and page
-overhead).
+Time estimate: chunks to embed (`pending` + `attachment_chunks.pending` from `scope`, i.e. body chunks plus
+min(chunks, cap) per distinct attachment content) ÷ passages/s (from `bench-embed` with the same `--workers`
+and `--threads`) = seconds; e.g. 40,000 chunks at 8.19 passages/s (laptop above, 4 × 3, e5-small) ≈ 81 min. With
+attachments, the owner's mailbox adds at most ~10,000 chunks (doctor estimate; the 2 M-character TXT counts 30, not
+~190,000): ~50,000 chunks ≈ 1 h 42 min at that rate (e5-base is slower: use its `bench-embed` rate). Size: about
+2 MB per 1,000 e5-small vectors (measured: 384 × 4 bytes plus row and page overhead).
 
 Parity with sentence-transformers (`scripts/e5_reference.py` → `tests/fixtures/e5_reference.json`):
 `E5_SMALL_DIR=... E5_BASE_DIR=... cargo test --release --features index --test embed_parity -- --ignored --nocapture`.

@@ -106,8 +106,9 @@ enum Cmd {
         #[command(flatten)]
         embed: EmbedArgs,
     },
-    /// Embed pending chunks of the embedding scope, newest message first.
-    /// Commits every batch: Ctrl-C loses at most the batches in flight (one
+    /// Embed pending chunks of the embedding scope: body chunks newest
+    /// message first, then attachment chunks (up to the scope's cap per
+    /// content) newest referencing message first. Commits every batch: Ctrl-C loses at most the batches in flight (one
     /// per worker), the next run resumes. Prints counts and rates only.
     Embed {
         /// Start no new batch after this long (90s, 30m, 2h); batches in
@@ -133,14 +134,19 @@ enum Cmd {
         /// `search -F`); repeatable = any. Replaces the stored folders.
         #[arg(short = 'F', long = "folder")]
         folders: Vec<String>,
+        /// Attachment chunks to embed per distinct content, from its start
+        /// (default 30, ~50,000 chars; 0 = none). Keyword search covers the
+        /// whole text. Raising it embeds the rest; lowering it keeps vectors.
+        #[arg(long)]
+        attachment_chunks: Option<u32>,
         /// Attachment types to index (comma-separated); replaces the stored list.
         #[arg(long, value_enum, value_delimiter = ',')]
         attachment_types: Option<Vec<extract::Kind>>,
         /// Largest attachment to read, in MB (default 20).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=100))]
         attachment_max_mb: Option<u64>,
-        /// Reset both scopes to their defaults (everything; every attachment type, 20 MB).
-        #[arg(long, conflicts_with_all = ["embed_since", "embed_until", "folders", "attachment_types", "attachment_max_mb"])]
+        /// Reset both scopes to their defaults (everything, 30 attachment chunks; every attachment type, 20 MB).
+        #[arg(long, conflicts_with_all = ["embed_since", "embed_until", "folders", "attachment_chunks", "attachment_types", "attachment_max_mb"])]
         clear: bool,
     },
     /// Search the index. Best chunk per message. keyword: every word (FTS5,
@@ -487,8 +493,20 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let m = embed.model(&c)?;
             embed_step(&mut c, embed, m, start, max_time, false)?
         }
-        Cmd::Scope { embed_since, embed_until, folders, attachment_types, attachment_max_mb, clear } => {
-            let embedding = clear || embed_since.is_some() || embed_until.is_some() || !folders.is_empty();
+        Cmd::Scope {
+            embed_since,
+            embed_until,
+            folders,
+            attachment_chunks,
+            attachment_types,
+            attachment_max_mb,
+            clear,
+        } => {
+            let embedding = clear
+                || embed_since.is_some()
+                || embed_until.is_some()
+                || !folders.is_empty()
+                || attachment_chunks.is_some();
             let attachments = clear || attachment_types.is_some() || attachment_max_mb.is_some();
             let mut requeued = None;
             let c = if embedding || attachments {
@@ -506,6 +524,9 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                     }
                     if !folders.is_empty() {
                         s.folders = folders;
+                    }
+                    if let Some(n) = attachment_chunks {
+                        s.attachment_chunks = n;
                     }
                     vectors::set_scope(&c, &s)?;
                 }

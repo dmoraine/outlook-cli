@@ -121,6 +121,17 @@ const MIGRATIONS: &[&str] = &[
      CREATE TRIGGER attachment_chunks_ad AFTER DELETE ON attachment_chunks BEGIN
         INSERT INTO attachment_fts(attachment_fts, rowid, text) VALUES ('delete', old.id, old.text);
      END;",
+    // Attachment chunk vectors: own table, as attachment chunk ids overlap
+    // body chunk ids. Same rules as `vectors`; deleted with their chunk.
+    "CREATE TABLE attachment_vectors (
+        chunk INTEGER NOT NULL REFERENCES attachment_chunks(id),
+        model TEXT NOT NULL,
+        revision TEXT NOT NULL,
+        vec BLOB NOT NULL,
+        PRIMARY KEY (chunk, model));
+     CREATE TRIGGER attachment_chunks_vectors_ad AFTER DELETE ON attachment_chunks BEGIN
+        DELETE FROM attachment_vectors WHERE chunk = old.id;
+     END;",
 ];
 
 /// %LOCALAPPDATA%\outlook-cli on Windows, $XDG_DATA_HOME/outlook-cli elsewhere.
@@ -268,6 +279,44 @@ mod tests {
         c.execute("INSERT INTO messages(id, ident, received, has_attachments) VALUES (1, 'mid:x', 0, 1)", []).unwrap();
         migrate(&mut c).unwrap();
         assert_eq!(attach::pending(&c).unwrap(), 1, "indexed before attachments: to backfill");
+    }
+
+    /// An S4c index with e5-base body vectors: they stay valid, attachment
+    /// chunks are queued for embedding.
+    #[test]
+    fn attachment_vectors_migration_keeps_body_vectors() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT)").unwrap();
+        for (i, sql) in MIGRATIONS[..5].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.execute("INSERT INTO schema_version(version) VALUES (?1)", [i as i64 + 1]).unwrap();
+        }
+        let m = model::get("e5-base").unwrap();
+        let blob = vectors::to_blob(&vec![0.5; m.dims], m.dims).unwrap();
+        c.execute_batch(
+            "INSERT INTO messages(id, ident, received, has_attachments, attachments_done) VALUES (1, 'mid:x', 0, 1, 1);
+             INSERT INTO chunks(id, message, seq, text) VALUES (1, 1, 0, 'body');
+             INSERT INTO attachment_contents(sha256, kind, size, outcome, extracted_at) VALUES ('s', 'pdf', 10, 'ok', 0);
+             INSERT INTO message_attachments(message, idx, name, sha256) VALUES (1, 0, 'a.pdf', 's');
+             INSERT INTO attachment_chunks(id, sha256, seq, text) VALUES (1, 's', 0, 'one'), (2, 's', 1, 'two');",
+        )
+        .unwrap();
+        c.execute("INSERT INTO vectors VALUES (1, ?1, ?2, ?3)", rusqlite::params![m.name, m.revision, blob]).unwrap();
+        c.execute_batch(&format!(
+            "INSERT INTO meta VALUES ('embed_model', '{}'), ('embed_revision', '{}')",
+            m.name, m.revision
+        ))
+        .unwrap();
+        migrate(&mut c).unwrap();
+        assert_eq!(schema_version(&c).unwrap(), MIGRATIONS.len());
+        let kept: Vec<u8> = c.query_row("SELECT vec FROM vectors WHERE chunk = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, blob);
+        vectors::check_model(&c, m, false).unwrap();
+        let v = vectors::counts(&c).unwrap();
+        assert_eq!((v["embedded"].as_i64(), v["pending"].as_i64()), (Some(1), Some(0)), "{v}");
+        let a = &v["attachment_chunks"];
+        assert_eq!((a["chunks"].as_i64(), a["pending"].as_i64(), a["embedded"].as_i64()), (Some(2), Some(2), Some(0)));
+        assert_eq!(a["cap"], 30, "{v}");
     }
 
     #[test]

@@ -1,8 +1,7 @@
 //! `outlook-index search`: keyword (FTS5), semantic (brute-force cosine over
 //! the stored vectors) and hybrid (RRF of both), plus `status`.
 
-use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value as Json, json};
@@ -132,7 +131,8 @@ pub fn plan(
     let stored = current_model(c)?;
     let has = |name: &str, rev: Option<&str>| {
         c.query_row(
-            "SELECT 1 FROM vectors WHERE model = ?1 AND (?2 IS NULL OR revision = ?2) LIMIT 1",
+            "SELECT 1 FROM vectors WHERE model = ?1 AND (?2 IS NULL OR revision = ?2)
+             UNION ALL SELECT 1 FROM attachment_vectors WHERE model = ?1 AND (?2 IS NULL OR revision = ?2) LIMIT 1",
             params![name, rev],
             |_| Ok(()),
         )
@@ -248,84 +248,70 @@ fn keyword_leg(c: &Connection, q: &Query, expr: &str, folders: &str, limit: usiz
     Ok(out)
 }
 
-/// A message's best chunk, ordered by score then lower message id.
-#[derive(PartialEq)]
-struct Best(f32, i64, i64);
-
-impl Eq for Best {}
-
-impl Ord for Best {
-    fn cmp(&self, o: &Self) -> Ordering {
-        self.0.total_cmp(&o.0).then(o.1.cmp(&self.1))
-    }
+/// Body vectors of ?1 at revision ?6 in message order, with the FILTER
+/// params; then the attachment vectors, once per message carrying the
+/// content (attachment index last).
+fn semantic_sql() -> [String; 2] {
+    [
+        format!(
+            "SELECT c.message, c.id, v.vec, {PEOPLE}, NULL
+             FROM chunks c INDEXED BY chunks_message
+             JOIN vectors v ON v.chunk = c.id AND v.model = ?1 AND v.revision = ?6
+             JOIN messages m ON m.id = c.message
+             WHERE {FILTER}
+             ORDER BY c.message"
+        ),
+        format!(
+            "SELECT ma.message, a.id, v.vec, {PEOPLE}, ma.idx
+             FROM attachment_vectors v JOIN attachment_chunks a ON a.id = v.chunk
+             JOIN message_attachments ma ON ma.sha256 = a.sha256
+             JOIN messages m ON m.id = ma.message
+             WHERE v.model = ?1 AND v.revision = ?6 AND {FILTER}"
+        ),
+    ]
 }
 
-impl PartialOrd for Best {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-
-/// Vectors of ?1 at revision ?6 in message order, with the FILTER params.
-fn semantic_sql() -> String {
-    format!(
-        "SELECT c.message, c.id, v.vec, {PEOPLE}
-         FROM chunks c INDEXED BY chunks_message
-         JOIN vectors v ON v.chunk = c.id AND v.model = ?1 AND v.revision = ?6
-         JOIN messages m ON m.id = c.message
-         WHERE {FILTER}
-         ORDER BY c.message"
-    )
-}
-
-/// Semantic leg: streams the vectors of `m` in message order (no sort, no
-/// load of all vectors), cosine = dot product of unit vectors, best chunk
-/// per message, keeps the `limit` best messages in a min-heap.
+/// Semantic leg: streams the body and attachment vectors of `m` (no load
+/// of all vectors), cosine = dot product of unit vectors, best chunk per
+/// message (body on a tie), the `limit` best messages; ties by message id.
 // ponytail: brute force, O(vectors) per query; an ANN index is deferred.
 fn semantic_leg(c: &Connection, q: &Query, m: &Model, v: &[f32], folders: &str, limit: usize) -> Result<Vec<Leg>> {
     if v.len() != m.dims {
         return Err(Error::Format(format!("query vector of {} dimensions, expected {}", v.len(), m.dims)));
     }
     let people = People::new(q);
-    let mut st = c.prepare(&semantic_sql()).map_err(db_err)?;
-    let mut rows =
-        st.query(params![m.name, q.since, q.until, folders, q.has_attachments, m.revision]).map_err(db_err)?;
-    let mut heap = BinaryHeap::with_capacity(limit + 1);
-    let mut push = |b: Option<Best>| {
-        if let Some(b) = b {
-            heap.push(Reverse(b));
-            if heap.len() > limit {
-                heap.pop();
+    // message -> people filter passed; best (score, chunk, attachment index).
+    let (mut ok, mut best) = (HashMap::<i64, bool>::new(), HashMap::<i64, (f32, i64, Option<i64>)>::new());
+    for sql in semantic_sql() {
+        let mut st = c.prepare(&sql).map_err(db_err)?;
+        let mut rows =
+            st.query(params![m.name, q.since, q.until, folders, q.has_attachments, m.revision]).map_err(db_err)?;
+        while let Some(r) = rows.next().map_err(db_err)? {
+            let message: i64 = r.get(0).map_err(db_err)?;
+            let pass = match ok.get(&message) {
+                Some(&p) => p,
+                None => *ok.entry(message).or_insert(people.ok(r, 3)?),
+            };
+            if !pass {
+                continue;
+            }
+            let blob = r.get_ref(2).map_err(db_err)?.as_blob().map_err(|e| Error::Format(e.to_string()))?;
+            if blob.len() != m.dims * 4 {
+                return Err(Error::Format(format!("stored vector of {} bytes, expected {}", blob.len(), m.dims * 4)));
+            }
+            let s: f32 = blob.as_chunks::<4>().0.iter().zip(v).map(|(b, x)| f32::from_le_bytes(*b) * x).sum();
+            let b = best.entry(message).or_insert((f32::NEG_INFINITY, 0, None));
+            if s > b.0 {
+                *b = (s, r.get(1).map_err(db_err)?, r.get(8).map_err(db_err)?);
             }
         }
-    };
-    let (mut cur, mut ok, mut best) = (None, false, None::<Best>);
-    while let Some(r) = rows.next().map_err(db_err)? {
-        let message: i64 = r.get(0).map_err(db_err)?;
-        if cur != Some(message) {
-            push(best.take());
-            cur = Some(message);
-            ok = people.ok(r, 3)?;
-        }
-        if !ok {
-            continue;
-        }
-        let blob = r.get_ref(2).map_err(db_err)?.as_blob().map_err(|e| Error::Format(e.to_string()))?;
-        if blob.len() != m.dims * 4 {
-            return Err(Error::Format(format!("stored vector of {} bytes, expected {}", blob.len(), m.dims * 4)));
-        }
-        let s: f32 = blob.as_chunks::<4>().0.iter().zip(v).map(|(b, x)| f32::from_le_bytes(*b) * x).sum();
-        let b = Best(s, message, r.get(1).map_err(db_err)?);
-        if best.as_ref().is_none_or(|x| b.0 > x.0) {
-            best = Some(b);
-        }
     }
-    push(best);
-    let mut out = heap.into_sorted_vec();
+    let mut out: Vec<_> = best.into_iter().collect();
+    out.sort_by(|a, b| b.1.0.total_cmp(&a.1.0).then(a.0.cmp(&b.0)));
     out.truncate(limit);
     Ok(out
         .into_iter()
-        .map(|Reverse(b)| Leg { message: b.1, chunk: b.2, score: b.0 as f64, excerpt: None, attachment: None })
+        .map(|(message, (s, chunk, attachment))| Leg { message, chunk, score: s as f64, excerpt: None, attachment })
         .collect())
 }
 
@@ -361,11 +347,15 @@ fn hit(c: &Connection, q: &Query, folders: &str, leg: &Leg, ranks: Json, scores:
         Some(e) => e.clone(),
         // The chunk without the overlap it shares with the previous one.
         None => {
+            let (t, owner) =
+                if leg.attachment.is_some() { ("attachment_chunks", "sha256") } else { ("chunks", "message") };
             let (text, overlap): (String, Option<i64>) = c
                 .query_row(
-                    "SELECT c.text, (SELECT p.end_char FROM chunks p WHERE p.message = c.message
-                                     AND p.seq = c.seq - 1) - c.start_char
-                     FROM chunks c WHERE c.id = ?1",
+                    &format!(
+                        "SELECT c.text, (SELECT p.end_char FROM {t} p WHERE p.{owner} = c.{owner}
+                                         AND p.seq = c.seq - 1) - c.start_char
+                         FROM {t} c WHERE c.id = ?1"
+                    ),
                     [leg.chunk],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
@@ -788,20 +778,62 @@ mod tests {
         assert_eq!(h["source"]["name"], "notes.docx");
     }
 
-    #[test]
-    fn attachment_chunks_not_embedded() {
-        let (mut c, _) = with_attachments();
-        let body: i64 = c.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
-        assert_eq!(status(&c).unwrap()["embedding"]["pending"], body, "attachments are not in the embedding scope");
+    /// with_attachments() plus 0x804, whose meeting exists only in its
+    /// attachment ("réunion"), embedded.
+    fn meeting_in_attachment() -> (Connection, Fake) {
+        let (mut c, mut f) = with_attachments();
+        f.add(0x804, 0x22, Some("<r@fict.invalid>"), "Docs", "Files for you.");
+        f.attach(0x804, "logo.txt", None, false, b"Colour chart.");
+        f.attach(0x804, "cr.txt", None, false, "Compte rendu de la réunion du jeudi.".as_bytes());
+        let mut x = |b: &[u8], n: Option<&str>, m: Option<&str>| crate::index::extract::extract(b, n, m);
+        crate::index::sync::sync_with(&mut c, &mut f, Some(&mut x), &Options::default()).unwrap();
         embed(&mut c);
-        let v: i64 = c.query_row("SELECT COUNT(*) FROM vectors", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, body);
-        // Hybrid: the keyword leg still finds attachment words.
-        let h = search(&c, &sem("plimsoll", Mode::Hybrid)).unwrap();
-        let hit = h.iter().find(|h| h["id"] == 0x704).unwrap();
-        assert!(hit["keyword_rank"].is_u64() && hit["source"]["kind"] == "attachment", "{hit}");
+        (c, f)
+    }
+
+    #[test]
+    fn semantic_finds_attachment_meaning() {
+        let (c, _) = meeting_in_attachment();
         let s = status(&c).unwrap();
-        assert_eq!((s["attachments"]["distinct"].as_u64(), s["attachments"]["chunks"].as_u64()), (Some(3), Some(3)));
+        assert_eq!(s["embedding"]["attachment_chunks"]["embedded"], 5, "{s}");
+        assert_eq!(ids(&c, &q("meeting")), Vec::<u64>::new(), "keyword: the word is not there");
+        let hits = search(&c, &sem("meeting", Mode::Semantic)).unwrap();
+        let h = &hits[0];
+        assert_eq!(h["id"], 0x804, "{hits:?}");
+        assert_eq!(h["source"], json!({ "kind": "attachment", "index": 1, "name": "cr.txt", "type": "txt" }));
+        assert_eq!(h["excerpt"], "Compte rendu de la réunion du jeudi.");
+        let n = hits.iter().filter(|h| h["id"] == 0x804).count();
+        assert_eq!(n, 1, "one hit per message, best chunk body or attachment");
+        // Filters through the carrying message.
+        let none = |f: &dyn Fn(&mut Query)| {
+            let mut x = sem("meeting", Mode::Semantic);
+            f(&mut x);
+            !ids(&c, &x).contains(&0x804)
+        };
+        assert!(none(&|x| x.folders = vec!["Archive".into()]));
+        assert!(none(&|x| x.since = Some(134_000_000_000_000_000 + 0x805 * 10_000_000)));
+        assert!(none(&|x| x.from = vec!["nobody".into()]));
+        assert!(!none(&|x| x.has_attachments = true));
+        // A body chunk still wins for a body meaning.
+        let h = &search(&c, &sem("lunch", Mode::Semantic)).unwrap()[0];
+        assert_eq!((h["id"].as_u64(), h["source"].as_str()), (Some(0x224), Some("body")));
+    }
+
+    #[test]
+    fn hybrid_fuses_attachment_vectors() {
+        let (c, _) = meeting_in_attachment();
+        let hits = search(&c, &sem("meeting plimsoll", Mode::Hybrid)).unwrap();
+        let h = hits.iter().find(|h| h["id"] == 0x804).unwrap();
+        assert!(h["keyword_rank"].is_null() && h["semantic_rank"].is_u64(), "semantic only: {h}");
+        assert_eq!(h["source"]["name"], "cr.txt", "{h}");
+        let h = hits.iter().find(|h| h["id"] == 0x704).unwrap();
+        assert!(h["keyword_rank"].is_u64() && h["source"]["kind"] == "attachment", "{h}");
+        let s = status(&c).unwrap();
+        assert_eq!((s["attachments"]["distinct"].as_u64(), s["attachments"]["chunks"].as_u64()), (Some(5), Some(5)));
+        let t = serde_json::to_string(&s).unwrap();
+        for m in ["cr.txt", "réunion", "plimsoll", "Plimsoll", "notes", "offer"] {
+            assert!(!t.contains(m), "status leaks {m:?}");
+        }
     }
 
     // --- semantic and hybrid ---
@@ -1082,13 +1114,15 @@ mod tests {
     #[test]
     fn semantic_scan_needs_no_sort() {
         let (c, _) = more();
-        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {}", semantic_sql())).unwrap();
-        let plan: Vec<String> = st
-            .query_map(params!["e5-small", None::<i64>, None::<i64>, "[]", false, "r"], |r| r.get(3))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{plan:?}");
+        for sql in semantic_sql() {
+            let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan: Vec<String> = st
+                .query_map(params!["e5-small", None::<i64>, None::<i64>, "[]", false, "r"], |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(!plan.iter().any(|p| p.contains("TEMP B-TREE")), "{plan:?}");
+        }
     }
 
     /// Synthetic index of N vectors (dim 384, 2 chunks per message): semantic
