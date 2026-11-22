@@ -9,6 +9,7 @@ pub mod search;
 pub mod sync;
 pub mod text;
 pub mod vectors;
+pub mod worker;
 
 use std::path::{Path, PathBuf};
 

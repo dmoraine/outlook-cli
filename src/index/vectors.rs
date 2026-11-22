@@ -1,6 +1,7 @@
 //! Stored vectors (one row per chunk and model), the persisted embedding
 //! scope and the resumable, newest-first embedding run.
 
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -12,11 +13,12 @@ use super::embed::Embedder;
 use super::model::{self, Model};
 use super::search::folder_ids;
 use super::sync::{get_meta, set_meta};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, guarded};
 use crate::timeutil::format_ft;
 
-/// What the embedding run needs from a model. A deterministic fake in tests.
-pub trait Embed {
+/// What the embedding run needs from a model: the in-process model, a
+/// worker process, or a deterministic fake in tests.
+pub trait Embed: Send {
     fn model(&self) -> &'static Model;
     /// Unit vectors of `model().dims` floats; adds the "passage: " prefix.
     fn passages(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
@@ -132,18 +134,26 @@ pub fn check_model(c: &Connection, m: &Model, reembed: bool) -> Result<()> {
 pub struct Options {
     /// Passages per model call and per transaction.
     pub batch: usize,
-    /// Stop after the first batch that ends past this budget.
+    /// Start no new batch past this budget.
     pub max_time: Option<Duration>,
     /// Drop the vectors of any other model first.
     pub reembed: bool,
 }
 
+/// A batch: (chunk id, passage) rows.
+type Rows = Vec<(i64, String)>;
+
 /// Embed the pending in-scope chunks, newest message first: passage =
-/// subject + newline + chunk text. One transaction per batch, so an
-/// interrupted run loses at most one batch and resumes. Counts only.
-pub fn run(c: &mut Connection, e: &mut dyn Embed, o: &Options) -> Result<Json> {
+/// subject + newline + chunk text. Each of `es` (a worker) embeds one
+/// batch at a time, in parallel; this thread is the only DB writer and
+/// commits each batch in its own transaction as it completes, so commits
+/// may interleave slightly out of newest-first order. An interrupted run loses at most the in-flight
+/// batches and resumes. A failed batch stores nothing; the run stops
+/// dispatching, commits the batches still in flight and returns the first
+/// error. Counts only.
+pub fn run<E: Embed + ?Sized>(c: &mut Connection, es: &mut [&mut E], o: &Options) -> Result<Json> {
     let start = Instant::now();
-    let m = e.model();
+    let m = es.first().ok_or_else(|| Error::Usage("no embedding worker".into()))?.model();
     check_model(c, m, o.reembed)?;
     let tx = c.transaction().map_err(db_err)?;
     let dropped = tx
@@ -167,42 +177,56 @@ pub fn run(c: &mut Connection, e: &mut dyn Embed, o: &Options) -> Result<Json> {
         .collect::<rusqlite::Result<_>>()
         .map_err(db_err)?;
 
+    let workers = es.len();
     let t = Instant::now();
     let (mut embedded, mut interrupted) = (0u64, false);
-    for (i, group) in ids.chunks(o.batch.max(1)).enumerate() {
-        if i > 0 && o.max_time.is_some_and(|max| start.elapsed() > max) {
-            interrupted = true;
-            break;
+    let (job_tx, job_rx) = mpsc::channel::<Rows>();
+    let job_rx = Mutex::new(job_rx);
+    std::thread::scope(|sc| -> Result<()> {
+        // Dropped on return, closing the channel: the workers stop.
+        let job_tx = job_tx;
+        let (res_tx, res_rx) = mpsc::channel::<(Rows, Result<Vec<Vec<f32>>>)>();
+        for e in es.iter_mut() {
+            let (job_rx, res_tx) = (&job_rx, res_tx.clone());
+            sc.spawn(move || {
+                loop {
+                    // Lock released before embedding; ends when the channel closes.
+                    let Ok(rows) = job_rx.lock().unwrap().recv() else { break };
+                    let texts: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+                    let r = guarded(|| e.passages(&texts));
+                    if res_tx.send((rows, r)).is_err() {
+                        break;
+                    }
+                }
+            });
         }
-        let mut rows = Vec::with_capacity(group.len());
-        for &id in group {
-            let text = c
-                .query_row(
-                    "SELECT COALESCE(m.subject, '') || char(10) || c.text FROM chunks c
-                     JOIN messages m ON m.id = c.message WHERE c.id = ?1",
-                    [id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(db_err)?;
-            rows.extend(text.map(|t| (id, t)));
-        }
-        let vecs = e.passages(&rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>())?;
-        if vecs.len() != rows.len() {
-            return Err(Error::Format(format!("{} vectors for {} passages", vecs.len(), rows.len())));
-        }
-        let tx = c.transaction().map_err(db_err)?;
-        {
-            let mut ins = tx
-                .prepare_cached("INSERT OR REPLACE INTO vectors(chunk, model, revision, vec) VALUES (?1, ?2, ?3, ?4)")
-                .map_err(db_err)?;
-            for ((id, _), v) in rows.iter().zip(&vecs) {
-                ins.execute(params![id, m.name, m.revision, to_blob(v, m.dims)?]).map_err(db_err)?;
+        drop(res_tx);
+        let (mut groups, mut in_flight, mut sent, mut failed) = (ids.chunks(o.batch.max(1)), 0, 0, None);
+        loop {
+            while failed.is_none() && !interrupted && in_flight < workers {
+                let Some(group) = groups.next() else { break };
+                // The first batch always runs.
+                interrupted = sent > 0 && o.max_time.is_some_and(|max| start.elapsed() > max);
+                if interrupted {
+                    break;
+                }
+                job_tx.send(texts(c, group)?).map_err(|_| Error::Format("embedding worker stopped".into()))?;
+                (in_flight, sent) = (in_flight + 1, sent + 1);
+            }
+            if in_flight == 0 {
+                break;
+            }
+            let (rows, r) = res_rx.recv().map_err(|_| Error::Format("embedding worker stopped".into()))?;
+            in_flight -= 1;
+            match r.and_then(|vecs| store(c, m, &rows, &vecs)) {
+                Ok(()) => embedded += rows.len() as u64,
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
             }
         }
-        tx.commit().map_err(db_err)?;
-        embedded += rows.len() as u64;
-    }
+        failed.map_or(Ok(()), Err)
+    })?;
     let secs = t.elapsed().as_secs_f64();
     let pending = counts(c)?["pending"].as_u64().unwrap_or(0);
     Ok(json!({
@@ -210,6 +234,7 @@ pub fn run(c: &mut Connection, e: &mut dyn Embed, o: &Options) -> Result<Json> {
         "revision": m.revision,
         "dims": m.dims,
         "batch": o.batch,
+        "workers": workers,
         "embedded": embedded,
         "dropped": dropped,
         "pending": pending,
@@ -218,6 +243,41 @@ pub fn run(c: &mut Connection, e: &mut dyn Embed, o: &Options) -> Result<Json> {
         "passages_per_s": if secs > 0.0 { (embedded as f64 / secs * 100.0).round() / 100.0 } else { 0.0 },
         "elapsed_ms": start.elapsed().as_millis() as u64,
     }))
+}
+
+/// Passages of the chunks still present.
+fn texts(c: &Connection, ids: &[i64]) -> Result<Rows> {
+    let mut rows = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let text = c
+            .query_row(
+                "SELECT COALESCE(m.subject, '') || char(10) || c.text FROM chunks c
+                 JOIN messages m ON m.id = c.message WHERE c.id = ?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        rows.extend(text.map(|t| (id, t)));
+    }
+    Ok(rows)
+}
+
+/// One batch, one transaction: all its vectors or none.
+fn store(c: &mut Connection, m: &Model, rows: &Rows, vecs: &[Vec<f32>]) -> Result<()> {
+    if vecs.len() != rows.len() {
+        return Err(Error::Format(format!("{} vectors for {} passages", vecs.len(), rows.len())));
+    }
+    let tx = c.transaction().map_err(db_err)?;
+    {
+        let mut ins = tx
+            .prepare_cached("INSERT OR REPLACE INTO vectors(chunk, model, revision, vec) VALUES (?1, ?2, ?3, ?4)")
+            .map_err(db_err)?;
+        for ((id, _), v) in rows.iter().zip(vecs) {
+            ins.execute(params![id, m.name, m.revision, to_blob(v, m.dims)?]).map_err(db_err)?;
+        }
+    }
+    tx.commit().map_err(db_err)
 }
 
 /// Embedding counts and scope summary for `status` and `scope`. No names:
@@ -302,15 +362,37 @@ mod tests {
     use crate::index::sync::fake::*;
     use crate::index::sync::{self, sync};
 
+    /// How the fake fails on a passage containing its marker.
+    #[derive(Clone, Copy)]
+    enum Fail {
+        Err,
+        /// One float short: refused inside the batch transaction.
+        Dims,
+        Panic,
+    }
+
     /// Deterministic fake: hashed text -> vector. Records what it embeds.
     struct Hashed {
         model: &'static Model,
         dims: usize,
         seen: Vec<String>,
+        fail: Option<(&'static str, Fail)>,
     }
 
     fn hashed(m: usize) -> Hashed {
-        Hashed { model: &MODELS[m], dims: MODELS[m].dims, seen: Vec::new() }
+        Hashed { model: &MODELS[m], dims: MODELS[m].dims, seen: Vec::new(), fail: None }
+    }
+
+    /// `run` with one worker.
+    fn run1(c: &mut Connection, e: &mut Hashed, o: &Options) -> Result<Json> {
+        run(c, &mut [e], o)
+    }
+
+    /// `run` with `n` workers like `e`; returns what each one embedded.
+    fn run_n(c: &mut Connection, n: usize, e: &Hashed, o: &Options) -> (Result<Json>, Vec<Vec<String>>) {
+        let mut es: Vec<Hashed> = (0..n).map(|_| Hashed { seen: Vec::new(), ..*e }).collect();
+        let r = run(c, &mut es.iter_mut().collect::<Vec<_>>(), o);
+        (r, es.into_iter().map(|e| e.seen).collect())
     }
 
     impl Embed for Hashed {
@@ -319,13 +401,20 @@ mod tests {
         }
         fn passages(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.seen.extend(texts.iter().map(|t| t.to_string()));
+            let fail = self.fail.filter(|(m, _)| texts.iter().any(|t| t.contains(m))).map(|f| f.1);
+            match fail {
+                Some(Fail::Err) => return Err(Error::Format("fake failure".into())),
+                Some(Fail::Panic) => panic!("fake panic"),
+                _ => {}
+            }
             Ok(texts
                 .iter()
                 .map(|t| {
                     let mut h = DefaultHasher::new();
                     t.hash(&mut h);
                     let mut x = h.finish() | 1;
-                    (0..self.dims)
+                    let short = matches!(fail, Some(Fail::Dims)) && self.fail.is_some_and(|(m, _)| t.contains(m));
+                    (0..self.dims - short as usize)
                         .map(|_| {
                             x ^= x << 13;
                             x ^= x >> 7;
@@ -371,7 +460,7 @@ mod tests {
         let mut f = mailbox();
         let mut c = indexed(&mut f);
         let mut e = Hashed { dims: 383, ..hashed(0) };
-        assert!(run(&mut c, &mut e, &opts(8)).is_err());
+        assert!(run1(&mut c, &mut e, &opts(8)).is_err());
         assert_eq!(count(&c, "SELECT COUNT(*) FROM vectors"), 0);
     }
 
@@ -380,7 +469,7 @@ mod tests {
         let mut f = mailbox();
         let mut c = indexed(&mut f);
         let mut e = hashed(0);
-        let s = run(&mut c, &mut e, &opts(2)).unwrap();
+        let s = run1(&mut c, &mut e, &opts(2)).unwrap();
         assert_eq!((s["embedded"].as_u64(), s["pending"].as_u64()), (Some(3), Some(0)), "{s}");
         assert_eq!((s["complete"].as_bool(), s["dims"].as_u64()), (Some(true), Some(384)), "{s}");
         let firsts: Vec<&str> = e.seen.iter().map(|t| t.split('\n').next().unwrap()).collect();
@@ -389,7 +478,7 @@ mod tests {
         assert_eq!(count(&c, "SELECT COUNT(*) FROM vectors WHERE length(vec) = 384 * 4 AND model = 'e5-small'"), 3);
         assert_eq!(current_model(&c).unwrap().as_deref(), Some("e5-small"));
         // Nothing pending: a second run embeds nothing.
-        assert_eq!(run(&mut c, &mut e, &opts(2)).unwrap()["embedded"], 0);
+        assert_eq!(run1(&mut c, &mut e, &opts(2)).unwrap()["embedded"], 0);
         assert_eq!(e.seen.len(), 3);
     }
 
@@ -412,7 +501,7 @@ mod tests {
         set(&c, inbox_late);
         assert_eq!(n(&c), 1);
         let mut e = hashed(0);
-        assert_eq!(run(&mut c, &mut e, &opts(8)).unwrap()["embedded"], 1);
+        assert_eq!(run1(&mut c, &mut e, &opts(8)).unwrap()["embedded"], 1);
         assert_eq!(e.seen, ["Lunch\nLunch on friday at noon."]);
 
         // Errors: unknown folder, empty range; the stored scope is unchanged.
@@ -439,13 +528,13 @@ mod tests {
         let mut f = mailbox();
         let mut c = indexed(&mut f);
         set_scope(&c, &Scope { folders: vec!["Inbox".into()], ..Scope::default() }).unwrap();
-        run(&mut c, &mut hashed(0), &opts(8)).unwrap();
+        run1(&mut c, &mut hashed(0), &opts(8)).unwrap();
         set_scope(&c, &Scope { folders: vec!["Archive".into()], ..Scope::default() }).unwrap();
         let v = counts(&c).unwrap();
         assert_eq!((v["vectors"].as_i64(), v["out_of_scope_embedded"].as_i64()), (Some(2), Some(2)), "{v}");
         assert_eq!((v["chunks_in_scope"].as_i64(), v["pending"].as_i64()), (Some(1), Some(1)), "{v}");
         assert_eq!((v["out_of_scope"].as_i64(), v["embedded_pct"].as_f64()), (Some(2), Some(0.0)), "{v}");
-        run(&mut c, &mut hashed(0), &opts(8)).unwrap();
+        run1(&mut c, &mut hashed(0), &opts(8)).unwrap();
         set_scope(&c, &Scope::default()).unwrap();
         let v = counts(&c).unwrap();
         assert_eq!((v["embedded"].as_i64(), v["embedded_pct"].as_f64()), (Some(3), Some(100.0)), "{v}");
@@ -470,33 +559,99 @@ mod tests {
             .unwrap()
     }
 
+    /// Interrupted runs with 1 or 3 workers resume to the 1-worker state.
     #[test]
     fn resume_reaches_the_same_state() {
-        let (mut f1, mut f2) = (bulk(), bulk());
-        let (mut one, mut many) = (indexed(&mut f1), indexed(&mut f2));
+        let mut f1 = bulk();
+        let mut one = indexed(&mut f1);
         let total = count(&one, "SELECT COUNT(*) FROM chunks");
         assert!(total > 14, "{total}");
-        run(&mut one, &mut hashed(0), &opts(3)).unwrap();
-        let o = Options { max_time: Some(Duration::ZERO), ..opts(3) };
-        let mut runs = 0;
-        loop {
-            let s = run(&mut many, &mut hashed(0), &o).unwrap();
-            runs += 1;
-            if s["complete"] == true {
-                break;
+        run1(&mut one, &mut hashed(0), &opts(3)).unwrap();
+        for workers in [1, 3] {
+            let mut f2 = bulk();
+            let mut many = indexed(&mut f2);
+            let o = Options { max_time: Some(Duration::ZERO), ..opts(3) };
+            let mut runs = 0;
+            loop {
+                let s = run_n(&mut many, workers, &hashed(0), &o).0.unwrap();
+                runs += 1;
+                assert_eq!(s["workers"], workers);
+                if s["complete"] == true {
+                    break;
+                }
+                assert_eq!((s["embedded"].as_i64(), s["interrupted"].as_bool()), (Some(3), Some(true)), "{s}");
             }
-            assert_eq!((s["embedded"].as_i64(), s["interrupted"].as_bool()), (Some(3), Some(true)), "{s}");
+            assert_eq!(runs, (total + 2) / 3, "{workers} workers");
+            assert_eq!(vectors(&one), vectors(&many), "{workers} workers");
         }
-        assert_eq!(runs, (total + 2) / 3);
-        assert_eq!(vectors(&one), vectors(&many));
         assert_eq!(vectors(&one).len() as i64, total);
+    }
+
+    /// N workers store exactly the vectors of one worker, whatever the batch.
+    #[test]
+    fn workers_store_the_same_vectors() {
+        let mut f = bulk();
+        let mut one = indexed(&mut f);
+        run1(&mut one, &mut hashed(0), &opts(2)).unwrap();
+        for (workers, batch) in [(2, 2), (3, 1), (4, 5), (8, 2)] {
+            let mut f = bulk();
+            let mut c = indexed(&mut f);
+            let (s, seen) = run_n(&mut c, workers, &hashed(0), &opts(batch));
+            let s = s.unwrap();
+            assert_eq!((s["workers"].as_u64(), s["complete"].as_bool()), (Some(workers as u64), Some(true)), "{s}");
+            assert_eq!(vectors(&one), vectors(&c), "{workers}x{batch}");
+            assert_eq!(seen.iter().map(Vec::len).sum::<usize>(), vectors(&c).len(), "each passage embedded once");
+            assert!(seen.iter().filter(|s| !s.is_empty()).count() > 1, "work shared: {workers}x{batch}");
+        }
+    }
+
+    /// A failing worker (error, wrong vector, panic): the run returns the
+    /// error, every batch is stored whole or not at all, a rerun completes.
+    #[test]
+    fn worker_failure_keeps_batches_whole() {
+        let mut f = bulk();
+        let mut reference = indexed(&mut f);
+        run1(&mut reference, &mut hashed(0), &opts(2)).unwrap();
+        // Chunk ids in commit-independent embedding order, as batches of 2.
+        let order: Vec<i64> = reference
+            .prepare("SELECT c.id FROM chunks c JOIN messages m ON m.id = c.message ORDER BY m.received DESC, m.id DESC, c.seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for fail in [Fail::Err, Fail::Dims, Fail::Panic] {
+            let mut f = bulk();
+            let mut c = indexed(&mut f);
+            // With Dims the error comes inside the batch transaction.
+            let marker = "Bulk text 4.";
+            let e = Hashed { fail: Some((marker, fail)), ..hashed(0) };
+            assert!(run_n(&mut c, 3, &e, &opts(2)).0.is_err());
+            let stored: std::collections::HashSet<i64> = vectors(&c).iter().map(|v| v.0).collect();
+            let mut failed = 0;
+            for group in order.chunks(2) {
+                let n = group.iter().filter(|id| stored.contains(id)).count();
+                assert!(n == 0 || n == group.len(), "partial batch {group:?}");
+                let text: Vec<String> = group
+                    .iter()
+                    .map(|id| c.query_row("SELECT text FROM chunks WHERE id = ?1", [id], |r| r.get(0)).unwrap())
+                    .collect();
+                if text.iter().any(|t| t.contains(marker)) {
+                    assert_eq!(n, 0, "failed batch not stored");
+                    failed += 1;
+                }
+            }
+            assert_eq!(failed, 1);
+            run_n(&mut c, 3, &hashed(0), &opts(2)).0.unwrap();
+            assert_eq!(vectors(&c), vectors(&reference));
+        }
     }
 
     #[test]
     fn deleted_message_drops_its_vectors() {
         let mut f = bulk();
         let mut c = indexed(&mut f);
-        run(&mut c, &mut hashed(0), &opts(8)).unwrap();
+        run1(&mut c, &mut hashed(0), &opts(8)).unwrap();
         let before = count(&c, "SELECT COUNT(*) FROM vectors");
         let gone = count(
             &c,
@@ -513,14 +668,14 @@ mod tests {
     fn model_switch_needs_reembed() {
         let mut f = mailbox();
         let mut c = indexed(&mut f);
-        run(&mut c, &mut hashed(0), &opts(8)).unwrap();
+        run1(&mut c, &mut hashed(0), &opts(8)).unwrap();
         let before = vectors(&c);
-        let e = run(&mut c, &mut hashed(1), &opts(8)).unwrap_err();
+        let e = run1(&mut c, &mut hashed(1), &opts(8)).unwrap_err();
         assert_eq!(e.kind(), "usage");
         assert!(e.to_string().contains("--reembed") && e.to_string().contains("e5-small"), "{e}");
         assert_eq!(vectors(&c), before, "refused: nothing changed");
         assert_eq!(current_model(&c).unwrap().as_deref(), Some("e5-small"));
-        let s = run(&mut c, &mut hashed(1), &Options { reembed: true, ..opts(8) }).unwrap();
+        let s = run1(&mut c, &mut hashed(1), &Options { reembed: true, ..opts(8) }).unwrap();
         assert_eq!((s["dropped"].as_u64(), s["embedded"].as_u64()), (Some(3), Some(3)), "{s}");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM vectors WHERE model = 'e5-base' AND length(vec) = 768 * 4"), 3);
         assert_eq!(count(&c, "SELECT COUNT(*) FROM vectors"), 3);
@@ -545,7 +700,7 @@ mod tests {
         };
         set_scope(&c, &s).unwrap();
         let outputs = [
-            run(&mut c, &mut hashed(0), &opts(2)).unwrap().to_string(),
+            run1(&mut c, &mut hashed(0), &opts(2)).unwrap().to_string(),
             counts(&c).unwrap().to_string(),
             crate::index::search::status(&c).unwrap().to_string(),
         ];
@@ -574,7 +729,7 @@ mod tests {
             |c: &Connection| count(c, "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()");
         let before = bytes(&c);
         let mut e = Embedder::load(&MODELS[0], &dir).unwrap();
-        let s = run(&mut c, &mut e, &opts(crate::index::embed::DEFAULT_BATCH)).unwrap();
+        let s = run(&mut c, &mut [&mut e], &opts(crate::index::embed::DEFAULT_BATCH)).unwrap();
         let n = s["embedded"].as_i64().unwrap();
         assert_eq!(n, count(&c, "SELECT COUNT(*) FROM chunks"));
         eprintln!(

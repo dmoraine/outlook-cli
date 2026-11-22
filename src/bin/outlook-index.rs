@@ -8,7 +8,7 @@ use serde_json::{Value as Json, json};
 use outlook_cli::error::{Error, Result};
 use outlook_cli::index::doctor::{self, StoreSource};
 use outlook_cli::index::embed::{self, Embedder};
-use outlook_cli::index::{self, model, search, sync, vectors};
+use outlook_cli::index::{self, model, search, sync, vectors, worker};
 use outlook_cli::paths::{default_file, native_path};
 use outlook_cli::timeutil::parse_when;
 
@@ -88,10 +88,11 @@ enum Cmd {
         embed: EmbedArgs,
     },
     /// Embed pending chunks of the embedding scope, newest message first.
-    /// Commits every batch: Ctrl-C or --max-time lose at most one batch, the
-    /// next run resumes. Prints counts and rates only.
+    /// Commits every batch: Ctrl-C loses at most the batches in flight (one
+    /// per worker), the next run resumes. Prints counts and rates only.
     Embed {
-        /// Stop after the batch that ends past this long (90s, 30m, 2h).
+        /// Start no new batch after this long (90s, 30m, 2h); batches in
+        /// flight finish.
         #[arg(long)]
         max_time: Option<String>,
         #[command(flatten)]
@@ -175,11 +176,21 @@ enum Cmd {
         /// Approximate duration in seconds.
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         seconds: u64,
-        /// Compute threads. Default: logical CPUs - 1 (at least 1).
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1024))]
-        threads: Option<u64>,
+        #[command(flatten)]
+        par: ParArgs,
         /// Passages per batch.
         #[arg(long, default_value_t = embed::DEFAULT_BATCH as u64, value_parser = clap::value_parser!(u64).range(1..=256))]
+        batch: u64,
+    },
+    /// Internal: one embedding worker process of --workers (frames on
+    /// stdin/stdout, see src/index/worker.rs).
+    #[command(hide = true)]
+    EmbedWorker {
+        #[command(flatten)]
+        model: ModelArgs,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1024))]
+        threads: u64,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
         batch: u64,
     },
 }
@@ -218,9 +229,8 @@ struct EmbedArgs {
     /// Directory with the model files. Default: <data dir>/models/<repository name>.
     #[arg(long, env = "OUTLOOK_INDEX_MODEL_DIR")]
     model_dir: Option<String>,
-    /// Compute threads. Default: logical CPUs - 1 (at least 1).
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1024))]
-    threads: Option<u64>,
+    #[command(flatten)]
+    par: ParArgs,
     /// Passages per batch (one model call, one commit).
     #[arg(long, default_value_t = embed::DEFAULT_BATCH as u64, value_parser = clap::value_parser!(u64).range(1..=256))]
     batch: u64,
@@ -246,11 +256,33 @@ impl EmbedArgs {
     }
 }
 
-/// Compute threads for candle (rayon reads RAYON_NUM_THREADS on first use).
-fn set_threads(threads: Option<u64>) -> usize {
-    let threads = threads.map_or_else(embed::default_threads, |n| n as usize);
+#[derive(Args)]
+struct ParArgs {
+    /// Batches embedded at once. More than 1: that many worker processes,
+    /// each with its own copy of the model. Default: (logical CPUs - 2) / 3,
+    /// at least 1.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
+    workers: Option<u64>,
+    /// Compute threads per worker.
+    #[arg(long, default_value_t = embed::DEFAULT_THREADS as u64, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    threads: u64,
+}
+
+impl ParArgs {
+    /// Effective (workers, threads); sets this process's compute threads
+    /// (worker processes get --threads).
+    fn apply(&self) -> (usize, usize) {
+        let workers = self.workers.map_or_else(|| embed::default_workers(embed::logical_cpus()), |n| n as usize);
+        (workers, set_threads(self.threads as usize))
+    }
+}
+
+/// Compute threads for candle: its matmul split
+/// (`candle_core::utils::get_num_threads`) and rayon's global pool both
+/// read RAYON_NUM_THREADS.
+fn set_threads(threads: usize) -> usize {
     // SAFETY: no other thread exists yet; candle and rayon read this
-    // variable on first use.
+    // variable on use.
     unsafe { std::env::set_var("RAYON_NUM_THREADS", threads.to_string()) };
     threads
 }
@@ -267,26 +299,47 @@ fn embed_step(
     max_time: Option<Duration>,
     missing_ok: bool,
 ) -> Result<Json> {
-    let threads = set_threads(a.threads);
+    let (workers, threads) = a.par.apply();
+    // Before the workers start: they inherit it.
     let low = a.priority == Priority::Low && vectors::lower_priority();
     let t = Instant::now();
-    let mut e = match Embedder::load(m, &model_dir(m, &a.model_dir)?) {
+    let mut es = match embedders(m, &model_dir(m, &a.model_dir)?, workers, threads, a.batch as usize) {
         Err(Error::NotFound(_)) if missing_ok => return Ok(json!({ "skipped": MODEL_MISSING })),
         r => r?,
     };
-    e.batch = a.batch as usize;
     let load_ms = t.elapsed().as_millis() as u64;
     let o = vectors::Options {
         batch: a.batch as usize,
         max_time: max_time.map(|d| d.saturating_sub(start.elapsed())),
         reembed: a.reembed,
     };
-    let mut v = vectors::run(c, &mut e, &o)?;
+    let mut v = vectors::run(c, &mut es.iter_mut().map(|e| e.as_mut()).collect::<Vec<_>>(), &o)?;
     let obj = v.as_object_mut().unwrap();
     obj.insert("threads".into(), json!(threads));
     obj.insert("priority".into(), json!(if low { "low" } else { "normal" }));
     obj.insert("load_ms".into(), json!(load_ms));
     Ok(v)
+}
+
+/// One worker: the model in this process. More: that many `embed-worker`
+/// child processes (one process with more threads scales badly), each
+/// loading its own copy of the model.
+fn embedders(
+    m: &'static model::Model,
+    dir: &std::path::Path,
+    workers: usize,
+    threads: usize,
+    batch: usize,
+) -> Result<Vec<Box<dyn vectors::Embed>>> {
+    if workers <= 1 {
+        let mut e = Embedder::load(m, dir)?;
+        e.batch = batch;
+        return Ok(vec![Box::new(e)]);
+    }
+    let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| Error::Io(e.to_string()))?);
+    cmd.args(["embed-worker", "--model", m.name, "--threads", &threads.to_string(), "--batch", &batch.to_string()]);
+    cmd.arg("--model-dir").arg(dir);
+    Ok(worker::Child::spawn(cmd, workers, m)?.into_iter().map(|c| Box::new(c) as Box<dyn vectors::Embed>).collect())
 }
 
 #[derive(Subcommand)]
@@ -324,6 +377,15 @@ fn existing(p: PathBuf) -> Result<PathBuf> {
 }
 
 fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
+    if let Cmd::EmbedWorker { ref model, threads, batch } = cli.cmd {
+        set_threads(threads as usize);
+        let e = model.resolve().and_then(|(m, dir)| {
+            let mut e = Embedder::load(m, &dir)?;
+            e.batch = batch as usize;
+            Ok(e)
+        });
+        return worker::serve(e, &mut std::io::stdin().lock(), &mut { out });
+    }
     let file = || match &cli.file {
         Some(f) => Ok(native_path(f)),
         None => default_file(),
@@ -421,7 +483,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             }
             let mut vector = None;
             if let Some(m) = m {
-                set_threads(None);
+                set_threads(embed::DEFAULT_THREADS);
                 match Embedder::load(m, &self::model_dir(m, model_dir)?) {
                     Ok(e) => vector = Some(e.embed_queries(&[&query])?.remove(0)),
                     // Default mode stays usable without the model files.
@@ -455,6 +517,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 json!({ "count": hits.len(), "mode": run_mode, "hits": hits })
             }
         }
+        Cmd::EmbedWorker { .. } => unreachable!("served above"),
         Cmd::Status => search::status(&index::open(&existing(index_path)?)?)?,
         Cmd::Model { cmd: ModelCmd::List } => model::list(model::default_dir)?,
         Cmd::Model { cmd: ModelCmd::Fetch { ref model } } => {
@@ -463,13 +526,19 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
                 eprintln!("{}", json!({ "progress": { "kind": "download", "file": f.name, "bytes": f.size } }))
             })?
         }
-        Cmd::BenchEmbed { ref model, seconds, threads, batch } => {
+        Cmd::BenchEmbed { ref model, seconds, ref par, batch } => {
             let (m, dir) = model.resolve()?;
-            let threads = set_threads(threads);
-            let t = std::time::Instant::now();
-            let mut e = Embedder::load(m, &dir)?;
-            e.batch = batch as usize;
-            embed::bench(&e, t.elapsed(), Duration::from_secs(seconds), threads)?
+            let (workers, threads) = par.apply();
+            let (t, time) = (Instant::now(), Duration::from_secs(seconds));
+            if workers <= 1 {
+                let mut e = Embedder::load(m, &dir)?;
+                e.batch = batch as usize;
+                embed::bench(&e, t.elapsed(), time, threads)?
+            } else {
+                let mut es = embedders(m, &dir, workers, threads, batch as usize)?;
+                let mut es: Vec<&mut dyn vectors::Embed> = es.iter_mut().map(|e| e.as_mut()).collect();
+                worker::bench(&mut es, t.elapsed(), time, batch as usize, threads)?
+            }
         }
     };
     let print = |v: &Json, pretty: bool| {

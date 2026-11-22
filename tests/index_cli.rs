@@ -76,6 +76,8 @@ fn model_and_bench_cli() {
         &["bench-embed", "--model", "e5-large"][..],
         &["bench-embed", "--seconds", "0"],
         &["bench-embed", "--threads", "0"],
+        &["bench-embed", "--workers", "0"],
+        &["embed", "--workers", "0"],
         &["bench-embed", "--batch", "0"],
         &["model", "fetch", "--model", "x"],
     ] {
@@ -132,6 +134,10 @@ fn scope_and_embed_cli() {
     std::fs::create_dir_all(&empty).unwrap();
     let o = run(&["embed", "--model-dir", empty.to_str().unwrap()], &idx);
     assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(3), "not_found"), "explicit when files are missing");
+    let o = run(&["embed", "--workers", "2", "--threads", "1", "--model-dir", empty.to_str().unwrap()], &idx);
+    assert_eq!((o.status.code(), err_kind(&o).as_str()), (Some(3), "not_found"), "from the worker processes");
+    let help = run(&["--help"], &idx);
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("embed-worker"), "internal command hidden");
     for bad in [&["embed", "--batch", "0"][..], &["embed", "--priority", "high"], &["embed", "--max-time", "x"]] {
         assert_eq!(run(bad, &idx).status.code(), Some(2), "{bad:?}");
     }

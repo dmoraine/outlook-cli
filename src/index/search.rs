@@ -744,7 +744,8 @@ mod tests {
     }
 
     fn embed(c: &mut Connection) {
-        vectors::run(c, &mut Concepts, &vectors::Options { batch: 4, max_time: None, reembed: false }).unwrap();
+        let o = vectors::Options { batch: 4, max_time: None, reembed: false };
+        vectors::run(c, &mut [&mut Concepts, &mut Concepts], &o).unwrap();
     }
 
     /// indexed() plus FR/EN invoices and a two-chunk message; not embedded yet.
@@ -1152,7 +1153,7 @@ mod tests {
         migrate(&mut c).unwrap();
         sync(&mut c, &mut f, &Options::default()).unwrap();
         let mut e = crate::index::embed::Embedder::load(&MODELS[0], &dir).unwrap();
-        vectors::run(&mut c, &mut e, &vectors::Options { batch: 8, max_time: None, reembed: false }).unwrap();
+        vectors::run(&mut c, &mut [&mut e], &vectors::Options { batch: 8, max_time: None, reembed: false }).unwrap();
         drop(e);
 
         // Cold: load (hash check included) + query embedding + hybrid search.

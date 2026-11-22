@@ -39,9 +39,18 @@ pub fn prefixed(kind: Kind, text: &str) -> String {
     format!("{}{}", kind.prefix(), text.trim()).trim_end().to_string()
 }
 
-/// Logical CPUs - 1 (at least 1), to keep the machine usable.
-pub fn default_threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1))
+/// Compute threads per worker. One process scales badly past ~3 threads;
+/// more throughput comes from more worker processes.
+pub const DEFAULT_THREADS: usize = 3;
+
+/// Workers for `cpus` logical CPUs: (cpus - 2) / 3, at least 1, so two CPUs
+/// stay free (14 CPUs: 4 workers x 3 threads; 4 CPUs: 1 x 3).
+pub fn default_workers(cpus: usize) -> usize {
+    (cpus.saturating_sub(2) / DEFAULT_THREADS).max(1)
+}
+
+pub fn logical_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 fn ml(e: impl std::fmt::Display) -> Error {
@@ -113,6 +122,12 @@ fn embed_ids(net: &Net, pad: u32, batch: usize, ids: &[Vec<u32>]) -> Result<Vec<
     }
     Ok(out)
 }
+
+/// The embedding run moves it to a worker thread.
+const _: () = {
+    const fn send<T: Send>() {}
+    send::<Embedder>()
+};
 
 pub struct Embedder {
     net: Net,
@@ -239,7 +254,8 @@ pub fn synthetic_passages(n: usize) -> Vec<String> {
     out
 }
 
-/// `bench-embed`: passages per second on synthetic text for about `time`.
+/// `bench-embed` with one worker: passages per second on synthetic text
+/// for about `time`, in this process.
 pub fn bench(e: &Embedder, load: Duration, time: Duration, threads: usize) -> Result<Json> {
     let pool = synthetic_passages(64);
     let ids: Vec<Vec<u32>> = e.ids(Kind::Passage, &pool.iter().map(String::as_str).collect::<Vec<_>>())?;
@@ -264,8 +280,9 @@ pub fn bench(e: &Embedder, load: Duration, time: Duration, threads: usize) -> Re
         "model": e.model.name,
         "revision": e.model.revision,
         "dims": e.model.dims,
+        "workers": 1,
         "threads": threads,
-        "cpus": std::thread::available_parallelism().map_or(0, |n| n.get()),
+        "cpus": logical_cpus(),
         "batch": e.batch,
         "load_ms": ms(load),
         "query_ms": ms(query),
@@ -291,9 +308,10 @@ mod tests {
     }
 
     #[test]
-    fn threads_default() {
-        let n = std::thread::available_parallelism().unwrap().get();
-        assert_eq!(default_threads(), (n - 1).max(1));
+    fn workers_default() {
+        let w: Vec<usize> = [1, 2, 4, 5, 8, 14, 16].into_iter().map(default_workers).collect();
+        assert_eq!(w, [1, 1, 1, 1, 2, 4, 4]);
+        assert_eq!(DEFAULT_THREADS, 3);
     }
 
     #[test]

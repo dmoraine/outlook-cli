@@ -235,7 +235,7 @@ outlook-index.exe model list --pretty                   # pinned revisions, file
 outlook-index.exe model fetch                           # e5-small (~490 MB), the only network access
 outlook-index.exe model fetch --model e5-base           # ~1.1 GB
 outlook-index.exe bench-embed --pretty                  # ~30 s of synthetic passages on this CPU
-outlook-index.exe bench-embed --model e5-base --seconds 60 --threads 4 --pretty
+outlook-index.exe bench-embed --model e5-base --seconds 60 --workers 4 --threads 3 --pretty
 ```
 
 `model fetch` downloads over HTTPS from huggingface.co with `curl` (shipped with Windows 10+) into `<name>.part`,
@@ -244,8 +244,19 @@ files of the pinned revision (`model list`) in a directory and pass `--model-dir
 Default directory: `%LOCALAPPDATA%\outlook-cli\models\multilingual-e5-small` (or `-base`; Linux: under
 `$XDG_DATA_HOME/outlook-cli`). Texts get the mandatory e5 prefix (`query: ` / `passage: `), are cut at 512 tokens,
 embedded in length-sorted batches (`--batch`, default 8) and mean-pooled over the tokens, then L2-normalized.
-`--threads` defaults to the logical CPUs minus one. `bench-embed` prints load time (hash check included), query
-latency and passages/s on synthetic text only. **Paste back** its whole JSON for both models.
+`bench-embed` prints load time (hash check included), query latency and passages/s on synthetic text only (with
+`--workers` above 1: aggregate passages/s, no token or query figures). **Paste back** its whole JSON for both models.
+
+**Workers and threads.** `--workers N` (on `embed`, `sync` and `bench-embed`) embeds N batches at once; `--threads`
+is the compute threads *per worker*. Defaults: workers = max(1, (logical CPUs − 2) / 3), threads = 3, so 14 CPUs
+give 4 × 3 and 4 CPUs 1 × 3; two CPUs stay free. Summaries print the effective `workers` and `threads`. One worker
+runs in the process. More workers run as child processes (`outlook-index embed-worker`, internal), each with its own
+copy of the model: memory grows with N (VPS, e5-small: ~1.25 GB RSS per process). One process with more threads
+scales badly; several small ones scale well. Owner's laptop (Intel i5, 14 logical CPUs, e5-small, ~311
+tokens/passage): one process with 2 / 4 / 6 / 8 / 13 threads gave 2.39 / 2.96 / 3.71 / 3.81 / 4.48 passages/s; 4
+processes × 3 threads 8.19 in total, 6 × 2 7.42; batch size 1/8/16 made no difference. On the VPS (4 vCPU) the same
+model in one process with 2 workers sharing the weights reached 3.5–3.6 passages/s against 4.5 for two processes ×
+2 threads, hence processes.
 
 ### Embeddings: scope and runs
 
@@ -269,20 +280,23 @@ never deleted by a scope change). Folder specs are counted, not printed. A folde
 indexed folders once a sync has run.
 
 `embed` embeds the pending in-scope chunks, newest message first; the passage is the subject, a newline and the chunk
-text (with the `passage: ` prefix). Each batch (`--batch`, default 8) is one commit, so `Ctrl-C` loses at most one
-batch and `--max-time` stops after the current batch; the next run resumes. It runs at below-normal priority
-(Windows `BELOW_NORMAL_PRIORITY_CLASS`, Linux nice 10; `--priority normal` to opt out) on `--threads` (default CPUs
-minus one). The model defaults to the one of the stored vectors (else e5-small); another model is refused unless
+text (with the `passage: ` prefix). Each batch (`--batch`, default 8) is one commit made by the parent process (the
+only DB writer) as soon as a worker returns it, so with several workers commits may land slightly out of
+newest-first order; `Ctrl-C` loses at most the batches in flight (one per worker) and `--max-time` starts no new batch
+once reached (batches in flight finish); the next run resumes. A failing worker stores nothing of its batch: the
+run stops dispatching, commits the batches still in flight and exits with the error. It runs at below-normal
+priority (Windows `BELOW_NORMAL_PRIORITY_CLASS`, Linux nice 10, inherited by worker processes; `--priority normal`
+to opt out) with `--workers` × `--threads`. The model defaults to the one of the stored vectors (else e5-small); another model is refused unless
 `--reembed`, which drops the old vectors. Missing model files are a `not_found` error. Output: `embedded`, `pending`,
-`complete`, `interrupted`, `passages_per_s`, `load_ms`, `elapsed_ms`, model, threads, priority.
+`complete`, `interrupted`, `passages_per_s`, `load_ms`, `elapsed_ms`, model, workers, threads, priority.
 
 `sync` runs the same step after indexing, within what is left of `--max-time`, with the same options. Without model
 files indexing still completes and the summary says `"embedding": {"skipped": "model files missing; run outlook-index
 model fetch"}`. `status` adds `embedding`: model, revision, dims, vectors, the scope counts above and a scope
 summary.
 
-Time estimate: `pending` (from `scope`) ÷ `passages_per_s` (from `bench-embed`) seconds; e.g. 100,000 chunks at
-10 passages/s ≈ 2.8 h. Size: about 2 MB per 1,000 e5-small vectors (measured: 384 × 4 bytes plus row and page
+Time estimate: chunks to embed (`pending` from `scope`) ÷ passages/s (from `bench-embed` with the same `--workers`
+and `--threads`) = seconds; e.g. 40,000 chunks at 8.19 passages/s (laptop above, 4 × 3, e5-small) ≈ 81 min. Size: about 2 MB per 1,000 e5-small vectors (measured: 384 × 4 bytes plus row and page
 overhead).
 
 Parity with sentence-transformers (`scripts/e5_reference.py` → `tests/fixtures/e5_reference.json`):
