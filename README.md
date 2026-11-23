@@ -13,7 +13,21 @@ sortie JSON, codes de retour stables, démarrage instantané, mémoire minimale.
 - **Formats** : OST Outlook 2013+ (pages 4 Ko, blocs compressés zlib), PST/OST Unicode (Outlook 2003–2010),
   encodages PST « compressible » et « high ». Le format ANSI (Outlook 97–2002) n'est pas géré.
 
+## Utilisation avec un agent
+
+Un agent IA (Hermes, Codex, Claude Code…) pointé sur ce dépôt suit [AGENTS.md](AGENTS.md) (en anglais) : il
+installe les outils, construit le premier index et planifie son rafraîchissement avec la skill
+[`outlook-mail-setup`](.agents/skills/outlook-mail-setup/SKILL.md), puis consulte la boîte avec la skill
+[`outlook-cli`](.agents/skills/outlook-cli/SKILL.md). Il demande votre accord avant chaque étape coûteuse
+(téléchargement du modèle, premier `sync`, planification) et ne rapporte que des compteurs. Hermes charge ces
+skills après `hermes skills trust <dossier du dépôt>` ; `scripts\install.ps1 -Skill hermes|codex|claude` (WSL :
+`scripts/install.sh --skill …`) installe la skill `outlook-cli` pour l'utiliser hors du dépôt.
+
 ## Installation
+
+Sans WSL, depuis PowerShell (Windows PowerShell 5.1 ou PowerShell 7, sans droits d'administrateur) :
+`scripts\install.ps1 -Version latest` installe la dernière release GitHub vérifiée (SHA-256, attestation) et
+`scripts\build.ps1` compile depuis les sources ; détails dans [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md).
 
 Le binaire est un `.exe` Windows, appelable aussi bien depuis PowerShell que depuis WSL. Il doit s'exécuter côté
 Windows : depuis WSL, un programme Linux ne peut pas lire un OST ouvert par Outlook.

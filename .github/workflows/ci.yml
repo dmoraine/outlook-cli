@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: shellcheck scripts/*.sh tests/scripts/*.sh
       - run: bash tests/scripts/install_sh_test.sh
+      - run: bash tests/scripts/agent_docs_test.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -43,7 +44,7 @@ jobs:
       - run: cargo test --release --features index
       - run: cargo build --release --features index --bin outlook-index
       - run: target/release/outlook-index.exe --version
-      # install.ps1 / schedule.ps1 / build.ps1 -WhatIf under the runner user, temp LOCALAPPDATA, both PowerShells.
+      # install.ps1 (with -Skill) / schedule.ps1 / build.ps1 -WhatIf under the runner user, temp LOCALAPPDATA, both PowerShells.
       - run: ./tests/scripts/windows.ps1 -ExeDir target/release
         shell: powershell
       - run: ./tests/scripts/windows.ps1 -ExeDir target/release

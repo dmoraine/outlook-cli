@@ -7,12 +7,18 @@ Install dir: %LOCALAPPDATA%\Programs\outlook-cli\, added to the user PATH if mis
   -Version vX.Y.Z|latest  GitHub Release assets of -Repo, checked against SHA256SUMS (fail closed); when `gh` is
                           logged in, `gh attestation verify` must pass too (attestation: verified|unavailable|failed).
   -FromDir <dir>          locally built exes instead (scripts/build.ps1).
-  -Uninstall              removes the exes, the PATH entry and the scheduled task; keeps the index and models in
-                          %LOCALAPPDATA%\outlook-cli\ unless -PurgeData, which requires -Confirm (or -Confirm:$false).
+  -Skill hermes|codex|claude|none  also installs the usage skill (.agents\skills\outlook-cli of this checkout):
+                          hermes: copy in <install dir>\skills, added to Hermes skills.external_dirs (`hermes config set`);
+                          codex: copy in $CODEX_HOME\skills (default %USERPROFILE%\.codex\skills);
+                          claude: copy in %USERPROFILE%\.claude\skills. Copies carry a marker file; a skill directory
+                          without it is never replaced or removed. Default none.
+  -Uninstall              removes the exes, the PATH entry, the scheduled task and every managed skill (and its Hermes
+                          entry); keeps the index and models in %LOCALAPPDATA%\outlook-cli\. -PurgeData (deletes them)
+                          is for the user to run themselves; a non-interactive confirmation is not available yet.
 -WhatIf shows the changes without making them. -Json prints one JSON object on stdout (no mailbox content).
 
 .EXAMPLE
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Version latest -Json
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Version latest -Skill hermes -Json
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium', DefaultParameterSetName = 'Release')]
 param(
@@ -23,6 +29,8 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'FromDir')][string]$FromDir,
     [Parameter(Mandatory = $true, ParameterSetName = 'Uninstall')][switch]$Uninstall,
     [Parameter(ParameterSetName = 'Uninstall')][switch]$PurgeData,
+    [Parameter(ParameterSetName = 'Release')][Parameter(ParameterSetName = 'FromDir')]
+    [ValidateSet('hermes', 'codex', 'claude', 'none')][string]$Skill = 'none',
     [switch]$Json
 )
 $ErrorActionPreference = 'Stop'
@@ -30,6 +38,8 @@ $ProgressPreference = 'SilentlyContinue' # Invoke-WebRequest is very slow with a
 $Cmdlet = $PSCmdlet
 $Exes = @('outlook-cli.exe', 'outlook-index.exe')
 $TaskName = 'outlook-index sync'
+$SkillSrc = Join-Path (Split-Path $PSScriptRoot) '.agents\skills\outlook-cli'
+$Marker = '.outlook-cli-managed'
 $script:planned = @()
 
 # State changes go through Want: under -WhatIf they are listed (not printed, to keep -Json output clean).
@@ -95,6 +105,51 @@ function Assert-Sums([string]$dir) {
         if ($got -ine $want) { throw "SHA-256 mismatch for ${e}: not installed" }
     }
 }
+# Skill parent directories per agent ($HOME is not used: 7 reads the profile folder from the OS, not USERPROFILE).
+function Skill-Dirs([string]$dest) {
+    $userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $userHome '.codex' }
+    [ordered]@{ hermes = (Join-Path $dest 'skills'); codex = (Join-Path $codexHome 'skills')
+        claude = (Join-Path $userHome '.claude\skills') }
+}
+# (Re)places <dir>\outlook-cli, only if absent or made by this script.
+function Copy-Skill([string]$dir) {
+    $d = Join-Path $dir 'outlook-cli'
+    if ((Test-Path -LiteralPath $d) -and -not (Test-Path -LiteralPath (Join-Path $d $Marker))) {
+        throw "$d exists and was not installed by this script: left alone"
+    }
+    if (-not (Want $d 'Install usage skill')) { return }
+    if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Copy-Item -LiteralPath $SkillSrc -Destination $d -Recurse
+    New-Item -ItemType File -Path (Join-Path $d $Marker) | Out-Null
+}
+function Remove-Skill([string]$dir) {
+    $d = Join-Path $dir 'outlook-cli'
+    if ((Test-Path -LiteralPath (Join-Path $d $Marker)) -and (Want $d 'Remove usage skill')) {
+        Remove-Item -LiteralPath $d -Recurse -Force
+        return $true
+    }
+    $false
+}
+# Hermes skills.external_dirs: read as JSON (`config get --json`), written back as a YAML flow list of single-quoted
+# strings (`config set` parses YAML): no double quotes, which 5.1 drops from native arguments.
+function Get-HermesDirs {
+    $ErrorActionPreference = 'Continue'
+    $t = ((& hermes config get skills.external_dirs --json 2> $null) | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'hermes config get skills.external_dirs failed' }
+    if (-not $t -or $t -eq 'null') { return , @() }
+    $v = $t | ConvertFrom-Json # 5.1 returns the array as one object: enumerate it with foreach
+    $list = @()
+    foreach ($x in $v) { $list += [string]$x }
+    , $list
+}
+function Set-HermesDirs([string[]]$dirs) {
+    $yaml = '[' + (@($dirs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ', ') + ']'
+    $ErrorActionPreference = 'Continue'
+    & hermes config set skills.external_dirs $yaml *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'hermes config set skills.external_dirs failed' }
+}
 
 $tmp = $null
 try {
@@ -107,8 +162,18 @@ try {
             throw '-PurgeData deletes the index and models: add -Confirm (or -Confirm:$false once the user agreed)'
         }
         $o = [ordered]@{ ok = $true; action = 'uninstall'; install_dir = $dest; removed = $false; path_removed = $false
-            task_removed = $false; data_purged = $false }
+            task_removed = $false; skills_removed = @(); data_purged = $false }
         Assert-NotRunning $dest
+        $sd = Skill-Dirs $dest
+        if (Get-Command hermes -ErrorAction SilentlyContinue) {
+            $dirs = Get-HermesDirs
+            $keep = @($dirs | Where-Object { -not (Same-Dir $_ $sd.hermes) })
+            if ($keep.Count -ne $dirs.Count -and (Want 'Hermes skills.external_dirs' "Remove $($sd.hermes)")) {
+                Set-HermesDirs $keep
+                $o.skills_removed += 'hermes'
+            }
+        }
+        foreach ($a in 'codex', 'claude') { if (Remove-Skill $sd[$a]) { $o.skills_removed += $a } }
         if ((Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) -and
             (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) -and (Want $TaskName 'Remove scheduled task')) {
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -135,6 +200,12 @@ try {
     }
 
     $o = [ordered]@{ ok = $true; action = 'install'; install_dir = $dest }
+    if ($Skill -ne 'none') {
+        if (-not (Test-Path -LiteralPath (Join-Path $SkillSrc 'SKILL.md'))) { throw "-Skill: .agents\skills\outlook-cli not found (run from a checkout)" }
+        if ($Skill -eq 'hermes' -and -not (Get-Command hermes -ErrorAction SilentlyContinue)) {
+            throw '-Skill hermes: hermes not found on PATH (Hermes in WSL: scripts/install.sh --skill hermes)'
+        }
+    }
     if ($FromDir) {
         $src = $FromDir
         foreach ($e in $Exes) {
@@ -189,6 +260,20 @@ try {
         if (Test-Path -LiteralPath $f) { $v[$e -replace '\.exe$'] = ((& $f --version) | Out-String).Trim() }
     }
     $o.versions = $v
+    $o.skill = $Skill
+    if ($Skill -ne 'none') {
+        $sd = (Skill-Dirs $dest)[$Skill]
+        Copy-Skill $sd
+        $o.skill_dir = Join-Path $sd 'outlook-cli'
+        if ($Skill -eq 'hermes') {
+            $dirs = Get-HermesDirs
+            $o.hermes_registered = $false
+            if (-not @($dirs | Where-Object { Same-Dir $_ $sd }).Count -and (Want 'Hermes skills.external_dirs' "Add $sd")) {
+                Set-HermesDirs (@($dirs) + $sd)
+                $o.hermes_registered = $true
+            }
+        }
+    }
     Finish $o
 } catch {
     $msg = $_.Exception.Message

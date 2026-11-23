@@ -1,11 +1,45 @@
 # Testing outlook-index on Windows
 
 Owner procedure for the branch `feat/mail-index`, from a fresh pull to a searchable index. Commands are for WSL
-(bash); PowerShell equivalents are at the end. Everything runs locally; the only network access is
-`model fetch` (step 4).
+(bash); without WSL, see section 0 for install and scheduling, then run the same `outlook-index` commands from
+PowerShell (section 9). Everything runs locally; the only network access is the release or toolchain download and
+`model fetch` (step 4). An AI agent follows [AGENTS.md](../AGENTS.md) and the `outlook-mail-setup` skill instead.
 
 **Privacy rule for feedback**: paste back only what section 10 lists. Those outputs are aggregates (counts, sizes,
 durations, error kinds). Never paste search hits, excerpts, subjects, names, addresses, folder or file names.
+
+## 0. Native PowerShell path (no WSL)
+
+Windows PowerShell 5.1 or PowerShell 7, no admin. Allow the scripts for this window only with
+`Set-ExecutionPolicy -Scope Process Bypass` (or run each with `powershell -NoProfile -ExecutionPolicy Bypass -File …`).
+Each script takes `-WhatIf` (plan only) and `-Json` (one JSON object on stdout, no mailbox content).
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+git switch feat/mail-index; git pull --ff-only origin feat/mail-index
+scripts\install.ps1 -Version latest -Json        # release, SHA-256 (+ attestation if gh is logged in), fail closed
+scripts\build.ps1 -InstallToolchain -NoTests -Json   # or: source build (rustup, gnullvm, llvm-mingw for the user), then install
+outlook-index --version                          # new shell: the install dir is on the user PATH
+```
+
+`install.ps1` installs both exes into `%LOCALAPPDATA%\Programs\outlook-cli\` and adds that folder to the user
+PATH. `-FromDir <dir>` installs exes built elsewhere. `-Skill hermes|codex|claude` also installs the `outlook-cli`
+agent skill (Hermes: registered in `skills.external_dirs` with `hermes config set`; Codex: `$CODEX_HOME\skills`,
+default `%USERPROFILE%\.codex\skills`; Claude Code: `%USERPROFILE%\.claude\skills`). `build.ps1` needs about
+3 GB of disk with `-NoTests` (5 GB with the tests) and about 8 GB of free RAM (`-Jobs 1` when short).
+
+Then follow sections 3 to 7 from PowerShell. Periodic refresh (per-user scheduled task, AC power only, no overlap,
+low priority, JSON logs in `%LOCALAPPDATA%\outlook-cli\logs\`, 14 kept):
+
+```powershell
+scripts\schedule.ps1 -Every 4h -At 09:00 -Json   # 1h | 4h | daily
+scripts\schedule.ps1 -Status -Json               # last run time, exit code, last sync summary (counts)
+scripts\schedule.ps1 -Remove -Json
+```
+
+Uninstall: `scripts\install.ps1 -Uninstall -Json` removes the exes, the PATH entry, the scheduled task and the
+skills it installed (and their Hermes entry); the index and models stay (purging them is left to the user; no non-interactive confirmation yet). WSL:
+`scripts/install.sh --uninstall` first (links and WSL-side skills).
 
 ## 1. Pull and build
 

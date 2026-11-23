@@ -1,6 +1,7 @@
-# Windows CI: plain assertions for scripts/install.ps1 and scripts/schedule.ps1, under the runner user.
+# Windows CI: plain assertions for scripts/install.ps1 (with -Skill) and scripts/schedule.ps1, under the runner user.
 # Run with both Windows PowerShell 5.1 and PowerShell 7: tests/scripts/windows.ps1 -ExeDir target\release
-# LOCALAPPDATA points to a temp dir; the user PATH and the scheduled task are restored at the end.
+# LOCALAPPDATA, USERPROFILE and CODEX_HOME point to a temp dir, hermes is a fake; the user PATH, the scheduled task
+# and the environment are restored at the end.
 param([Parameter(Mandatory = $true)][string]$ExeDir)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot)
@@ -27,6 +28,7 @@ function Run([string]$file, [string[]]$a) {
 function Hash([string]$f) { (Get-FileHash $f -Algorithm SHA256).Hash.ToLowerInvariant() }
 
 $before = UserPath
+$savedEnv = @{ Path = $env:Path; USERPROFILE = $env:USERPROFILE; CODEX_HOME = $env:CODEX_HOME }
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("outlook-cli-test-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $env:LOCALAPPDATA = $tmp
@@ -137,7 +139,62 @@ try {
     Run $schedule @('-Every', '4h', '-Json') | Out-Null
     $r = Run $install @('-Uninstall', '-Json')
     Check ($code -eq 0 -and $r.task_removed -and -not (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue)) "uninstall removes the task"
+
+    # Usage skill. Fake hermes: a .cmd (native argument passing, as a real hermes.exe) running a script that keeps
+    # skills.external_dirs as JSON in $env:FAKE_HERMES_DIRS and reads `config set` values as single-quoted YAML.
+    $fake = Join-Path $tmp 'fakebin'
+    New-Item -ItemType Directory -Force -Path $fake | Out-Null
+    Set-Content -Path "$fake\hermes.cmd" -Encoding Ascii -Value '@powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0hermes-fake.ps1" %*'
+    Set-Content -Path "$fake\hermes-fake.ps1" -Encoding Ascii -Value @'
+if ($args[0] -ne 'config' -or $args[2] -ne 'skills.external_dirs') { exit 2 }
+if ($args[1] -eq 'get') { [Console]::Out.Write([IO.File]::ReadAllText($env:FAKE_HERMES_DIRS)); exit 0 }
+if ($args[1] -ne 'set') { exit 2 }
+$items = @([regex]::Matches($args[3], "'((?:[^']|'')*)'") | ForEach-Object { $_.Groups[1].Value -replace "''", "'" })
+[IO.File]::WriteAllText($env:FAKE_HERMES_DIRS, (ConvertTo-Json -InputObject $items -Compress))
+'Set skills.external_dirs'
+'@
+    $env:FAKE_HERMES_DIRS = Join-Path $tmp 'hermes-dirs.json'
+    [IO.File]::WriteAllText($env:FAKE_HERMES_DIRS, '["C:\\team skills"]')
+    function HermesDirs { @([IO.File]::ReadAllText($env:FAKE_HERMES_DIRS) | ConvertFrom-Json | ForEach-Object { $_ }) }
+    $env:USERPROFILE = Join-Path $tmp 'home'
+    $env:CODEX_HOME = Join-Path $tmp 'codex'
+    $claude = Join-Path $tmp 'home\.claude\skills'
+    $codex = Join-Path $tmp 'codex\skills'
+
+    $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'hermes', '-Json')
+    Check ($code -ne 0 -and $r.ok -eq $false -and -not (Test-Path "$dir\outlook-cli.exe")) "-Skill hermes without hermes refused before installing"
+    $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'cursor', '-Json')
+    Check ($code -ne 0) "unknown -Skill rejected"
+    $env:Path = "$fake;$env:Path"
+    $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'hermes', '-Json')
+    $d = HermesDirs
+    Check ($code -eq 0 -and $r.hermes_registered -eq $true -and (Test-Path "$dir\skills\outlook-cli\SKILL.md") -and
+        (Test-Path "$dir\skills\outlook-cli\references\outlook-index.md")) "-Skill hermes copies the skill"
+    Check ($d.Count -eq 2 -and $d[0] -eq 'C:\team skills' -and $d[1] -eq "$dir\skills") "hermes external_dirs: $($d -join ' | ')"
+    $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'hermes', '-Json')
+    Check ($code -eq 0 -and $r.hermes_registered -eq $false -and (HermesDirs).Count -eq 2) "-Skill hermes is idempotent"
+    $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'claude', '-Json')
+    Check ($code -eq 0 -and (Test-Path "$claude\outlook-cli\SKILL.md")) "-Skill claude installs in %USERPROFILE%\.claude\skills"
+    New-Item -ItemType Directory -Force -Path "$claude\other" | Out-Null
+    Set-Content -Path "$claude\other\SKILL.md" -Value 'mine'
+    New-Item -ItemType Directory -Force -Path "$codex\outlook-cli" | Out-Null
+    Set-Content -Path "$codex\outlook-cli\SKILL.md" -Value 'mine'
+    $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'codex', '-Json')
+    Check ($code -ne 0 -and (Get-Content "$codex\outlook-cli\SKILL.md") -eq 'mine') "unmanaged skill directory left alone"
+    Remove-Item -Recurse -Force "$codex\outlook-cli"
+    $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'codex', '-Json')
+    Check ($code -eq 0 -and (Test-Path "$codex\outlook-cli\SKILL.md")) "-Skill codex installs in `$CODEX_HOME\skills"
+
+    $r = Run $install @('-Uninstall', '-Json')
+    $d = HermesDirs
+    Check ($code -eq 0 -and (@($r.skills_removed) -join ',') -eq 'hermes,codex,claude') "uninstall removes the skills: $(@($r.skills_removed) -join ',')"
+    Check ($d.Count -eq 1 -and $d[0] -eq 'C:\team skills') "hermes external_dirs back to the unrelated entry"
+    Check (-not (Test-Path "$claude\outlook-cli") -and -not (Test-Path "$codex\outlook-cli") -and
+        (Get-Content "$claude\other\SKILL.md") -eq 'mine') "managed copies removed, unrelated skill kept"
+    $r = Run $install @('-Uninstall', '-Json')
+    Check ($code -eq 0 -and @($r.skills_removed).Count -eq 0 -and (HermesDirs).Count -eq 1) "second uninstall leaves the skills alone"
 } finally {
+    foreach ($k in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedEnv[$k]) } # $null unsets
     Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
     if ((UserPath) -ne $before) { [Environment]::SetEnvironmentVariable('Path', $before, 'User') }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
