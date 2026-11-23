@@ -5,6 +5,7 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  workflow_dispatch: # dry run: builds the release assets, publishes nothing
 
 permissions:
   contents: read
@@ -45,16 +46,44 @@ jobs:
           name: outlook-index-windows-x64
           path: target/release/outlook-index.exe
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # Shared by the dry run and the release: no rebuild, the exes come from the windows job.
+  package:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: [linux, windows]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: outlook-cli-windows-x64
-      - run: gh release create "$GITHUB_REF_NAME" outlook-cli.exe --repo "$GITHUB_REPOSITORY" --generate-notes
+          pattern: outlook-*-windows-x64
+          merge-multiple: true
+      - run: sha256sum outlook-cli.exe outlook-index.exe > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            outlook-cli.exe
+            outlook-index.exe
+            SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # sign the attestations
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+      - run: sha256sum -c SHA256SUMS
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            outlook-cli.exe
+            outlook-index.exe
+      - run: gh release create "$GITHUB_REF_NAME" outlook-cli.exe outlook-index.exe SHA256SUMS --repo "$GITHUB_REPOSITORY" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
