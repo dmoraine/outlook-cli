@@ -26,6 +26,21 @@ scripts/build.sh             # tests + dist/outlook-cli.exe, dist/outlook-index.
 scripts/install.sh           # %LOCALAPPDATA%\Programs\outlook-cli\ (les deux .exe) + liens ~/.local/bin/outlook-cli, outlook-index
 ```
 
+La compilation demande environ 8 Go de RAM libre dans WSL (`free -g`) ; `cargo` lance 2 jobs par défaut
+(`CARGO_BUILD_JOBS`). Si elle est tuée ou si WSL s'arrête (mémoire insuffisante) :
+
+```bash
+scripts/build.sh --no-tests                    # compilation seule ; la CI lance les tests (équivaut à SKIP_TESTS=1)
+CARGO_BUILD_JOBS=1 scripts/build.sh --no-tests # un job à la fois : plus lent, le moins de RAM
+```
+
+Optionnel : donner plus de mémoire à WSL dans `%UserProfile%\.wslconfig`, puis `wsl --shutdown` depuis PowerShell :
+
+```ini
+[wsl2]
+memory=12GB
+```
+
 PowerShell : `& "$env:LOCALAPPDATA\Programs\outlook-cli\outlook-cli.exe" info`
 (ou ajouter ce dossier au `PATH` utilisateur pour taper simplement `outlook-cli`).
 

@@ -19,6 +19,21 @@ scripts/setup-toolchain.sh        # first time only
 scripts/build.sh                  # tests + dist/outlook-cli.exe, dist/outlook-index.exe
 ```
 
+The build needs about 8 GB of RAM free in WSL (`free -g`); `cargo` jobs default to 2 (`CARGO_BUILD_JOBS`). If
+it is killed or WSL stops (out of memory):
+
+```bash
+scripts/build.sh --no-tests                    # build only; CI runs the tests (same as SKIP_TESTS=1)
+CARGO_BUILD_JOBS=1 scripts/build.sh --no-tests # one job at a time: slower, least RAM
+```
+
+Optional: give WSL more memory in `%UserProfile%\.wslconfig`, then run `wsl --shutdown` from PowerShell:
+
+```ini
+[wsl2]
+memory=12GB
+```
+
 ## 2. Install
 
 Do not install while an `outlook-index` process is running: Windows refuses to overwrite a running `.exe`.
