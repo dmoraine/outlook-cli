@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: shellcheck scripts/*.sh tests/scripts/*.sh
+      - run: bash tests/scripts/install_sh_test.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -41,6 +43,11 @@ jobs:
       - run: cargo test --release --features index
       - run: cargo build --release --features index --bin outlook-index
       - run: target/release/outlook-index.exe --version
+      # install.ps1 / schedule.ps1 / build.ps1 -WhatIf under the runner user, temp LOCALAPPDATA, both PowerShells.
+      - run: ./tests/scripts/windows.ps1 -ExeDir target/release
+        shell: powershell
+      - run: ./tests/scripts/windows.ps1 -ExeDir target/release
+        shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
           name: outlook-index-windows-x64

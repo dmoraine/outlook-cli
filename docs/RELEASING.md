@@ -49,5 +49,8 @@ gh attestation verify outlook-index.exe --repo dmoraine/outlook-cli
 PowerShell, without `sha256sum`: compare `(Get-FileHash outlook-cli.exe -Algorithm SHA256).Hash` (case-insensitive)
 with its line in `SHA256SUMS`, same for `outlook-index.exe`.
 
+`scripts/install.ps1 -Version vX.Y.Z` (native PowerShell) and `scripts/install.sh --release vX.Y.Z` (WSL) run these
+checks and install nothing if one fails.
+
 A hash mismatch or a failed attestation means: do not run the file; build from source instead
 (`docs/WINDOWS_TESTING.md`). If `gh` is not available, the SHA-256 check alone is the minimum.
