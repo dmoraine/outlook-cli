@@ -176,9 +176,9 @@ or **delete it** (irreversible; the index holds a copy of the mail).
 1. No run active. Hermes cron: `hermes cron remove <job_id>`, delete its script from `<hermes home>\scripts\`.
 2. WSL: `scripts/install.sh --uninstall` (links, WSL-side skills and their Hermes entry).
 3. `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall -Json`: exes, user PATH entry,
-   scheduled task, managed skills and their Hermes entry. The data stays. Do not purge it yourself: no
-   non-interactive confirmation is supported yet. If the user wants the data gone, tell them it is in
-   `%LOCALAPPDATA%\outlook-cli` and that deleting it is their own separately confirmed action.
+   scheduled task, managed skills and their Hermes entry. The data stays. Only if the user chose **delete it**
+   in this conversation, run instead (`data_purged: true`; `-PurgeData` without `-Yes` is refused):
+   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall -PurgeData -Yes -Json`
 4. Optional, if the user wants: `hermes skills untrust <checkout>`; a toolchain installed by `build.ps1` lives in
    `%LOCALAPPDATA%\outlook-cli\toolchain` (purged with the data) and rustup in `%USERPROFILE%\.cargo`
    (`rustup self uninstall`, only if nothing else uses it).

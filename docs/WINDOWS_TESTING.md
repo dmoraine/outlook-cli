@@ -38,7 +38,7 @@ scripts\schedule.ps1 -Remove -Json
 ```
 
 Uninstall: `scripts\install.ps1 -Uninstall -Json` removes the exes, the PATH entry, the scheduled task and the
-skills it installed (and their Hermes entry); the index and models stay (purging them is left to the user; no non-interactive confirmation yet). WSL:
+skills it installed (and their Hermes entry); the index and models stay unless `-PurgeData -Yes` is added (irreversible). WSL:
 `scripts/install.sh --uninstall` first (links and WSL-side skills).
 
 ## 1. Pull and build

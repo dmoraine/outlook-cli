@@ -32,8 +32,9 @@ grep -q 'never while another run is active' AGENTS.md || fail "AGENTS.md: no-ove
 for c in 'Consent gate 1' 'Consent gate 2' 'Consent gate 3' '## Upgrade' '## Uninstall' '## Errors'; do
     grep -q "$c" .agents/skills/outlook-mail-setup/SKILL.md || fail "outlook-mail-setup misses '$c'"
 done
-# -PurgeData -Confirm:$false cannot bind under `powershell -File` (5.1): no purge command documented until F7.
+# -Confirm:$false cannot bind under `powershell -File` (5.1): the purge agreement is the -Yes switch.
 ! grep -rn -- '-Confirm:\$false' AGENTS.md README.md docs .agents || fail "a purge with -Confirm:\$false is documented"
+grep -q -- '-PurgeData -Yes' .agents/skills/outlook-mail-setup/SKILL.md || fail "outlook-mail-setup: no -PurgeData -Yes command"
 grep -q -- '--no-agent --script' .agents/skills/outlook-mail-setup/references/hermes-cron.md || fail "hermes cron: no script-only job"
 
 # Relative links resolve (anchors and URLs skipped).

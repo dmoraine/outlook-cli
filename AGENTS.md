@@ -34,7 +34,7 @@ recorded), and never while another run is active (`outlook-index status` → `ru
 - `outlook-index model fetch` (download), `bench-embed` (CPU), `doctor` (walks the whole mailbox);
 - `sync` and `embed` (hours of CPU for a first index), `scope` with an option (scope change);
 - setting up or changing a scheduled refresh (Windows scheduled task or Hermes cron job);
-- restoring a backup; `install.ps1 -Uninstall -PurgeData` (deletes the index and models);
+- restoring a backup; `install.ps1 -Uninstall -PurgeData -Yes` (deletes the index and models);
 - downloading a build toolchain (`build.ps1 -InstallToolchain`).
 
 Allowed without asking: every `outlook-cli` command, `outlook-index search`, `status`, `scope` without options,

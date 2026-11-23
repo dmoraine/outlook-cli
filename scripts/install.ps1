@@ -13,8 +13,8 @@ Install dir: %LOCALAPPDATA%\Programs\outlook-cli\, added to the user PATH if mis
                           claude: copy in %USERPROFILE%\.claude\skills. Copies carry a marker file; a skill directory
                           without it is never replaced or removed. Default none.
   -Uninstall              removes the exes, the PATH entry, the scheduled task and every managed skill (and its Hermes
-                          entry); keeps the index and models in %LOCALAPPDATA%\outlook-cli\. -PurgeData (deletes them)
-                          is for the user to run themselves; a non-interactive confirmation is not available yet.
+                          entry); keeps the index and models in %LOCALAPPDATA%\outlook-cli\. -PurgeData -Yes also deletes
+                          them (irreversible; -Yes is the explicit agreement, -PurgeData alone is refused).
 -WhatIf shows the changes without making them. -Json prints one JSON object on stdout (no mailbox content).
 
 .EXAMPLE
@@ -29,6 +29,8 @@ param(
     [Parameter(Mandatory = $true, ParameterSetName = 'FromDir')][string]$FromDir,
     [Parameter(Mandatory = $true, ParameterSetName = 'Uninstall')][switch]$Uninstall,
     [Parameter(ParameterSetName = 'Uninstall')][switch]$PurgeData,
+    # Agreement to -PurgeData; a plain switch, so it binds under `powershell -File` (5.1 and 7), unlike -Confirm:$false.
+    [Parameter(ParameterSetName = 'Uninstall')][switch]$Yes,
     [Parameter(ParameterSetName = 'Release')][Parameter(ParameterSetName = 'FromDir')]
     [ValidateSet('hermes', 'codex', 'claude', 'none')][string]$Skill = 'none',
     [switch]$Json
@@ -158,8 +160,8 @@ try {
     $data = Join-Path $env:LOCALAPPDATA 'outlook-cli'
 
     if ($Uninstall) {
-        if ($PurgeData -and -not $PSBoundParameters.ContainsKey('Confirm')) {
-            throw '-PurgeData deletes the index and models: add -Confirm (or -Confirm:$false once the user agreed)'
+        if ($PurgeData -and -not $Yes) {
+            throw '-PurgeData deletes the index and models: add -Yes once the user agreed'
         }
         $o = [ordered]@{ ok = $true; action = 'uninstall'; install_dir = $dest; removed = $false; path_removed = $false
             task_removed = $false; skills_removed = @(); data_purged = $false }

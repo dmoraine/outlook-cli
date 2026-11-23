@@ -85,11 +85,18 @@ try {
     $r = Run $install @('-Version', '1.2', '-Json')
     Check ($code -ne 0) "invalid -Version rejected"
 
-    # -PurgeData needs -Confirm.
+    # -PurgeData needs -Yes; checked with the documented Windows PowerShell 5.1 -File command line, then this edition.
     $r = Run $install @('-Uninstall', '-PurgeData', '-Json')
-    Check ($code -ne 0 -and (Test-Path "$data\index.sqlite")) "-PurgeData without -Confirm refused"
-    $r = Run $install @('-Uninstall', '-PurgeData', '-Confirm:$false', '-Json')
-    Check ($code -eq 0 -and $r.data_purged -eq $true -and -not (Test-Path $data)) "-PurgeData -Confirm removes the data"
+    Check ($code -ne 0 -and (Test-Path "$data\index.sqlite")) "-PurgeData without -Yes refused"
+    Push-Location $root
+    try { $out = powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall -PurgeData -Yes -Json; $code = $LASTEXITCODE }
+    finally { Pop-Location }
+    $r = $null; try { $r = ($out | Out-String).Trim() | ConvertFrom-Json } catch { Write-Host "not JSON: $out" }
+    Check ($code -eq 0 -and $r.data_purged -eq $true -and -not (Test-Path $data)) "powershell -File -PurgeData -Yes removes the data"
+    New-Item -ItemType Directory -Force -Path $data | Out-Null
+    Set-Content -Path "$data\index.sqlite" -Value 'x'
+    $r = Run $install @('-Uninstall', '-PurgeData', '-Yes', '-Json')
+    Check ($code -eq 0 -and $r.data_purged -eq $true -and -not (Test-Path $data)) "-PurgeData -Yes removes the data"
 
     # Scheduled task: -WhatIf, register, update, status, run log + rotation, remove.
     Run $install @('-FromDir', $ExeDir, '-Json') | Out-Null
