@@ -25,6 +25,12 @@ pub struct Model {
     pub revision: &'static str,
     pub dims: usize,
     pub files: [ModelFile; 3],
+    /// Peak memory of one embedding worker (default worker count). e5-small:
+    /// measured peak RSS 1.20 GiB (1,253,092 KiB; `bench-embed --workers 1`,
+    /// batch 8, 3 threads, Linux x86_64), rounded up to 1.25 GiB. e5-base:
+    /// estimated from file sizes, e5-small's RSS being 2.7x its 471 MB
+    /// weights: 2.7 x 1.11 GB = 3.0 GB, 2.75 GiB.
+    pub worker_bytes: u64,
 }
 
 /// Pinned from the Hugging Face API (LFS sha256; config.json: git blob id
@@ -52,6 +58,7 @@ pub const MODELS: [Model; 2] = [
                 sha256: "1a55775f53449dac10a2bcbc312469fac40b96d53198c407081a831f81c98477",
             },
         ],
+        worker_bytes: 1280 << 20,
     },
     Model {
         name: "e5-base",
@@ -75,6 +82,7 @@ pub const MODELS: [Model; 2] = [
                 sha256: "a18a44fad1d0b46ded15928144138cff1135d5cc8233bdd90be5f18822de09a7",
             },
         ],
+        worker_bytes: 2816 << 20,
     },
 ];
 

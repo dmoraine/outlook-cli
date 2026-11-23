@@ -1,7 +1,9 @@
 //! Attachment text extraction: PDF text layer, DOCX, PPTX, XLSX, TXT, CSV,
 //! HTML. Pure Rust. Parsers see untrusted files: `extract` turns a panic
-//! into `failed`, and `Isolated` runs it in a child process
-//! (`outlook-index extract-worker`) killed after a per-file timeout.
+//! into `failed` and a structural cap into `too_complex`, and `Isolated`
+//! runs it in a child process (`outlook-index extract-worker`) killed after
+//! a per-file timeout, under an OS memory limit. The parent only sniffs
+//! magic bytes and sizes; every archive and PDF is parsed in the child.
 
 use std::borrow::Cow;
 use std::io::{BufReader, Cursor, Read, Write};
@@ -9,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quick_xml::events::{BytesStart, Event};
 use serde::{Deserialize, Serialize};
@@ -62,6 +64,11 @@ pub enum Skip {
     /// Malformed file, parser panic or worker crash.
     Failed,
     Timeout,
+    /// Past a structural cap of the parser (zip entries, path depth,
+    /// decompressed bytes or ratio; XML depth or elements; PDF objects or pages).
+    TooComplex,
+    /// The child died of its OS memory limit (or overflowed its stack).
+    MemoryLimit,
 }
 
 impl Skip {
@@ -76,6 +83,8 @@ impl Skip {
             Skip::EmptyText => "empty_text",
             Skip::Failed => "failed",
             Skip::Timeout => "timeout",
+            Skip::TooComplex => "too_complex",
+            Skip::MemoryLimit => "memory_limit",
         }
     }
 }
@@ -110,8 +119,30 @@ impl Default for Limits {
 /// Default per-file timeout of `Isolated`.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Decompressed bytes read from one zip part (zip bomb guard).
+/// Structural caps, enforced in the parser (past one: `too_complex`).
+/// Zip: entries, path depth of an entry name, decompressed bytes read from
+/// one part and from the whole file, and decompressed / compressed bytes of
+/// a part past `RATIO_FROM` (zip bomb). Nested archives are never opened.
+const MAX_ENTRIES: usize = 10_000;
+const MAX_DEPTH: usize = 16;
 const MAX_PART: u64 = 256 << 20;
+const MAX_UNZIPPED: u64 = 512 << 20;
+// ponytail: fixed ratio; legit OOXML parts past 16 MiB pack well under 100x, bombs 200-1000x.
+const MAX_RATIO: u64 = 100;
+const RATIO_FROM: u64 = 16 << 20;
+/// XML: element nesting and elements per part.
+const MAX_XML_DEPTH: usize = 256;
+const MAX_XML_ELEMENTS: u64 = 10_000_000;
+/// PDF: objects (lopdf holds them all in memory) and pages.
+const MAX_PDF_OBJECTS: usize = 200_000;
+const MAX_PDF_PAGES: usize = 10_000;
+
+/// Default OS memory limit of the extraction child: a quarter of the
+/// physical memory available at start, within 256 MiB..2 GiB; 1 GiB when
+/// unknown.
+pub fn memory_limit(available: Option<u64>) -> u64 {
+    available.map_or(1 << 30, |a| (a / 4).clamp(256 << 20, 2 << 30))
+}
 
 pub type Outcome = std::result::Result<Extracted, Skip>;
 
@@ -151,9 +182,8 @@ fn by_mime(mime: Option<&str>) -> Option<Typed> {
 
 /// A kind, or the reason to skip.
 type Typed = std::result::Result<Kind, Skip>;
-type Zip<'a> = zip::ZipArchive<Cursor<&'a [u8]>>;
 
-/// Kind from magic bytes: %PDF, images, PK zip with an Office main part.
+/// Kind from magic bytes: %PDF, images, PK zip naming an Office main part.
 fn by_magic(b: &[u8]) -> Option<Typed> {
     if b[..b.len().min(1024)].windows(5).any(|w| w == b"%PDF-") {
         return Some(Ok(Kind::Pdf));
@@ -165,11 +195,17 @@ fn by_magic(b: &[u8]) -> Option<Typed> {
     if !b.starts_with(b"PK\x03\x04") {
         return None;
     }
-    let z = zip::ZipArchive::new(Cursor::new(b)).ok()?;
-    let has = |n: &str| z.index_for_name(n).is_some();
-    let k = [("word/document.xml", Kind::Docx), ("xl/workbook.xml", Kind::Xlsx), ("ppt/presentation.xml", Kind::Pptx)]
-        .into_iter()
-        .find(|(n, _)| has(n))?;
+    // Entry names are stored in clear in the zip headers: a byte search, no
+    // archive parsing in the parent.
+    // ponytail: a stored (uncompressed) nested archive may name another main part; the child then fails.
+    let has = |n: &[u8]| b.windows(n.len()).any(|w| w == n);
+    let k = [
+        (&b"word/document.xml"[..], Kind::Docx),
+        (b"xl/workbook.xml", Kind::Xlsx),
+        (b"ppt/presentation.xml", Kind::Pptx),
+    ]
+    .into_iter()
+    .find(|(n, _)| has(n))?;
     Some(Ok(k.1))
 }
 
@@ -292,7 +328,7 @@ fn parse(kind: Kind, b: &[u8], l: &Limits, out: &mut Out) -> std::result::Result
         if b.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
             return Err(Skip::Encrypted);
         }
-        let mut z = zip::ZipArchive::new(Cursor::new(b)).map_err(|_| Skip::Failed)?;
+        let mut z = open_zip(b)?;
         return match kind {
             Kind::Docx => docx(&mut z, out),
             Kind::Pptx => pptx(&mut z, out),
@@ -321,12 +357,23 @@ fn decode(b: &[u8]) -> String {
 
 /// Text layer, pages separated by a blank line.
 fn pdf(b: &[u8], out: &mut Out) -> std::result::Result<(), Skip> {
+    // Object headers are counted before lopdf loads them all; objects in
+    // object streams are counted after the load.
+    if b.windows(4).filter(|w| w == b" obj").count() > MAX_PDF_OBJECTS {
+        return Err(Skip::TooComplex);
+    }
     let encrypted = || b.windows(8).any(|w| w == b"/Encrypt");
     let mut doc = lopdf::Document::load_mem(b).map_err(|_| if encrypted() { Skip::Encrypted } else { Skip::Failed })?;
+    if doc.objects.len() > MAX_PDF_OBJECTS {
+        return Err(Skip::TooComplex);
+    }
     if doc.is_encrypted() && doc.decrypt("").is_err() {
         return Err(Skip::Encrypted);
     }
     let pages: Vec<u32> = doc.get_pages().into_keys().collect();
+    if pages.len() > MAX_PDF_PAGES {
+        return Err(Skip::TooComplex);
+    }
     let mut ok = 0;
     for p in &pages {
         let mut s = String::new();
@@ -364,18 +411,76 @@ fn text<'e>(e: &'e Event) -> Option<Cow<'e, str>> {
     }
 }
 
-/// Feed the events of zip part `name` to `f` until it returns false or the
-/// part ends. A missing part or broken XML is `failed`.
-fn walk(z: &mut Zip, name: &str, mut f: impl FnMut(&Event) -> bool) -> std::result::Result<(), Skip> {
-    let part = z.by_name(name).map_err(|_| Skip::Failed)?;
-    let mut r = quick_xml::Reader::from_reader(BufReader::new(part.take(MAX_PART)));
-    let mut buf = Vec::new();
-    loop {
-        match r.read_event_into(&mut buf).map_err(|_| Skip::Failed)? {
-            Event::Eof => return Ok(()),
-            e if !f(&e) => return Ok(()),
-            _ => buf.clear(),
+/// A zip archive and the decompressed bytes read from it so far.
+struct Zip<'a> {
+    z: zip::ZipArchive<Cursor<&'a [u8]>>,
+    unzipped: u64,
+}
+
+/// Open `b` within the entry count and path depth caps.
+fn open_zip(b: &[u8]) -> std::result::Result<Zip<'_>, Skip> {
+    let z = zip::ZipArchive::new(Cursor::new(b)).map_err(|_| Skip::Failed)?;
+    if z.len() > MAX_ENTRIES || z.file_names().flatten().any(|n| n.matches(['/', '\\']).count() >= MAX_DEPTH) {
+        return Err(Skip::TooComplex);
+    }
+    Ok(Zip { z, unzipped: 0 })
+}
+
+/// Decompressed bytes of one part, within the part, file and ratio caps:
+/// past one, reads fail and `over` is set.
+struct Capped<'z, R> {
+    r: R,
+    part: u64,
+    packed: u64,
+    unzipped: &'z mut u64,
+    over: bool,
+}
+
+impl<R: Read> Read for Capped<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.r.read(buf)?;
+        self.part += n as u64;
+        *self.unzipped += n as u64;
+        self.over |= self.part > MAX_PART
+            || *self.unzipped > MAX_UNZIPPED
+            || (self.part > RATIO_FROM && self.part / self.packed.max(1) > MAX_RATIO);
+        if self.over {
+            return Err(std::io::Error::other("past a decompression cap"));
         }
+        Ok(n)
+    }
+}
+
+/// Feed the events of zip part `name` to `f` until it returns false or the
+/// part ends. A missing part or broken XML is `failed`; past a cap
+/// (decompression, XML depth or elements), `too_complex`.
+fn walk(z: &mut Zip, name: &str, mut f: impl FnMut(&Event) -> bool) -> std::result::Result<(), Skip> {
+    let Zip { z, unzipped } = z;
+    let part = z.by_name(name).map_err(|_| Skip::Failed)?;
+    let packed = part.compressed_size();
+    let mut r =
+        quick_xml::Reader::from_reader(BufReader::new(Capped { r: part, part: 0, packed, unzipped, over: false }));
+    let (mut buf, mut depth, mut elements) = (Vec::new(), 0usize, 0u64);
+    loop {
+        let e = match r.read_event_into(&mut buf) {
+            Ok(e) => e,
+            Err(_) if r.get_ref().get_ref().over => return Err(Skip::TooComplex),
+            Err(_) => return Err(Skip::Failed),
+        };
+        match e {
+            Event::Start(_) => (depth, elements) = (depth + 1, elements + 1),
+            Event::Empty(_) => elements += 1,
+            Event::End(_) => depth = depth.saturating_sub(1),
+            Event::Eof => return Ok(()),
+            _ => {}
+        }
+        if depth > MAX_XML_DEPTH || elements > MAX_XML_ELEMENTS {
+            return Err(Skip::TooComplex);
+        }
+        if !f(&e) {
+            return Ok(());
+        }
+        buf.clear();
     }
 }
 
@@ -421,14 +526,14 @@ fn docx(z: &mut Zip, out: &mut Out) -> std::result::Result<(), Skip> {
 /// Slides in number order, separated by a blank line.
 // ponytail: number order, not presentation.xml's sldIdLst; reordered decks keep file order.
 fn pptx(z: &mut Zip, out: &mut Out) -> std::result::Result<(), Skip> {
-    let mut slides: Vec<(u32, String)> = z
-        .file_names()
-        .flatten()
-        .filter_map(|n| {
-            let k = n.strip_prefix("ppt/slides/slide")?.strip_suffix(".xml")?.parse().ok()?;
-            Some((k, n.to_string()))
-        })
-        .collect();
+    let mut slides: Vec<(u32, String)> =
+        z.z.file_names()
+            .flatten()
+            .filter_map(|n| {
+                let k = n.strip_prefix("ppt/slides/slide")?.strip_suffix(".xml")?.parse().ok()?;
+                Some((k, n.to_string()))
+            })
+            .collect();
     slides.sort();
     if slides.is_empty() {
         return Err(Skip::Failed);
@@ -456,7 +561,7 @@ fn column(r: &str) -> Option<usize> {
 fn xlsx(z: &mut Zip, l: &Limits, out: &mut Out) -> std::result::Result<(), Skip> {
     // Shared strings: <si> = concatenated <t>, phonetic runs (<rPh>) excluded.
     let mut shared = Vec::new();
-    if z.index_for_name("xl/sharedStrings.xml").is_some() {
+    if z.z.index_for_name("xl/sharedStrings.xml").is_some() {
         let (mut cur, mut in_t, mut rph, mut size) = (String::new(), false, false, 0);
         walk(z, "xl/sharedStrings.xml", |e| {
             match tag(e) {
@@ -483,7 +588,7 @@ fn xlsx(z: &mut Zip, l: &Limits, out: &mut Out) -> std::result::Result<(), Skip>
         true
     })?;
     let mut targets = std::collections::HashMap::new();
-    if z.index_for_name("xl/_rels/workbook.xml.rels").is_some() {
+    if z.z.index_for_name("xl/_rels/workbook.xml.rels").is_some() {
         walk(z, "xl/_rels/workbook.xml.rels", |e| {
             if let Event::Start(s) | Event::Empty(s) = e
                 && let (Some(id), Some(t)) = (attr(s, "Id"), attr(s, "Target"))
@@ -572,8 +677,14 @@ struct Request {
 /// `{kind, limits}` then a data frame; one reply = JSON `{"Ok":..}` or
 /// `{"Err":"reason"}`. Ends at end of input.
 pub fn serve(r: &mut impl Read, w: &mut impl Write) -> Result<()> {
+    // Test hook (proves the OS limit): OUTLOOK_INDEX_TEST_EXTRACT_ALLOC=<MiB>
+    // allocates and touches that much for a file of exactly `TEST_ALLOC`.
+    let alloc: usize = std::env::var("OUTLOOK_INDEX_TEST_EXTRACT_ALLOC").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     while let Some(h) = read_frame(r)? {
         let data = read_frame(r)?.ok_or_else(|| Error::Io("extract worker: missing data frame".into()))?;
+        if alloc > 0 && data == b"TEST_ALLOC" {
+            std::hint::black_box(vec![1u8; alloc << 20]);
+        }
         let reply = match serde_json::from_slice::<Request>(&h) {
             Ok(q) => run(q.kind, &data, &q.limits),
             Err(_) => Err(Skip::Failed),
@@ -590,6 +701,9 @@ struct Worker {
     proc: Child,
     tx: mpsc::Sender<Vec<u8>>,
     rx: mpsc::Receiver<Vec<u8>>,
+    /// Holds the memory limit; closing it kills the child.
+    #[cfg(windows)]
+    _job: Option<job::Job>,
 }
 
 impl Drop for Worker {
@@ -599,9 +713,21 @@ impl Drop for Worker {
     }
 }
 
-fn spawn(cmd: &mut Command) -> std::io::Result<Worker> {
+fn spawn(cmd: &mut Command, memory: Option<u64>) -> std::io::Result<Worker> {
     // stderr discarded: nothing from a parsed file reaches the parent's output.
     let mut proc = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    // Into its job right away: it reads no file before the first request.
+    #[cfg(windows)]
+    let job = match memory.map(|m| job::Job::assign(&proc, m)).transpose() {
+        Ok(j) => j,
+        Err(e) => {
+            let _ = proc.kill();
+            let _ = proc.wait();
+            return Err(e);
+        }
+    };
+    #[cfg(not(windows))]
+    let _ = memory;
     let (mut stdin, stdout) = (proc.stdin.take().unwrap(), proc.stdout.take().unwrap());
     let (tx, requests) = mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
@@ -620,30 +746,242 @@ fn spawn(cmd: &mut Command) -> std::io::Result<Worker> {
             }
         }
     });
+    #[cfg(windows)]
+    return Ok(Worker { proc, tx, rx, _job: job });
+    #[cfg(not(windows))]
     Ok(Worker { proc, tx, rx })
 }
 
-/// Parent side: extraction in a child process, restarted after a timeout or
-/// a crash. Type and size checks run here; the child gets the kind and the
-/// bytes, never the name.
+/// The child died of its memory limit: a failed allocation aborts it
+/// (SIGABRT; Windows: fail-fast 0xC0000409 or STATUS_NO_MEMORY), or the OS
+/// killed it (SIGKILL). A stack overflow aborts the same way.
+fn out_of_memory(s: std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        matches!(s.signal(), Some(6 | 9))
+    }
+    #[cfg(windows)]
+    {
+        matches!(s.code().map(|c| c as u32), Some(0xC000_0409 | 0xC000_0017))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = s;
+        false
+    }
+}
+
+/// Targets where `with_memory` sets the child's address space limit
+/// (RLIMIT_AS): Linux, macOS, FreeBSD, DragonFly, NetBSD. Windows uses a job
+/// object. Other Unix (OpenBSD has no RLIMIT_AS, Solaris, illumos, ...): no
+/// OS limit, only the caps and the timeout; `memory_enforced` is false.
+pub const MEMORY_ENFORCED: bool = cfg!(any(
+    windows,
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd"
+));
+
+/// Unix: the child's address space limit (RLIMIT_AS), set between fork and exec.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd"
+))]
+fn limit_address_space(cmd: &mut Command, bytes: u64) {
+    use std::os::unix::process::CommandExt;
+    // rlim_t and RLIMIT_AS per <sys/resource.h>.
+    #[cfg(target_os = "linux")]
+    type Rlim = std::ffi::c_ulong;
+    #[cfg(any(target_os = "macos", target_os = "netbsd"))]
+    type Rlim = u64;
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    type Rlim = i64;
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "mips", target_arch = "mips64", target_arch = "mips32r6", target_arch = "mips64r6"))
+    ))]
+    const RLIMIT_AS: i32 = 9;
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "mips", target_arch = "mips64", target_arch = "mips32r6", target_arch = "mips64r6")
+    ))]
+    const RLIMIT_AS: i32 = 6;
+    #[cfg(target_os = "macos")]
+    const RLIMIT_AS: i32 = 5;
+    // RLIMIT_VMEM, aliased RLIMIT_AS.
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))]
+    const RLIMIT_AS: i32 = 10;
+    #[repr(C)]
+    struct RLimit {
+        cur: Rlim,
+        max: Rlim,
+    }
+    unsafe extern "C" {
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    }
+    let b = Rlim::try_from(bytes).unwrap_or(Rlim::MAX);
+    let l = RLimit { cur: b, max: b };
+    // SAFETY: the closure runs in the forked child before exec, where only
+    // async-signal-safe calls are allowed. It allocates nothing and takes no
+    // lock: `l` was built before the fork, setrlimit is a direct system call
+    // wrapper (glibc and musl: prlimit64; libSystem and the BSD libcs: the
+    // setrlimit syscall), and `last_os_error` only reads errno. The limit
+    // survives exec.
+    unsafe {
+        cmd.pre_exec(move || if setrlimit(RLIMIT_AS, &l) == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) });
+    }
+}
+
+/// Windows: a job object per child with JOB_OBJECT_LIMIT_PROCESS_MEMORY
+/// (allocations past it fail) and KILL_ON_JOB_CLOSE.
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    type Handle = *mut c_void;
+
+    /// JOBOBJECT_BASIC_LIMIT_INFORMATION.
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimit {
+        per_process_user_time: i64,
+        per_job_user_time: i64,
+        flags: u32,
+        min_working_set: usize,
+        max_working_set: usize,
+        active_processes: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    /// JOBOBJECT_EXTENDED_LIMIT_INFORMATION (IO_COUNTERS = 6 x u64).
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimit {
+        basic: BasicLimit,
+        io: [u64; 6],
+        process_memory: usize,
+        job_memory: usize,
+        peak_process_memory: usize,
+        peak_job_memory: usize,
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(size_of::<ExtendedLimit>() == 144);
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(job: Handle, class: i32, info: *mut c_void, len: u32) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn CloseHandle(h: Handle) -> i32;
+    }
+    const EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const LIMIT_PROCESS_MEMORY: u32 = 0x100;
+    const LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+
+    /// An owned job handle; closing it kills the processes in it.
+    pub struct Job(Handle);
+
+    impl Job {
+        /// A new job limiting `child` to `bytes` of committed memory.
+        pub fn assign(child: &std::process::Child, bytes: u64) -> std::io::Result<Job> {
+            let err = std::io::Error::last_os_error;
+            // SAFETY: null attributes and name are documented: default
+            // security, unnamed job.
+            let h = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if h.is_null() {
+                return Err(err());
+            }
+            let job = Job(h);
+            let mut info = ExtendedLimit::default();
+            info.basic.flags = LIMIT_PROCESS_MEMORY | LIMIT_KILL_ON_JOB_CLOSE;
+            info.process_memory = usize::try_from(bytes).unwrap_or(usize::MAX);
+            let len = size_of::<ExtendedLimit>() as u32;
+            // SAFETY: `info` is a JOBOBJECT_EXTENDED_LIMIT_INFORMATION (layout
+            // above, size checked) of `len` bytes; `h` is the job just created.
+            if unsafe { SetInformationJobObject(h, EXTENDED_LIMIT_INFORMATION, (&raw mut info).cast(), len) } == 0 {
+                return Err(err());
+            }
+            // SAFETY: the process handle stays open while `child` lives.
+            if unsafe { AssignProcessToJobObject(h, child.as_raw_handle()) } == 0 {
+                return Err(err());
+            }
+            Ok(job)
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: an owned handle, closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Parent side: extraction in a child process, restarted after a timeout,
+/// a crash or a memory kill. Size checks and magic-byte sniffing run here;
+/// the child gets the kind and the bytes, never the name.
 pub struct Isolated {
     pub limits: Limits,
     pub timeout: Duration,
     /// Child processes started so far.
     pub spawned: usize,
+    /// OS memory limit of each child in bytes (`with_memory`); enforced only
+    /// where `MEMORY_ENFORCED`.
+    pub memory: Option<u64>,
     cmd: Command,
     worker: Option<Worker>,
 }
 
 impl Isolated {
     pub fn new(cmd: Command, timeout: Duration, limits: Limits) -> Isolated {
-        Isolated { limits, timeout, spawned: 0, cmd, worker: None }
+        Isolated { limits, timeout, spawned: 0, memory: None, cmd, worker: None }
+    }
+
+    /// Children limited to `bytes` of memory: past it the child dies, the
+    /// file is `memory_limit` and the next file gets a new child.
+    pub fn with_memory(mut self, bytes: u64) -> Isolated {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd"
+        ))]
+        limit_address_space(&mut self.cmd, bytes);
+        self.memory = Some(bytes);
+        self
+    }
+
+    /// Why the worker's child ended: `memory_limit` when limited and its exit
+    /// says so, else `failed`.
+    fn death(&mut self) -> Skip {
+        let Some(w) = self.worker.as_mut() else { return Skip::Failed };
+        // Its output closed: it is exiting.
+        let t = Instant::now();
+        let status = loop {
+            match w.proc.try_wait() {
+                Ok(None) if t.elapsed() < Duration::from_secs(2) => std::thread::sleep(Duration::from_millis(10)),
+                Ok(s) => break s,
+                Err(_) => break None,
+            }
+        };
+        if self.memory.is_some() && status.is_some_and(out_of_memory) { Skip::MemoryLimit } else { Skip::Failed }
     }
 
     pub fn extract(&mut self, bytes: &[u8], name: Option<&str>, mime: Option<&str>) -> Outcome {
         let kind = check(bytes, name, mime, &self.limits)?;
         if self.worker.is_none() {
-            self.worker = Some(spawn(&mut self.cmd).map_err(|_| Skip::Failed)?);
+            self.worker = Some(spawn(&mut self.cmd, self.memory).map_err(|_| Skip::Failed)?);
             self.spawned += 1;
         }
         let w = self.worker.as_ref().unwrap();
@@ -655,7 +993,7 @@ impl Isolated {
         let r = match reply {
             Ok(f) => serde_json::from_slice(&f).map_err(|_| Skip::Failed),
             Err(RecvTimeoutError::Timeout) => Err(Skip::Timeout),
-            Err(RecvTimeoutError::Disconnected) => Err(Skip::Failed),
+            Err(RecvTimeoutError::Disconnected) => Err(self.death()),
         };
         match r {
             Ok(r) => r,
@@ -671,12 +1009,16 @@ impl Isolated {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::io::{Cursor, Write};
-    use std::time::Instant;
 
     use super::*;
 
     /// A minimal PDF with one Helvetica text line per page.
     pub fn pdf(pages: &[&str]) -> Vec<u8> {
+        pdf_with(pages, 0)
+    }
+
+    /// `pdf` plus `nulls` extra null objects.
+    fn pdf_with(pages: &[&str], nulls: usize) -> Vec<u8> {
         let n = pages.len();
         let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 4 + 2 * i)).collect();
         let mut objs = vec![
@@ -692,6 +1034,7 @@ pub(crate) mod tests {
             let s = if t.is_empty() { String::new() } else { format!("BT /F1 12 Tf 72 720 Td ({t}) Tj ET") };
             objs.push(format!("<< /Length {} >>\nstream\n{s}\nendstream", s.len()));
         }
+        objs.extend(std::iter::repeat_n("null".to_string(), nulls));
         let mut out = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
         for (i, o) in objs.iter().enumerate() {
@@ -708,12 +1051,115 @@ pub(crate) mod tests {
     }
 
     pub fn zip(files: &[(&str, &str)]) -> Vec<u8> {
+        zip_bytes(&files.iter().map(|(n, b)| (n.to_string(), b.as_bytes().to_vec())).collect::<Vec<_>>())
+    }
+
+    fn zip_bytes(files: &[(String, Vec<u8>)]) -> Vec<u8> {
         let mut z = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, body) in files {
-            z.start_file(*name, ::zip::write::SimpleFileOptions::default()).unwrap();
-            z.write_all(body.as_bytes()).unwrap();
+            z.start_file(name, ::zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(body).unwrap();
         }
         z.finish().unwrap().into_inner()
+    }
+
+    /// A docx whose document.xml is `head` then `mib` MiB of `chunk`, deflated.
+    fn zip_bomb(head: &str, chunk: &str, mib: usize) -> Vec<u8> {
+        let mut z = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+        z.start_file("word/document.xml", ::zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(head.as_bytes()).unwrap();
+        let block = chunk.repeat((1 << 20) / chunk.len());
+        for _ in 0..mib {
+            z.write_all(block.as_bytes()).unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    fn outcome(r: Outcome) -> &'static str {
+        r.map_or_else(Skip::as_str, |_| "ok")
+    }
+
+    const DOC: &str = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#;
+
+    /// S10: hostile archives hit a structural cap in the parser: too_complex.
+    #[test]
+    fn hostile_zip_is_too_complex() {
+        // 32 MiB of empty paragraphs from a few KB (ratio cap).
+        let b = zip_bomb(DOC, "<w:p/>", 32);
+        assert!(b.len() < 1 << 20, "{}", b.len());
+        assert_eq!(outcome(extract(&b, Some("bomb.docx"), None)), "too_complex");
+        // Zips nested in zips under a deep entry path (depth cap).
+        let mut nested = zip(&[("a.txt", "Fictitious")]);
+        for _ in 0..8 {
+            nested = zip_bytes(&[("inner.zip".into(), nested)]);
+        }
+        let main = format!("{DOC}<w:p><w:r><w:t>Fictitious</w:t></w:r></w:p></w:body></w:document>");
+        let deep = zip_bytes(&[
+            ("word/document.xml".into(), main.clone().into_bytes()),
+            (format!("{}x.zip", "d/".repeat(40)), nested),
+        ]);
+        assert_eq!(outcome(extract(&deep, Some("deep.docx"), None)), "too_complex");
+        // Too many entries.
+        let mut many = vec![("word/document.xml".to_string(), main.into_bytes())];
+        many.extend((0..10_001).map(|i| (format!("word/media/e{i}"), Vec::new())));
+        assert_eq!(outcome(extract(&zip_bytes(&many), Some("many.docx"), None)), "too_complex");
+        // XML nested deeper than the depth cap.
+        let xml = format!("{DOC}{}<w:t>deep</w:t></w:body></w:document>", "<w:p>".repeat(1000));
+        let b = zip(&[("word/document.xml", &xml)]);
+        assert_eq!(outcome(extract(&b, Some("deep.docx"), None)), "too_complex");
+    }
+
+    /// S10: PDFs past the object or page caps: too_complex.
+    #[test]
+    fn hostile_pdf_is_too_complex() {
+        let b = pdf_with(&["Fictitious"], 250_000);
+        assert!(b.len() < 20 << 20, "{}", b.len());
+        assert_eq!(outcome(extract(&b, Some("objects.pdf"), None)), "too_complex");
+        assert_eq!(outcome(extract(&pdf(&[""; 10_001]), Some("pages.pdf"), None)), "too_complex");
+    }
+
+    /// S10: available memory / 4, within 256 MiB..2 GiB; 1 GiB when unknown.
+    #[test]
+    fn memory_limit_clamped() {
+        const M: u64 = 1 << 20;
+        assert_eq!(memory_limit(None), 1024 * M);
+        assert_eq!(memory_limit(Some(0)), 256 * M);
+        assert_eq!(memory_limit(Some(1024 * M)), 256 * M);
+        assert_eq!(memory_limit(Some(4096 * M)), 1024 * M);
+        assert_eq!(memory_limit(Some(6000 * M)), 1500 * M);
+        assert_eq!(memory_limit(Some(8192 * M)), 2048 * M);
+        assert_eq!(memory_limit(Some(64 << 30)), 2048 * M);
+    }
+
+    /// S10: how a dead child died: the memory limit (allocation abort or
+    /// kill) or anything else.
+    #[test]
+    fn memory_deaths() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            let s = std::process::ExitStatus::from_raw;
+            assert!(out_of_memory(s(6)) && out_of_memory(s(9)), "SIGABRT, SIGKILL");
+            assert!(!out_of_memory(s(11)) && !out_of_memory(s(1 << 8)) && !out_of_memory(s(0)), "SIGSEGV, exit 1, 0");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            let s = std::process::ExitStatus::from_raw;
+            assert!(out_of_memory(s(0xC000_0409)) && out_of_memory(s(0xC000_0017)));
+            assert!(!out_of_memory(s(1)) && !out_of_memory(s(0xC000_0005)));
+        }
+    }
+
+    /// S10: the parent only sniffs bytes: a local header naming the main
+    /// part is enough, no archive is parsed.
+    #[test]
+    fn office_sniffed_without_parsing() {
+        let mut b = b"PK\x03\x04".to_vec();
+        b.extend([0u8; 26]);
+        b.extend(b"word/document.xml");
+        assert_eq!(kind(&b, None, None), Ok(Kind::Docx));
+        assert_eq!(kind(b"PK\x03\x04 no part", None, None), Err(Skip::UnsupportedType));
     }
 
     const CT: &str =

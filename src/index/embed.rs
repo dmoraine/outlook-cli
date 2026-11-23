@@ -49,6 +49,14 @@ pub fn default_workers(cpus: usize) -> usize {
     (cpus.saturating_sub(2) / DEFAULT_THREADS).max(1)
 }
 
+/// Default workers: the CPU rule, lowered so that the workers fit in the
+/// physical memory available at start less 1 GiB (`Model::worker_bytes`
+/// each); at least 1. Unknown memory: the CPU rule.
+pub fn default_workers_for(cpus: usize, available: Option<u64>, m: &Model) -> usize {
+    let fit = available.map_or(usize::MAX, |a| (a.saturating_sub(1 << 30) / m.worker_bytes) as usize);
+    default_workers(cpus).min(fit).max(1)
+}
+
 pub fn logical_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
@@ -312,6 +320,20 @@ mod tests {
         let w: Vec<usize> = [1, 2, 4, 5, 8, 14, 16].into_iter().map(default_workers).collect();
         assert_eq!(w, [1, 1, 1, 1, 2, 4, 4]);
         assert_eq!(DEFAULT_THREADS, 3);
+    }
+
+    /// S10: min(CPU rule, (available - 1 GiB) / per-worker estimate), at least 1.
+    #[test]
+    fn workers_default_by_memory() {
+        let [small, base] = &crate::index::model::MODELS;
+        let w = |cpus, gib: u64, m| default_workers_for(cpus, Some(gib << 30), m);
+        for (m, want) in [(base, [[1, 2], [1, 4], [1, 4]]), (small, [[1, 4], [1, 4], [1, 4]])] {
+            let got = [8, 16, 32].map(|gib| [w(4, gib, m), w(14, gib, m)]);
+            assert_eq!(got, want, "{}: 8/16/32 GiB x 4/14 CPUs", m.name);
+        }
+        assert_eq!((w(14, 2, base), w(14, 0, small)), (1, 1), "at least one");
+        assert_eq!(default_workers_for(14, None, base), 4, "unknown memory: CPU rule");
+        assert_eq!(default_workers_for(32, Some(12 << 30), base), 4, "memory bound below the CPU rule (10)");
     }
 
     #[test]

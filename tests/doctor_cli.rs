@@ -11,10 +11,12 @@ fn doctor_errors_leak_nothing() {
     std::fs::write(&junk, b"SECRET_BODY not a pst".repeat(100)).unwrap();
     let missing = dir.join("SECRET_missing.ost");
     for (file, kind, extra) in [
-        (&junk, "format", None),
-        (&missing, "io", None),
-        (&junk, "format", Some("--attachments")),
-        (&missing, "io", Some("--attachments")),
+        (&junk, "format", &[][..]),
+        (&missing, "io", &[]),
+        (&junk, "format", &["--attachments"]),
+        (&missing, "io", &["--attachments"]),
+        // S10: the extractor memory limit override is accepted.
+        (&junk, "format", &["--attachments", "--extract-memory-mb", "300"]),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_outlook-index"))
             .arg("doctor")

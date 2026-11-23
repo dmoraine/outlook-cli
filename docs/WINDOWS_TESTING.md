@@ -51,6 +51,18 @@ outlook-index doctor --attachments --pretty       # 300 attachments, each parsed
 ```
 
 Both print aggregates only and are meant to be pasted back whole (stdout and any stderr line).
+`doctor` also prints `machine.available_ram_bytes` and `machine.defaults`: the extractor memory limit
+(`extract_memory_mb`) and the default `workers` per model that `sync` would use on this PC.
+
+**Attachment extraction limits.** The child parses every archive and PDF; the parent only checks sizes and magic
+bytes. Past a structural cap (ZIP: 10,000 entries, 16 path levels, 256 MB unpacked per part and 512 MB per file,
+unpacked/packed ratio 100 past 16 MB; XML: 256 nesting levels, 10,000,000 elements per part; PDF: 200,000 objects,
+10,000 pages; nested archives are never opened) a file is skipped as `too_complex`. The child also runs in a Windows
+job object limited to a quarter of the physical memory available at start, clamped to 256 MB..2 GB (1 GB if
+unknown); `--extract-memory-mb N` (on `sync` and `doctor --attachments`, at least 128) overrides it. A child past it
+dies alone: the file is `memory_limit`, retried like `failed` (3 attempts in all), and the sync goes on with a new
+child. `doctor --attachments` shows the limit as `limits.memory_mb` / `limits.memory_enforced`; report any
+`too_complex` or `memory_limit` count.
 
 ## 4. Model files
 
@@ -63,8 +75,10 @@ outlook-index bench-embed --pretty # ~30 s, synthetic text; paste back
 ```
 
 `bench-embed` prints `passages_per_s` for the default `--workers`/`--threads` (14 logical CPUs: 4 workers × 3
-threads). Each worker is a process with its own copy of the model: if RAM is tight, lower `--workers` and use the
-same value for `sync`.
+threads, fewer when memory is short). Each worker is a process with its own copy of the model; the default count
+fits the memory available at start less 1 GB, at about 1.25 GB per e5-small worker (measured peak 1.20 GB) and
+2.75 GB per e5-base worker (estimated from file sizes). If RAM is still tight, lower `--workers` and use the same
+value for `sync`.
 
 ## 5. First sync
 

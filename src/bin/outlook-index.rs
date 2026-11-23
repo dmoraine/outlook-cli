@@ -71,10 +71,13 @@ enum Cmd {
         sample: Option<usize>,
         /// Attachment text extraction instead: whole random messages with
         /// attachments, each attachment extracted in a child process (30 s
-        /// timeout). Counts per type and skip reason, sizes, timings,
-        /// estimated chunks and the SHA-256 dedupe ratio.
+        /// timeout, memory limit). Counts per type and skip reason, sizes,
+        /// timings, estimated chunks and the SHA-256 dedupe ratio.
         #[arg(long)]
         attachments: bool,
+        /// With --attachments: memory limit of the extraction child, in MB.
+        #[arg(long, requires = "attachments", value_name = "MB", value_parser = clap::value_parser!(u64).range(128..))]
+        extract_memory_mb: Option<u64>,
     },
     /// Bring the index up to date with the file (every mail folder): new,
     /// deleted, moved and read/unread changes, then attachment text (see
@@ -97,6 +100,11 @@ enum Cmd {
         /// later sync without it catches up.
         #[arg(long)]
         no_attachments: bool,
+        /// Memory limit of the attachment extraction child, in MB; past it the
+        /// child is killed and the file counted as memory_limit. Default: a
+        /// quarter of the available memory at start, within 256..2048.
+        #[arg(long, value_name = "MB", value_parser = clap::value_parser!(u64).range(128..))]
+        extract_memory_mb: Option<u64>,
         /// Also index these well-known folders with their subfolders
         /// (deleted = Deleted Items, junk = Junk E-mail; none = neither, the
         /// default). Stored in the index: later syncs keep the choice.
@@ -322,7 +330,8 @@ impl EmbedArgs {
 struct ParArgs {
     /// Batches embedded at once. More than 1: that many worker processes,
     /// each with its own copy of the model. Default: (logical CPUs - 2) / 3,
-    /// at least 1.
+    /// lowered to what fits in the available memory less 1 GiB (about 1.25
+    /// GiB per e5-small worker, 2.75 GiB per e5-base one), at least 1.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
     workers: Option<u64>,
     /// Compute threads per worker.
@@ -341,14 +350,15 @@ fn worker_timeout(s: &str) -> std::result::Result<Duration, String> {
 }
 
 impl ParArgs {
-    fn workers(&self) -> usize {
-        self.workers.map_or_else(|| embed::default_workers(embed::logical_cpus()), |n| n as usize)
+    /// --workers, else the default for `m` and the `available` memory.
+    fn workers(&self, m: &model::Model, available: Option<u64>) -> usize {
+        self.workers.map_or_else(|| embed::default_workers_for(embed::logical_cpus(), available, m), |n| n as usize)
     }
 
     /// Effective (workers, threads); sets this process's compute threads
     /// (worker processes get --threads).
-    fn apply(&self) -> (usize, usize) {
-        (self.workers(), set_threads(self.threads as usize))
+    fn apply(&self, m: &model::Model, available: Option<u64>) -> (usize, usize) {
+        (self.workers(m, available), set_threads(self.threads as usize))
     }
 }
 
@@ -390,6 +400,8 @@ const MODEL_MISSING: &str = "model files missing; run outlook-index model fetch"
 
 /// Load the model and embed within `max_time` from `start`. Missing model
 /// files: Ok(skipped) when `missing_ok`, else the not_found error.
+/// `available`: physical memory at start (default worker count).
+#[allow(clippy::too_many_arguments)]
 fn embed_step(
     c: &mut rusqlite::Connection,
     a: &EmbedArgs,
@@ -397,9 +409,10 @@ fn embed_step(
     start: Instant,
     max_time: Option<Duration>,
     missing_ok: bool,
+    available: Option<u64>,
     p: &mut Progress,
 ) -> Result<Json> {
-    let (workers, threads) = a.par.apply();
+    let (workers, threads) = a.par.apply(m, available);
     // Before the workers start: they inherit it.
     let low = a.priority == Priority::Low && vectors::lower_priority();
     let t = Instant::now();
@@ -572,13 +585,16 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
     let mut lines = None;
     let v = match cli.cmd {
         // doctor output gets pasted back: its errors carry no path or content.
-        Cmd::Doctor { sample, attachments } => {
+        Cmd::Doctor { sample, attachments, extract_memory_mb } => {
             let f = file().map_err(doctor::sanitize)?;
             if attachments {
                 let exe = std::env::current_exe().map_err(|e| doctor::sanitize(Error::Io(e.to_string())))?;
                 let mut cmd = std::process::Command::new(exe);
                 cmd.arg("extract-worker");
-                let mut x = extract::Isolated::new(cmd, extract::TIMEOUT, extract::Limits::default());
+                let memory =
+                    extract_memory_mb.map_or_else(|| extract::memory_limit(doctor::available_ram()), |mb| mb << 20);
+                let mut x =
+                    extract::Isolated::new(cmd, extract::TIMEOUT, extract::Limits::default()).with_memory(memory);
                 doctor::run_attachments(&f, sample.unwrap_or(300), &mut x).map_err(doctor::sanitize)?
             } else {
                 doctor::run(&f, &index_path, sample.unwrap_or(200)).map_err(doctor::sanitize)?
@@ -589,11 +605,13 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             allow_mass_delete,
             no_embed,
             no_attachments,
+            extract_memory_mb,
             ref include_folders,
             ref embed,
             ref progress,
         } => {
             let start = Instant::now();
+            let available = doctor::available_ram();
             let max_time = max_time.as_deref().map(parse_duration).transpose()?;
             if include_folders.as_ref().is_some_and(|v| v.len() > 1 && v.iter().any(|x| x == "none")) {
                 return Err(Error::Usage(INCLUDE_NONE.into()));
@@ -607,21 +625,23 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let (mut c, _lock) = index::open_write(&index_path)?;
             // Model choice is checked before indexing.
             let m = if no_embed { None } else { Some(embed.model(&c)?) };
-            // Each attachment is parsed in a child process (30 s timeout, restarted after a failure).
+            // Each attachment is parsed in a child process (30 s timeout, memory
+            // limit, restarted after a failure).
             let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e| Error::Io(e.to_string()))?);
             cmd.arg("extract-worker");
             let limits = extract::Limits { max_bytes: attach::scope(&c)?.max_bytes as usize, ..Default::default() };
-            let mut x = extract::Isolated::new(cmd, extract::TIMEOUT, limits);
+            let memory = extract_memory_mb.map_or_else(|| extract::memory_limit(available), |mb| mb << 20);
+            let mut x = extract::Isolated::new(cmd, extract::TIMEOUT, limits).with_memory(memory);
             let mut extract = |b: &[u8], n: Option<&str>, m: Option<&str>| x.extract(b, n, m);
             let extract: Option<&mut doctor::ExtractFn> = if no_attachments { None } else { Some(&mut extract) };
-            let mut p = progress.start(m.map(|_| embed.par.workers()), m);
+            let mut p = progress.start(m.map(|m| embed.par.workers(m, available)), m);
             let mut v = sync::sync_with_progress(&mut c, &mut StoreSource::open(&f)?, extract, &opts, &mut p)?;
             let e = match m {
                 None => json!({ "skipped": "--no-embed" }),
                 Some(_) if max_time.is_some_and(|t| start.elapsed() >= t) => {
                     json!({ "skipped": "max-time reached; the next sync or embed resumes" })
                 }
-                Some(m) => embed_step(&mut c, embed, m, start, max_time, true, &mut p)?,
+                Some(m) => embed_step(&mut c, embed, m, start, max_time, true, available, &mut p)?,
             };
             p.finish(Some(&c))?;
             v.as_object_mut().unwrap().insert("embedding".into(), e);
@@ -632,8 +652,9 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
             let max_time = max_time.as_deref().map(parse_duration).transpose()?;
             let (mut c, _lock) = index::open_write(&existing(index_path)?)?;
             let m = embed.model(&c)?;
-            let mut p = progress.start(Some(embed.par.workers()), Some(m));
-            let v = embed_step(&mut c, embed, m, start, max_time, false, &mut p)?;
+            let available = doctor::available_ram();
+            let mut p = progress.start(Some(embed.par.workers(m, available)), Some(m));
+            let v = embed_step(&mut c, embed, m, start, max_time, false, available, &mut p)?;
             p.finish(Some(&c))?;
             v
         }
@@ -800,7 +821,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<()> {
         // Same default as sync: what the index will embed with.
         Cmd::BenchEmbed { ref model, seconds, ref par, batch } => {
             let (m, dir) = model.resolve(Some(&index_path))?;
-            let (workers, threads) = par.apply();
+            let (workers, threads) = par.apply(m, doctor::available_ram());
             let (t, time) = (Instant::now(), Duration::from_secs(seconds));
             if workers <= 1 {
                 let mut e = Embedder::load(m, &dir)?;

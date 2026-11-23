@@ -239,7 +239,8 @@ outlook-index doctor --sample 1000 --pretty      # plus précis, plus lent
 outlook-index doctor --attachments --pretty      # extraction de 300 pièces jointes (--sample N)
 ```
 
-`doctor` n'affiche que des agrégats : machine (OS, architecture, CPU, RAM), SQLite/FTS5, état de l'index
+`doctor` n'affiche que des agrégats : machine (OS, architecture, CPU, RAM totale et disponible, et `defaults` :
+`extract_memory_mb`, limite mémoire de l'extracteur, et `workers` par modèle, calculés comme `sync`), SQLite/FTS5, état de l'index
 (`exists`, `bytes`, `under_onedrive`, `permissions_warning`), type et taille du fichier, nombre de dossiers et de messages par préfixe de
 classe, profondeur et année, durée du scan complet, et pour l'échantillon : temps d'ouverture et d'extraction du
 texte (µs), longueurs de texte, estimation du nombre de chunks, couverture Message-ID, pièces jointes par
@@ -252,7 +253,8 @@ fichier, ni texte, ni chemin : la sortie complète peut être recopiée telle qu
 `doctor --attachments` ouvre des messages au hasard ayant des pièces jointes et extrait chaque pièce dans un
 processus fils : `by_kind` (`pdf`, `docx`, …, `image`, `other`) × issue (`ok` ou motif d'exclusion), `by_outcome`,
 `extracted` (caractères et temps d'extraction), `chunks` par type (échantillon et estimation pour la boîte),
-`dedupe` (`hashed`, `distinct`, `distinct_ratio` par SHA-256), `limits`, `workers_started`.
+`dedupe` (`hashed`, `distinct`, `distinct_ratio` par SHA-256), `limits` (dont `memory_mb` et `memory_enforced`),
+`workers_started`. `--extract-memory-mb N` y fixe la limite mémoire du processus fils, comme pour `sync`.
 
 ### sync
 
@@ -298,15 +300,30 @@ Pièces jointes : `sync` lit ensuite celles des messages nouveaux ou modifiés (
 avant, du plus récent au plus ancien, par lots). Pièces inline, images, fichiers trop gros, messages joints, liens
 et extensions inconnues sont écartés d'après leurs propriétés, sans lire les données. Le reste est lu, haché
 (SHA-256) et, pour un contenu inédit, extrait dans un processus fils (`outlook-index extract-worker`, interne ;
-30 s maximum, relancé après un échec). Un contenu est stocké et découpé une fois, partagé par tous les messages qui
-le portent, supprimé avec le dernier. Une extraction `failed` ou `timeout` est retentée par les syncs suivants
-(3 essais en tout).
+30 s maximum, limite mémoire, relancé après un échec). Le processus principal ne regarde que la taille et les
+octets magiques : toute archive (DOCX, XLSX, PPTX) et tout PDF sont analysés dans le fils. Un contenu est stocké et
+découpé une fois, partagé par tous les messages qui le portent, supprimé avec le dernier. Une extraction `failed`,
+`timeout` ou `memory_limit` est retentée par les syncs suivants (3 essais en tout).
+
+**Limites de l'extracteur.** Plafonds de structure, vérifiés dans le fils ; au-delà, motif `too_complex` (le fichier
+est écarté, le sync continue) : ZIP au plus 10 000 entrées, chemins d'au plus 16 niveaux, 256 Mo décompressés par
+partie et 512 Mo par fichier, rapport décompressé/compressé au plus 100 au-delà de 16 Mo (zip bomb) ; les archives
+imbriquées ne sont jamais ouvertes ; XML au plus 256 niveaux d'imbrication et 10 000 000 d'éléments par partie ;
+PDF au plus 200 000 objets et 10 000 pages. Limite mémoire du système sur le fils : par défaut un quart de la
+mémoire physique disponible au démarrage du sync, bornée entre 256 Mo et 2 Go (1 Go si elle est inconnue) ;
+`--extract-memory-mb N` la remplace (128 au minimum). Linux, macOS, FreeBSD, DragonFly, NetBSD : `RLIMIT_AS`
+(espace d'adressage) ; Windows : objet
+job (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`, le fils est tué avec le job). Un fils qui la dépasse meurt seul : motif
+`memory_limit` (aussi un débordement de pile), retenté comme un échec, le sync continue avec un nouveau fils.
+Autres systèmes (OpenBSD, qui n'a pas `RLIMIT_AS`, Solaris, illumos…) : pas de limite mémoire, seulement les
+plafonds et le délai, et `doctor --attachments` affiche `memory_enforced: false`. La limite n'est vérifiée en test
+que sous Linux et Windows ; macOS et les BSD ne sont pas testés.
 
 Formats extraits : PDF (couche texte, pas d'OCR), DOCX, PPTX, XLSX (au plus 20 000 lignes par feuille, 200 000
 cellules et 1 024 colonnes ; chaque cellule à sa colonne, les cellules vides en champs vides), TXT et CSV
 (UTF-8, UTF-16 avec BOM, sinon Windows-1252), HTML. Le type vient de l'extension, puis des octets magiques, puis du type MIME.
 Texte limité à 2 000 000 caractères. Motifs d'exclusion : `inline`, `image`, `too_large`, `unsupported_type` (archives, `.doc`/`.xls` anciens, Markdown…), `excluded_type`,
-`embedded_message`, `encrypted`, `empty_text` (PDF scanné), `failed`, `timeout`.
+`embedded_message`, `encrypted`, `empty_text` (PDF scanné), `failed`, `timeout`, `too_complex`, `memory_limit`.
 
 Résumé (stdout, compteurs seulement), notamment : `complete`, `new`, `refreshed`, `deleted`, `excluded_removed`, `moved`,
 `flags_changed`, `chunks_added`, `failed`, `remaining`, `errors` (par type), `totals`, `attachments_extracted`,
@@ -339,8 +356,12 @@ puis moyennés et normalisés.
 
 **Workers et threads.** `--workers N` (sur `sync`, `embed` et `bench-embed`) calcule N lots à la fois ;
 `--threads` est le nombre de threads *par worker*. Défauts : workers = max(1, (CPU logiques − 2) / 3), threads = 3,
-soit 4 × 3 pour 14 CPU. Au-delà d'un worker, chacun est un processus fils (`outlook-index embed-worker`, interne)
-avec sa propre copie du modèle : la mémoire croît avec N (VPS, e5-small : ~1,25 Go de RSS par processus).
+soit 4 × 3 pour 14 CPU, réduit pour tenir dans la mémoire disponible au démarrage moins 1 Gio : au plus
+(disponible − 1 Gio) / estimation par worker, au moins 1. Estimations : e5-small 1,25 Gio (pic de RSS mesuré
+1,20 Gio, `bench-embed --workers 1`, lot 8, 3 threads, Linux), e5-base 2,75 Gio (estimée d'après la taille des
+fichiers : 2,7 × 1,11 Go de poids, le rapport mesuré sur e5-small). `--workers` impose la valeur ; `doctor` affiche
+les défauts calculés (`machine.defaults.workers`). Au-delà d'un worker, chacun est un processus fils
+(`outlook-index embed-worker`, interne) avec sa propre copie du modèle : la mémoire croît avec N.
 `--worker-timeout` (ex. `5m`) borne l'attente d'un worker : chargement du modèle (défaut 180 s) puis chaque lot
 (défaut 120 s). Au-delà, le worker est tué, l'exécution s'arrête en erreur `io` (« timed out ») ; les lots déjà
 enregistrés restent, relancer reprend.

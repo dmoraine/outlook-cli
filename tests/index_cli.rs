@@ -351,6 +351,12 @@ fn attachments_cli() {
     }
     let o = run(&["sync", "--no-attachments", "--no-embed", "--file", "/nonexistent.ost"], &idx);
     assert_eq!(o.status.code(), Some(4), "flag accepted");
+    // S10: the extractor memory limit override, in MB.
+    let o = run(&["sync", "--extract-memory-mb", "300", "--no-embed", "--file", "/nonexistent.ost"], &idx);
+    assert_eq!(o.status.code(), Some(4), "flag accepted: {}", String::from_utf8_lossy(&o.stderr));
+    for bad in ["0", "127", "lots"] {
+        assert_eq!(run(&["sync", "--extract-memory-mb", bad], &idx).status.code(), Some(2), "{bad}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -20,7 +20,7 @@ use crate::ndb::Nid;
 use crate::store::Attachment;
 use crate::timeutil::now_ft;
 
-/// Extraction attempts of a failed or timed-out content, one per sync.
+/// Extraction attempts of a failed, timed-out or memory_limit content, one per sync.
 pub const MAX_ATTEMPTS: i64 = 3;
 /// Largest max size the scope accepts.
 pub const MAX_BYTES_LIMIT: u64 = 100 << 20;
@@ -95,7 +95,7 @@ pub fn gc(c: &Connection) -> Result<()> {
 pub struct Stats {
     pub extracted: u64,
     pub deduplicated: u64,
-    /// Extractions that failed or timed out.
+    /// Extractions that failed, timed out or hit the memory limit.
     pub failed: u64,
     pub skipped: BTreeMap<&'static str, u64>,
     /// Read errors by kind; the message is read again by the next sync.
@@ -234,7 +234,7 @@ fn skipped(
 }
 
 fn retry(outcome: &str, attempts: i64) -> bool {
-    matches!(outcome, "failed" | "timeout") && attempts < MAX_ATTEMPTS
+    matches!(outcome, "failed" | "timeout" | "memory_limit") && attempts < MAX_ATTEMPTS
 }
 
 /// One attachment: skip, deduplicate or extract, then link. True when no
@@ -314,7 +314,7 @@ fn one(
             }
             st.extracted += 1;
         }
-        Err(Skip::Failed | Skip::Timeout) => st.failed += 1,
+        Err(Skip::Failed | Skip::Timeout | Skip::MemoryLimit) => st.failed += 1,
         Err(r) => *st.skipped.entry(r.as_str()).or_default() += 1,
     }
     link(tx, message, a, Some(&sha), None)?;

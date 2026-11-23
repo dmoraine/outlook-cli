@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 
-use super::extract::{Isolated, Limits, Outcome, Skip, label, skip_attachment};
+use super::embed::{default_workers_for, logical_cpus};
+use super::extract::{Isolated, Limits, MEMORY_ENFORCED, Outcome, Skip, label, memory_limit, skip_attachment};
+use super::model::MODELS;
 use super::text;
 use crate::body::text_of;
 use crate::error::{Error, Result, with_retry};
@@ -144,39 +146,64 @@ fn pick(len: usize, n: usize, mut seed: u64) -> Vec<usize> {
     idx
 }
 
-/// Total physical memory in bytes, None when unknown.
+/// (total, available) physical memory in bytes, None when unknown.
 #[cfg(target_os = "linux")]
-fn total_ram() -> Option<u64> {
-    meminfo_total(&std::fs::read_to_string("/proc/meminfo").ok()?)
+fn ram() -> Option<(Option<u64>, Option<u64>)> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    Some((meminfo(&s, "MemTotal:"), meminfo(&s, "MemAvailable:")))
 }
 
 #[cfg(windows)]
-fn total_ram() -> Option<u64> {
+fn ram() -> Option<(Option<u64>, Option<u64>)> {
     #[repr(C)]
     struct MemoryStatusEx {
         length: u32,
         load: u32,
         total_phys: u64,
-        rest: [u64; 6],
+        avail_phys: u64,
+        rest: [u64; 5],
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GlobalMemoryStatusEx(m: *mut MemoryStatusEx) -> i32;
     }
-    let mut m = MemoryStatusEx { length: size_of::<MemoryStatusEx>() as u32, load: 0, total_phys: 0, rest: [0; 6] };
+    let mut m = MemoryStatusEx {
+        length: size_of::<MemoryStatusEx>() as u32,
+        load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        rest: [0; 5],
+    };
     // SAFETY: `m` is a MEMORYSTATUSEX (64 bytes) with dwLength set, as the API requires.
-    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.total_phys)
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some((Some(m.total_phys), Some(m.avail_phys)))
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn total_ram() -> Option<u64> {
+fn ram() -> Option<(Option<u64>, Option<u64>)> {
     None
 }
 
-/// "MemTotal:  16314312 kB" line of /proc/meminfo, in bytes.
+fn total_ram() -> Option<u64> {
+    ram()?.0
+}
+
+/// Physical memory available now (MemAvailable, ullAvailPhys), in bytes.
+pub fn available_ram() -> Option<u64> {
+    ram()?.1
+}
+
+/// Defaults computed from the available memory: the extraction child's
+/// memory limit and the embedding workers per model. Counts only.
+pub fn defaults(available: Option<u64>) -> Json {
+    let cpus = logical_cpus();
+    let workers: BTreeMap<_, _> = MODELS.iter().map(|m| (m.name, default_workers_for(cpus, available, m))).collect();
+    json!({ "extract_memory_mb": memory_limit(available) >> 20, "workers": workers })
+}
+
+/// "MemTotal:  16314312 kB"-style line `key` of /proc/meminfo, in bytes.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn meminfo_total(s: &str) -> Option<u64> {
-    let v = s.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.trim();
+fn meminfo(s: &str, key: &str) -> Option<u64> {
+    let v = s.lines().find_map(|l| l.strip_prefix(key))?.trim();
     v.strip_suffix("kB")?.trim().parse::<u64>().ok()?.checked_mul(1024)
 }
 
@@ -286,6 +313,7 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
         }
     }
     let sample_time = t.elapsed();
+    let available = available_ram();
     let per_message = if read > 0 { body_chunks as f64 / read as f64 } else { 0.0 };
 
     json!({
@@ -294,6 +322,8 @@ pub fn report(src: &mut dyn Source, sample: usize, seed: u64) -> Json {
             "arch": std::env::consts::ARCH,
             "cpus": std::thread::available_parallelism().map_or(0, |n| n.get()),
             "ram_bytes": total_ram(),
+            "available_ram_bytes": available,
+            "defaults": defaults(available),
         },
         "folders": {
             "total": folders.len(),
@@ -558,6 +588,8 @@ pub fn run_attachments(file: &Path, sample: usize, x: &mut Isolated) -> Result<J
             "max_cells": l.max_cells,
             "max_cols": l.max_cols,
             "timeout_s": x.timeout.as_secs(),
+            "memory_mb": x.memory.map(|b| b >> 20),
+            "memory_enforced": x.memory.is_some() && MEMORY_ENFORCED,
         },
         "workers_started": x.spawned,
         "attachments": a,
@@ -926,6 +958,13 @@ mod tests {
         }
         #[cfg(any(target_os = "linux", windows))]
         assert!(v["machine"]["ram_bytes"].as_u64().is_some_and(|b| b > 0));
+        #[cfg(any(target_os = "linux", windows))]
+        assert!(v["machine"]["available_ram_bytes"].as_u64().is_some_and(|b| b > 0));
+        // S10: computed defaults, counts only.
+        let d = &v["machine"]["defaults"];
+        assert!(d["extract_memory_mb"].as_u64().is_some_and(|m| (256..=2048).contains(&m)), "{d}");
+        assert_eq!(d["workers"].as_object().map(|o| o.len()), Some(2), "{d}");
+        assert!(["e5-small", "e5-base"].iter().all(|m| d["workers"][m].as_u64().is_some_and(|n| n >= 1)), "{d}");
     }
 
     #[test]
@@ -972,9 +1011,12 @@ mod tests {
 
     #[test]
     fn total_ram_from_meminfo() {
-        assert_eq!(meminfo_total("MemTotal:       16314312 kB\nMemFree: 1 kB\n"), Some(16314312 * 1024));
-        assert_eq!(meminfo_total("MemFree: 1 kB\n"), None);
-        assert_eq!(meminfo_total("MemTotal: lots\n"), None);
+        assert_eq!(meminfo("MemTotal:       16314312 kB\nMemFree: 1 kB\n", "MemTotal:"), Some(16314312 * 1024));
+        assert_eq!(meminfo("MemFree: 1 kB\n", "MemTotal:"), None);
+        assert_eq!(meminfo("MemTotal: lots\n", "MemTotal:"), None);
+        let m = "MemTotal: 8000000 kB\nMemFree: 100 kB\nMemAvailable:   2500000 kB\n";
+        assert_eq!(meminfo(m, "MemAvailable:"), Some(2500000 * 1024));
+        assert_eq!(meminfo("MemTotal: 1 kB\n", "MemAvailable:"), None);
     }
 
     #[test]
