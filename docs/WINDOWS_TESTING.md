@@ -1,6 +1,6 @@
 # Testing outlook-index on Windows
 
-Owner procedure for the branch `feat/mail-index`, from a fresh pull to a searchable index. Commands are for WSL
+Procedure for a release (or the git branch `main`), from install to a searchable index. Commands are for WSL
 (bash); without WSL, see section 0 for install and scheduling, then run the same `outlook-index` commands from
 PowerShell (section 9). Everything runs locally; the only network access is the release or toolchain download and
 `model fetch` (step 4). An AI agent follows [AGENTS.md](../AGENTS.md) and the `outlook-mail-setup` skill instead.
@@ -16,7 +16,7 @@ Each script takes `-WhatIf` (plan only) and `-Json` (one JSON object on stdout, 
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-git switch feat/mail-index; git pull --ff-only origin feat/mail-index
+# scripts without git: Code → Download ZIP or the release source zip; with a clone: git switch main; git pull --ff-only origin main
 scripts\install.ps1 -Version latest -Json        # release, SHA-256 (+ attestation if gh is logged in), fail closed
 scripts\build.ps1 -InstallToolchain -NoTests -Json   # or: source build (rustup, gnullvm, llvm-mingw for the user), then install
 outlook-index --version                          # new shell: the install dir is on the user PATH
@@ -64,8 +64,8 @@ skills it installed (and their Hermes entry); the index and models stay unless `
 ```bash
 cd ~/outlook-cli                  # your clone
 git fetch origin
-git switch feat/mail-index
-git pull --ff-only origin feat/mail-index
+git switch main
+git pull --ff-only origin main
 git rev-parse --short HEAD        # paste back
 scripts/setup-toolchain.sh        # first time only
 scripts/build.sh                  # tests + dist/outlook-cli.exe, dist/outlook-index.exe
@@ -239,7 +239,7 @@ Copy-Item "$d\backups\index-YYYYMMDD-HHMMSS.sqlite" "$d\index.sqlite"
 
 | Step | Paste |
 |---|---|
-| 1–2 | `git rev-parse --short HEAD`, `outlook-index --version` |
+| 0–2 | `outlook-index --version`; from a clone also `git rev-parse --short HEAD`; for a release install, `sha256` and `attestation_reason` |
 | 3 | the whole JSON of `doctor` and of `doctor --attachments`, and any stderr line |
 | 4 | the whole JSON of `bench-embed` (both models if you fetched both), and any `model fetch` error |
 | 5 | the summary JSON of each `sync` (stdout), its wall-clock time, the `--workers`/`--max-time` used, the last `{"progress":...}` line, and any `{"warning":...}` or `{"error":...}` line |

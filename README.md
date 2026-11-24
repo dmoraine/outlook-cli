@@ -25,14 +25,43 @@ skills après `hermes skills trust <dossier du dépôt>` ; `scripts\install.ps1 
 
 ## Installation
 
-Sans WSL, depuis PowerShell (Windows PowerShell 5.1 ou PowerShell 7, sans droits d'administrateur) :
-`scripts\install.ps1 -Version latest` installe la dernière release GitHub vérifiée (SHA-256, attestation) et
-`scripts\build.ps1` compile depuis les sources ; détails dans [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md).
+Les binaires sont des `.exe` Windows, appelables aussi bien depuis PowerShell que depuis WSL. Ils doivent
+s'exécuter côté Windows : depuis WSL, un programme Linux ne peut pas lire un OST ouvert par Outlook. Aucun droit
+d'administrateur n'est nécessaire, ni `git`, ni `gh`, ni WSL, ni PowerShell 7. Historique des versions :
+[CHANGELOG.md](CHANGELOG.md) ; publication et vérification des releases : [docs/RELEASING.md](docs/RELEASING.md).
 
-Le binaire est un `.exe` Windows, appelable aussi bien depuis PowerShell que depuis WSL. Il doit s'exécuter côté
-Windows : depuis WSL, un programme Linux ne peut pas lire un OST ouvert par Outlook.
+### Release GitHub, depuis PowerShell (recommandé)
 
-Prérequis de compilation (sous WSL/Linux, sans droits root) :
+Windows PowerShell 5.1 (fourni avec Windows) ou PowerShell 7. Récupérer d'abord les scripts, sans `git` : sur la
+page GitHub du dépôt, **Code → Download ZIP** (branche `main`), ou l'archive **Source code (zip)** de la release ;
+l'extraire dans un nouveau dossier. Puis, dans PowerShell, depuis ce dossier :
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass       # autorise les scripts pour cette fenêtre seulement
+scripts\install.ps1 -Version v0.2.0 -Json       # ou -Version latest
+outlook-cli --version                           # dans une nouvelle fenêtre (PATH utilisateur mis à jour)
+```
+
+`install.ps1` télécharge `outlook-cli.exe`, `outlook-index.exe` et `SHA256SUMS` depuis la release, vérifie
+**toujours** le SHA-256 de chaque exe (en cas d'écart, rien n'est installé), puis l'attestation GitHub si `gh` est
+installé et connecté (facultatif ; une attestation en échec n'installe rien non plus ; sans `gh` connecté,
+`attestation_reason` vaut `gh_missing` ou `gh_not_logged_in` et le SHA-256 suffit). Il installe dans `%LOCALAPPDATA%\Programs\outlook-cli\` et ajoute ce dossier au `PATH`
+utilisateur. Désinstallation : `scripts\install.ps1 -Uninstall` (l'index et les modèles sont conservés). Détails et
+planification du rafraîchissement : [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md).
+
+### Release GitHub, depuis WSL
+
+```bash
+scripts/install.sh --release v0.2.0   # ou latest ; mêmes vérifications, liens ~/.local/bin/outlook-cli, outlook-index
+```
+
+### Compilation depuis les sources
+
+PowerShell, sans WSL ni Visual Studio : `scripts\build.ps1 -InstallToolchain -NoTests -Json` télécharge pour
+l'utilisateur rustup et llvm-mingw (version figée, SHA-256 vérifié), compile, puis installe comme `install.ps1`
+(environ 3 Go de disque, 8 Go de RAM libre ; `-Jobs 1` si la mémoire manque).
+
+Sous WSL/Linux, sans droits root :
 
 ```bash
 scripts/setup-toolchain.sh   # rustup + cible x86_64-pc-windows-gnullvm + linker llvm-mingw (~/opt)
@@ -55,8 +84,8 @@ Optionnel : donner plus de mémoire à WSL dans `%UserProfile%\.wslconfig`, puis
 memory=12GB
 ```
 
-PowerShell : `& "$env:LOCALAPPDATA\Programs\outlook-cli\outlook-cli.exe" info`
-(ou ajouter ce dossier au `PATH` utilisateur pour taper simplement `outlook-cli`).
+Après `scripts/install.sh`, depuis PowerShell : `& "$env:LOCALAPPDATA\Programs\outlook-cli\outlook-cli.exe" info`
+(ou ajouter ce dossier au `PATH` utilisateur, ce que fait `install.ps1`, pour taper simplement `outlook-cli`).
 
 ## Fichier lu
 
@@ -174,9 +203,10 @@ $r.messages | Select-Object id, received, subject
 
 Binaire séparé qui construit un index local de la boîte mail (feature cargo `index`) : métadonnées, index plein
 texte FTS5 et vecteurs dans un seul fichier SQLite, embeddings calculés localement sur le CPU. Lecture seule sur
-l'OST, aucun accès réseau hors `model fetch`. Construit par `scripts/build.sh` (`dist/outlook-index.exe`), installé
-par `scripts/install.sh` à côté de `outlook-cli.exe` (lien `~/.local/bin/outlook-index`). Procédure de test complète
-pour le poste Windows : [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md).
+l'OST, aucun accès réseau hors `model fetch`. Publié dans chaque release à côté de `outlook-cli.exe` et installé
+avec lui par `scripts\install.ps1` (PowerShell) comme par `scripts/install.sh` (WSL, lien
+`~/.local/bin/outlook-index`) ; construit par `scripts\build.ps1` ou `scripts/build.sh` (`dist/outlook-index.exe`).
+Procédure de test complète pour le poste Windows : [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md).
 
 ```bash
 outlook-index doctor --pretty                    # diagnostic agrégé (aucun contenu)
