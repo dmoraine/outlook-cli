@@ -21,7 +21,14 @@ the user recorded); say what it costs (download size, hours of CPU, disk). Never
 excerpts) into a report or a log; the OST file name often is the user's e-mail address: report its size only.
 Never set `OUTLOOK_INDEX_DEBUG`. Answer in the user's language.
 
-## 0. Detect the environment
+## 0. Capability inventory (read-only, no consent needed)
+
+Run the probes of [references/capabilities.md](references/capabilities.md) before proposing anything: shell and
+PowerShell editions, execution policy, `git`, `gh` and its login, `winget`, `curl.exe`, WSL, Hermes gateway and
+cron scheduler, proxy, TLS inspection, network reachability, CPUs, RAM, disk. They change nothing. Pick the path
+from its decision table and tell the user which one and why. Windows PowerShell 5.1 and `curl.exe` cover the
+default path; `gh`, `git`, WSL, PowerShell 7, `winget` and Hermes are optional extras, never prerequisites: do not
+ask the user to install one unless they want the path it opens.
 
 | Where the agent's shell runs | Detect | Use |
 |---|---|---|
@@ -39,9 +46,6 @@ Windows, `~/.hermes` elsewhere), Codex, Claude Code, other. Hermes in WSL and th
 $o = "$env:LOCALAPPDATA\Microsoft\Outlook"
 Get-ChildItem $o -File -Include *.ost, *.pst -Recurse -ErrorAction SilentlyContinue |
     Select-Object Extension, @{n = 'GB'; e = { [math]::Round($_.Length / 1GB, 2) } }, LastWriteTime   # no names
-$cs = Get-CimInstance Win32_ComputerSystem; $os = Get-CimInstance Win32_OperatingSystem
-"{0} logical CPUs, {1:N1} GB RAM, {2:N1} GB free" -f $cs.NumberOfLogicalProcessors, ($cs.TotalPhysicalMemory / 1GB), ($os.FreePhysicalMemory / 1MB)
-"{0:N1} GB free on the data drive" -f ((Get-PSDrive ($env:LOCALAPPDATA.Substring(0, 1))).Free / 1GB)
 Get-Command outlook-cli, outlook-index -ErrorAction SilentlyContinue | Select-Object Name, Version
 ```
 
@@ -64,7 +68,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Version
 # WSL: scripts/install.sh --release latest
 ```
 
-Check the JSON: `ok`, `sha256: verified`, `attestation: verified|unavailable`, `versions`. It installs into
+Check the JSON: `ok`, `sha256: verified`, `attestation: verified|unavailable`, `versions`, and
+`attestation_reason`: `verified`, `gh_missing` or `gh_not_logged_in` (`unavailable`: SHA-256 alone gated the
+install, which is fine), `failed` (`ok: false`, nothing installed), `not_applicable` (`-FromDir`). It installs into
 `%LOCALAPPDATA%\Programs\outlook-cli\` and adds it to the user PATH for new shells. In a shell opened before:
 `Set-Alias outlook-index "$env:LOCALAPPDATA\Programs\outlook-cli\outlook-index.exe"` (same for `outlook-cli`).
 

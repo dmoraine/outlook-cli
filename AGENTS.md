@@ -11,7 +11,9 @@ Guide for AI agents (Hermes, Codex, Claude Code, …) working with this reposito
   the CPU) for keyword and semantic search across years and attachment text.
 - Everything stays on the PC. The only network access: the GitHub release download (or the toolchain for a source
   build) and `outlook-index model fetch` (embedding model, ~1.1 GB from huggingface.co).
-- Windows `.exe` only, from native PowerShell (5.1 or 7) or WSL; no admin rights needed.
+- Windows `.exe` only, from native PowerShell (5.1 or 7) or WSL; no admin rights needed. No extra tool is required:
+  Windows PowerShell 5.1 and the built-in `curl.exe` (model download) suffice; `gh`, `git`, WSL, PowerShell 7,
+  `winget` and Hermes only open optional paths (setup skill step 0).
 
 ## Which skill to load
 

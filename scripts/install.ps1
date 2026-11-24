@@ -5,8 +5,10 @@ Installs outlook-cli.exe and outlook-index.exe for the current user (no admin). 
 .DESCRIPTION
 Install dir: %LOCALAPPDATA%\Programs\outlook-cli\, added to the user PATH if missing. Idempotent.
   -Version vX.Y.Z|latest  GitHub Release assets of -Repo, checked against SHA256SUMS (fail closed); when `gh` is
-                          logged in, `gh attestation verify` must pass too (attestation: verified|unavailable|failed).
-  -FromDir <dir>          locally built exes instead (scripts/build.ps1).
+                          logged in, `gh attestation verify` must pass too (attestation: verified|unavailable|failed;
+                          attestation_reason: verified|gh_missing|gh_not_logged_in|failed). gh is optional: without
+                          it the SHA-256 check alone gates the install.
+  -FromDir <dir>          locally built exes instead (scripts/build.ps1); attestation_reason: not_applicable.
   -Skill hermes|codex|claude|none  also installs the usage skill (.agents\skills\outlook-cli of this checkout):
                           hermes: copy in <install dir>\skills, added to Hermes skills.external_dirs (`hermes config set`);
                           codex: copy in $CODEX_HOME\skills (default %USERPROFILE%\.codex\skills);
@@ -214,6 +216,7 @@ try {
             if (-not (Test-Path -LiteralPath (Join-Path $src $e) -PathType Leaf)) { throw "-FromDir: $e not found" }
         }
         $o.source = 'dir'
+        $o.attestation_reason = 'not_applicable'
     } else {
         if ($Version -ne 'latest' -and $Version -notmatch '^v\d+\.\d+\.\d+$') { throw '-Version must be vX.Y.Z or latest' }
         if ($Repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw '-Repo must be owner/name' }
@@ -229,11 +232,14 @@ try {
             Assert-Sums $tmp
             $o.sha256 = 'verified'
             $o.attestation = 'unavailable'
-            if ((Get-Command gh -ErrorAction SilentlyContinue) -and (Test-Native 'gh' @('auth', 'status'))) {
+            if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { $o.attestation_reason = 'gh_missing' }
+            elseif (-not (Test-Native 'gh' @('auth', 'status'))) { $o.attestation_reason = 'gh_not_logged_in' }
+            else {
                 $o.attestation = 'verified'
                 foreach ($e in $Exes) {
                     if (-not (Test-Native 'gh' @('attestation', 'verify', (Join-Path $tmp $e), '--repo', $Repo))) { $o.attestation = 'failed' }
                 }
+                $o.attestation_reason = $o.attestation
             }
             if ($o.attestation -eq 'failed') { throw 'attestation failed: not installed' }
         }
@@ -279,7 +285,9 @@ try {
     Finish $o
 } catch {
     $msg = $_.Exception.Message
-    if ($Json) { [ordered]@{ ok = $false; error = $msg } | ConvertTo-Json -Compress } else { Write-Error $msg -ErrorAction Continue }
+    $err = [ordered]@{ ok = $false; error = $msg }
+    if ($o -and $o['attestation']) { $err.attestation = $o['attestation']; $err.attestation_reason = $o['attestation_reason'] }
+    if ($Json) { $err | ConvertTo-Json -Compress } else { Write-Error $msg -ErrorAction Continue }
     exit 1
 } finally {
     if ($tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }

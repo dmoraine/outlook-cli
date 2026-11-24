@@ -28,6 +28,24 @@ agent skill (Hermes: registered in `skills.external_dirs` with `hermes config se
 default `%USERPROFILE%\.codex\skills`; Claude Code: `%USERPROFILE%\.claude\skills`). `build.ps1` needs about
 3 GB of disk with `-NoTests` (5 GB with the tests) and about 8 GB of free RAM (`-Jobs 1` when short).
 
+**Testing a CI dry run before a release** (the `release-assets` artifact of a *Run workflow* run, see
+[RELEASING.md](RELEASING.md)). `install.ps1 -BaseUrl <folder> -Version latest` reads
+`<folder>\latest\download\`, then checks `SHA256SUMS` as for a release.
+
+- Without `gh`, in a browser: signed in to GitHub (artifacts need a login), open the repository → Actions → CI →
+  the dry-run run → section **Artifacts** at the bottom of its page → `release-assets` (a zip). Unzip it into a new
+  folder `C:\dl\dryrun\latest\download\` (three files: both exes and `SHA256SUMS`), then:
+
+  ```powershell
+  scripts\install.ps1 -Version latest -BaseUrl C:\dl\dryrun -Json   # sha256: verified, attestation_reason: gh_missing
+  ```
+
+- With `gh`: `gh run list --workflow ci.yml --event workflow_dispatch -L 1` (run id), then
+  `gh run download <run-id> -n release-assets -D C:\dl\dryrun\latest\download` and the same `install.ps1` line.
+  A dry run has no attestation, so with `gh` logged in that line reports `attestation failed` and installs nothing
+  (fail closed): compare `(Get-FileHash <exe> -Algorithm SHA256).Hash` with its `SHA256SUMS` line by hand, then
+  `scripts\install.ps1 -FromDir C:\dl\dryrun\latest\download -Json` (`attestation_reason: not_applicable`).
+
 Then follow sections 3 to 7 from PowerShell. Periodic refresh (per-user scheduled task, AC power only, no overlap,
 low priority, JSON logs in `%LOCALAPPDATA%\outlook-cli\logs\`, 14 kept):
 

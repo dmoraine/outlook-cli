@@ -106,6 +106,7 @@ try {
     # install -FromDir, twice (idempotent), PATH added once.
     $r = Run $install @('-FromDir', $ExeDir, '-Json')
     Check ($code -eq 0 -and $r.ok -and $r.source -eq 'dir') "install -FromDir ok"
+    Check ($r.attestation_reason -eq 'not_applicable' -and $null -eq $r.attestation) "-FromDir: attestation_reason not_applicable, no attestation"
     Check ((Test-Path "$dir\outlook-cli.exe") -and (Test-Path "$dir\outlook-index.exe")) "exes installed"
     Check ($r.path_added -eq $true -and (Entries) -eq 1) "user PATH entry added"
     Check ("$($r.versions.'outlook-index')" -like 'outlook-index *') "outlook-index version printed"
@@ -136,7 +137,36 @@ try {
     [IO.File]::WriteAllText("$rel\SHA256SUMS", $sums)
     $base = Join-Path $tmp 'rel'
     $r = Run $install @('-Version', 'v0.0.1', '-BaseUrl', $base, '-Json')
-    Check ($code -eq 0 -and $r.sha256 -eq 'verified' -and $r.attestation -eq 'unavailable') "release install verified"
+    $ghOnPath = [bool](Get-Command gh -CommandType Application -ErrorAction SilentlyContinue)
+    $want = if ($ghOnPath) { 'gh_not_logged_in' } else { 'gh_missing' }
+    Check ($code -eq 0 -and $r.sha256 -eq 'verified' -and $r.attestation -eq 'unavailable' -and
+        $r.attestation_reason -eq $want) "release install verified (attestation_reason $($r.attestation_reason), want $want)"
+
+    # attestation_reason per gh state: PATH without gh, then a fake gh (auth / attestation exit codes from env).
+    $ghDirs = @(Get-Command gh -All -CommandType Application -ErrorAction SilentlyContinue | ForEach-Object { (Split-Path $_.Source).TrimEnd('\') })
+    $pathBefore = $env:Path
+    $env:Path = @($env:Path -split ';' | Where-Object { $_ -and $ghDirs -notcontains $_.TrimEnd('\') }) -join ';'
+    try {
+        Check (-not (Get-Command gh -CommandType Application -ErrorAction SilentlyContinue)) "PATH without gh"
+        $r = Run $install @('-Version', 'v0.0.1', '-BaseUrl', $base, '-Json')
+        Check ($code -eq 0 -and $r.attestation -eq 'unavailable' -and $r.attestation_reason -eq 'gh_missing') "no gh: attestation unavailable, reason gh_missing"
+        $fakeGh = Join-Path $tmp 'fakegh'
+        New-Item -ItemType Directory -Force -Path $fakeGh | Out-Null
+        Set-Content -Path "$fakeGh\gh.cmd" -Encoding Ascii -Value @('@echo off',
+            'if "%1"=="auth" exit /b %FAKE_GH_AUTH%', 'if "%1"=="attestation" exit /b %FAKE_GH_VERIFY%', 'exit /b 2')
+        $env:Path = "$fakeGh;$env:Path"
+        $env:FAKE_GH_AUTH = '1'; $env:FAKE_GH_VERIFY = '0'
+        $r = Run $install @('-Version', 'v0.0.1', '-BaseUrl', $base, '-Json')
+        Check ($code -eq 0 -and $r.attestation -eq 'unavailable' -and $r.attestation_reason -eq 'gh_not_logged_in') "gh logged out: reason gh_not_logged_in"
+        $env:FAKE_GH_AUTH = '0'
+        $r = Run $install @('-Version', 'v0.0.1', '-BaseUrl', $base, '-Json')
+        Check ($code -eq 0 -and $r.attestation -eq 'verified' -and $r.attestation_reason -eq 'verified') "gh attestation ok: reason verified"
+        Run $install @('-Uninstall', '-Json') | Out-Null
+        $env:FAKE_GH_VERIFY = '1'
+        $r = Run $install @('-Version', 'v0.0.1', '-BaseUrl', $base, '-Json')
+        Check ($code -ne 0 -and $r.ok -eq $false -and $r.attestation -eq 'failed' -and $r.attestation_reason -eq 'failed' -and
+            -not (Test-Path "$dir\outlook-cli.exe")) "gh attestation fails: reason failed, nothing installed"
+    } finally { $env:Path = $pathBefore; $env:FAKE_GH_AUTH = $null; $env:FAKE_GH_VERIFY = $null }
     Run $install @('-Uninstall', '-Json') | Out-Null
     [IO.File]::WriteAllText("$rel\SHA256SUMS", ($sums -replace '^[0-9a-f]{64}', ('0' * 64)))
     $r = Run $install @('-Version', 'v0.0.1', '-BaseUrl', $base, '-Json')

@@ -37,6 +37,32 @@ done
 grep -q -- '-PurgeData -Yes' .agents/skills/outlook-mail-setup/SKILL.md || fail "outlook-mail-setup: no -PurgeData -Yes command"
 grep -q -- '--no-agent --script' .agents/skills/outlook-mail-setup/references/hermes-cron.md || fail "hermes cron: no script-only job"
 
+# Step 0 is a read-only capability inventory; no optional tool is presented as a requirement.
+setup=.agents/skills/outlook-mail-setup/SKILL.md
+caps=.agents/skills/outlook-mail-setup/references/capabilities.md
+[ -f "$caps" ] || fail "capability reference missing"
+grep -q '](references/capabilities.md)' "$setup" || fail "setup skill does not link references/capabilities.md"
+grep -q '^## 0\. Capability inventory (read-only' "$setup" || fail "setup step 0 is not a read-only capability inventory"
+tool='(gh|git|wsl|pwsh|powershell 7|winget|hermes)'
+required="(requires?|needs?|must (have|install))[^.]{0,30}[^a-z0-9_]$tool([^a-z0-9_]|\$)|(^|[^a-z0-9_])$tool[^a-z0-9_][^.]{0,30}(is|are) (required|mandatory)"
+for s in 'it requires `gh`.' '`git` is required.' 'WSL is mandatory'; do
+    grep -qiE "$required" <<<"$s" || fail "required-tool pattern misses: $s"
+done
+if grep -inE "$required" "$setup" "$caps" AGENTS.md; then
+    fail "setup docs present an optional tool as required"
+fi
+grep -q 'No extra tool is required' AGENTS.md || fail "AGENTS.md does not say no extra tool is required"
+for c in 'gh auth status' 'git --version' '$PSVersionTable' 'WSL_DISTRO_NAME' 'curl.exe --version' 'winget --version' \
+    'hermes cron status' 'hermes gateway status' 'Get-ExecutionPolicy -List' 'netsh winhttp show proxy' '-Scope Process'; do
+    grep -qF -- "$c" "$caps" || fail "capabilities.md misses probe $c"
+done
+for c in verified gh_missing gh_not_logged_in failed not_applicable; do
+    grep -q "$c" scripts/install.ps1 || fail "install.ps1 help misses attestation_reason $c"
+    grep -q "$c" "$setup" || fail "setup skill misses attestation_reason $c"
+done
+grep -q 'Artifacts' docs/WINDOWS_TESTING.md && grep -q 'release-assets' docs/WINDOWS_TESTING.md ||
+    fail "WINDOWS_TESTING.md: no browser download of the dry-run artifact"
+
 # Relative links resolve (anchors and URLs skipped).
 for f in AGENTS.md CLAUDE.md README.md docs/*.md .agents/skills/*/SKILL.md .agents/skills/*/references/*.md; do
     while IFS= read -r t; do
