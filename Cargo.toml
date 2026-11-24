@@ -1,6 +1,6 @@
 [package]
 name = "outlook-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Fast, low-memory CLI to read e-mails from Outlook OST/PST files, even while Outlook is running"
 license = "MIT"
@@ -14,6 +14,18 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4.6.7", features = ["derive", "env"] }
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 memmap2 = "0.9.11"
+rusqlite = { version = "0.43.0", features = ["bundled"], optional = true }
+# Local embeddings (feature "index"): pure Rust, CPU only.
+candle-core = { version = "0.11.1", optional = true }
+candle-nn = { version = "0.11.1", optional = true }
+candle-transformers = { version = "0.11.1", optional = true }
+sha2 = { version = "0.10", optional = true }
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"], optional = true }
+# Attachment text (feature "index"): pure Rust, no C.
+lopdf = { version = "0.42", default-features = false, optional = true }
+pdf-extract = { version = "0.12.1", optional = true }
+quick-xml = { version = "0.42", optional = true }
+zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 
@@ -22,3 +34,27 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[features]
+# Local mail index (outlook-index binary). Off by default: outlook-cli keeps its dependency set.
+index = [
+    "dep:rusqlite",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:sha2",
+    "dep:tokenizers",
+    "dep:lopdf",
+    "dep:pdf-extract",
+    "dep:quick-xml",
+    "dep:zip",
+]
+
+[[bin]]
+name = "outlook-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "outlook-index"
+path = "src/bin/outlook-index.rs"
+required-features = ["index"]

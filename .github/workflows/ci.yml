@@ -5,6 +5,7 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
+  workflow_dispatch: # dry run: builds the release assets, publishes nothing
 
 permissions:
   contents: read
@@ -14,12 +15,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: shellcheck scripts/*.sh tests/scripts/*.sh
+      - run: bash tests/scripts/install_sh_test.sh
+      - run: bash tests/scripts/agent_docs_test.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - run: cargo fmt --check
-      - run: cargo clippy --release -- -D warnings
+      - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo test --release
+      - run: cargo clippy --release --all-targets --features index -- -D warnings
+      - run: cargo test --release --features index
+      # outlook-cli must not depend on SQLite or the embedding stack.
+      - run: "! cargo tree -e normal | grep -iE 'sqlite|candle|tokenizers'"
 
   windows:
     runs-on: windows-latest
@@ -33,17 +41,57 @@ jobs:
         with:
           name: outlook-cli-windows-x64
           path: target/release/outlook-cli.exe
+      - run: cargo test --release --features index
+      - run: cargo build --release --features index --bin outlook-index
+      - run: target/release/outlook-index.exe --version
+      # install.ps1 (with -Skill) / schedule.ps1 / build.ps1 -WhatIf under the runner user, temp LOCALAPPDATA, both PowerShells.
+      - run: ./tests/scripts/windows.ps1 -ExeDir target/release
+        shell: powershell
+      - run: ./tests/scripts/windows.ps1 -ExeDir target/release
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: outlook-index-windows-x64
+          path: target/release/outlook-index.exe
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
+  # Shared by the dry run and the release: no rebuild, the exes come from the windows job.
+  package:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: [linux, windows]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: outlook-cli-windows-x64
-      - run: gh release create "$GITHUB_REF_NAME" outlook-cli.exe --repo "$GITHUB_REPOSITORY" --generate-notes
+          pattern: outlook-*-windows-x64
+          merge-multiple: true
+      - run: sha256sum outlook-cli.exe outlook-index.exe > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            outlook-cli.exe
+            outlook-index.exe
+            SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # sign the attestations
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+      - run: sha256sum -c SHA256SUMS
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            outlook-cli.exe
+            outlook-index.exe
+      - run: gh release create "$GITHUB_REF_NAME" outlook-cli.exe outlook-index.exe SHA256SUMS --repo "$GITHUB_REPOSITORY" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
