@@ -40,7 +40,7 @@ $redirects = @{ 'https://a.test/x' = 'https://b.test/y'; 'https://b.test/y' = '/
 $fetch = {
     param([uri]$uri, [string]$dest)
     $script:hops += "$uri"
-    $to = $redirects["$uri"]
+    $to = $script:redirects["$uri"] # script scope: Save-Https's own $redirects counter shadows a bare $redirects
     if ($to) { return @{ status = 302; location = $to } }
     if ("$uri" -eq 'https://partial.test/') { [IO.File]::WriteAllText($dest, 'part'); throw 'connection reset' }
     if ("$uri" -eq 'https://cached.test/') { return @{ status = 304; location = 'https://a.test/x' } }
