@@ -118,7 +118,7 @@ Filtres (communs à `list`, `new` et `watch`) :
 | Option | Effet |
 |---|---|
 | `-F, --folder` | chemin (`Inbox/Projets`), nom, ou id ; répétable ; `all` = tous les dossiers de mails ; défaut : Inbox (détectée quelle que soit la langue) |
-| `-s, --since` | reçu à partir de : `2026-10-15T08:00:00Z`, `2026-10-15T10:00+02:00`, `"2026-10-15 08:00"` (heure locale), `2026-10-15`, `90s`, `15m`, `2h`, `3d`, `1w`, `today`, `yesterday` |
+| `-s, --since` | reçu à partir de : `2026-10-15T08:00:00Z`, `2026-10-15T10:00:00+02:00`, `"2026-10-15 08:00"` (heure locale), `2026-10-15`, `90s`, `15m`, `2h`, `3d`, `1w`, `today`, `yesterday` |
 | `--after` | reçu strictement après (pour repasser le `cursor` d'un appel précédent) |
 | `-u, --until` | reçu strictement avant |
 | `--from` | nom ou adresse de l'expéditeur contient (insensible à la casse) ; répétable = OU |
@@ -260,7 +260,7 @@ Lecture et écriture de l'index :
 
 ```bash
 outlook-index backup                             # backups/index-AAAAMMJJ-HHMMSS.sqlite à côté de l'index
-outlook-index backup --to D:\sauvegardes\index-avant-test.sqlite
+outlook-index backup --to 'D:\sauvegardes\index-avant-test.sqlite'
 ```
 
 Copie cohérente de l'index (SQLite `VACUUM INTO`, un seul instantané, WAL compris) dans un **nouveau** fichier :

@@ -61,7 +61,7 @@ outlook-cli folders --format text                       # folder paths, ids and 
   mail folder; default Inbox, found whatever the language), `-s/--since` (inclusive), `-u/--until` (exclusive),
   `--after` (exclusive, cursor), `--from`, `--to` (to/cc/bcc), `--subject` (case-insensitive substrings;
   `--from`/`--to` repeatable = OR), `--unread`, `--read`, `--has-attachments`, `--class IPM.Note`.
-  Dates: `2026-10-15T08:00:00Z`, `2026-10-15T10:00+02:00`, `"2026-10-15 08:00"` and `2026-10-15` (local time),
+  Dates: `2026-10-15T08:00:00Z`, `2026-10-15T10:00:00+02:00`, `"2026-10-15 08:00"` and `2026-10-15` (local time),
   `90s` `15m` `2h` `3d` `1w`, `today`, `yesterday`. `list` only: `-n/--limit`, `--oldest-first`.
 - Content: by default headers + `preview` (Outlook's preview), no body. `-b/--body` with `--body-max 2000`
   to `4000` (default `0` = no limit), `--recipients`, `--attachments`, `--full` (all three). `get`: `--body-max`,
