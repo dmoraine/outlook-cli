@@ -27,7 +27,7 @@ param(
     [switch]$Json
 )
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
+. (Join-Path $PSScriptRoot 'download.ps1') # Save-Https: https on every redirect hop
 $Cmdlet = $PSCmdlet
 $Triple = 'x86_64-pc-windows-gnullvm'
 $Toolchain = "stable-$Triple"
@@ -49,7 +49,7 @@ function Exec([string]$exe, [string[]]$arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$(Split-Path $exe -Leaf) $($arguments[0..1] -join ' ') failed (exit $LASTEXITCODE)" }
 }
 function Get-Verified([string]$url, [string]$sha256, [string]$dest) {
-    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest
+    Save-Https $url $dest
     if ((Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash -ine $sha256) {
         Remove-Item -LiteralPath $dest -Force
         throw "SHA-256 mismatch for $(Split-Path $url -Leaf)"
@@ -78,7 +78,7 @@ try {
     if ($missing -contains 'rustup' -and (Want $cargoHome 'Install rustup (user)')) {
         $init = Join-Path ([IO.Path]::GetTempPath()) ('rustup-init-' + [guid]::NewGuid().ToString('N') + '.exe')
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri "$RustupUrl.sha256" -OutFile "$init.sha256"
+            Save-Https "$RustupUrl.sha256" "$init.sha256"
             $sum = ((Get-Content -LiteralPath "$init.sha256" -Raw) -split '\s+')[0]
             Get-Verified $RustupUrl $sum $init
             # A gnullvm host needs no Visual Studio (rustup only asks for it with an msvc host).

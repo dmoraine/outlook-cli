@@ -52,5 +52,12 @@ with its line in `SHA256SUMS`, same for `outlook-index.exe`.
 `scripts/install.ps1 -Version vX.Y.Z` (native PowerShell) and `scripts/install.sh --release vX.Y.Z` (WSL) run these
 checks and install nothing if one fails.
 
+Redirect policy (PowerShell, `scripts/download.ps1`): every download made by `scripts/install.ps1` (release assets
+and `SHA256SUMS`) and `scripts/build.ps1` (rustup-init and its `.sha256`, llvm-mingw) follows redirects by hand, at
+most 10, and each URL, the first one and every redirect target, must be `https` before it is requested: an
+https-to-http redirect fails the download without any plain-http request. The SHA-256 check still runs before
+anything downloaded is installed or executed. `-BaseUrl` takes an `https` URL (same policy) or a local directory
+(copied, then checked the same way).
+
 A hash mismatch or a failed attestation means: do not run the file; build from source instead
 (`docs/WINDOWS_TESTING.md`). If `gh` is not available, the SHA-256 check alone is the minimum.

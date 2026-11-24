@@ -23,12 +23,76 @@ function Run([string]$file, [string[]]$a) {
     $out = & $shell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $file @a
     $script:code = $LASTEXITCODE
     $text = ($out | Out-String).Trim()
+    $script:raw = $text
     try { return ($text | ConvertFrom-Json) } catch { Write-Host "not JSON: $text"; return $null }
 }
 function Hash([string]$f) { (Get-FileHash $f -Algorithm SHA256).Hash.ToLowerInvariant() }
+function Snapshot([string]$d) {
+    @(Get-ChildItem -LiteralPath $d -Force | Sort-Object Name |
+        ForEach-Object { "$($_.Name)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }) -join ';'
+}
+
+# Download policy (scripts/download.ps1, used by install.ps1 and build.ps1): https on every hop, at most 10
+# redirects, checked before each request. A fake fetcher records the requested URLs.
+. (Join-Path $root 'scripts\download.ps1')
+$redirects = @{ 'https://a.test/x' = 'https://b.test/y'; 'https://b.test/y' = '/z'; 'https://c.test/x' = 'http://b.test/y'
+    'https://loop.test/' = '/' }
+$fetch = {
+    param([uri]$uri, [string]$dest)
+    $script:hops += "$uri"
+    $to = $redirects["$uri"]
+    if ($to) { return @{ status = 302; location = $to } }
+    if ("$uri" -eq 'https://partial.test/') { [IO.File]::WriteAllText($dest, 'part'); throw 'connection reset' }
+    if ("$uri" -eq 'https://cached.test/') { return @{ status = 304; location = 'https://a.test/x' } }
+    [IO.File]::WriteAllText($dest, 'body'); @{ status = 200 }
+}
+function Try-Save([string]$url, [string]$dest) {
+    $script:hops = @()
+    try { Save-Https $url $dest $fetch; $true } catch { $false }
+}
+$dl = Join-Path ([IO.Path]::GetTempPath()) ("outlook-cli-dl-" + [guid]::NewGuid().ToString('N'))
+$listener = $null; $server = $null
+try {
+    Check ((Try-Save 'https://a.test/x' $dl) -and ($script:hops -join ',') -eq 'https://a.test/x,https://b.test/y,https://b.test/z' -and
+        [IO.File]::ReadAllText($dl) -eq 'body') "https redirects (absolute, relative) followed"
+    Remove-Item -LiteralPath $dl -Force -ErrorAction SilentlyContinue
+    Check (-not (Try-Save 'https://c.test/x' $dl) -and ($script:hops -join ',') -eq 'https://c.test/x' -and -not (Test-Path $dl)) "https to http redirect refused before its request"
+    Check (-not (Try-Save 'http://a.test/x' $dl) -and $script:hops.Count -eq 0) "http URL refused before any request"
+    Check (-not (Try-Save 'https://loop.test/' $dl) -and $script:hops.Count -eq 11) "10 redirects followed, the 11th refused (requests: $($script:hops.Count))"
+    Check (-not (Try-Save 'https://cached.test/' $dl) -and $script:hops.Count -eq 1) "3xx other than a redirect fails"
+    Check (-not (Try-Save 'https://partial.test/' $dl) -and -not (Test-Path $dl)) "failed download leaves no partial file"
+    # The real hop (Invoke-Hop) against a loopback server: a 302 is returned, not followed; a 200 body is written.
+    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $server = [powershell]::Create().AddScript({
+            param($l)
+            foreach ($resp in "HTTP/1.1 302 Found`r`nLocation: https://example.invalid/next`r`nContent-Length: 0`r`nConnection: close`r`n`r`n",
+                "HTTP/1.1 200 OK`r`nContent-Length: 4`r`nConnection: close`r`n`r`nbody") {
+                $c = $l.AcceptTcpClient()
+                $s = $c.GetStream()
+                $rd = New-Object IO.StreamReader($s)
+                while ($rd.ReadLine()) { }
+                $b = [Text.Encoding]::ASCII.GetBytes($resp)
+                $s.Write($b, 0, $b.Length)
+                $c.Close()
+            }
+        }).AddArgument($listener)
+    $null = $server.BeginInvoke()
+    $port = $listener.LocalEndpoint.Port
+    $h1 = $null; $h2 = $null
+    try { $h1 = Invoke-Hop ([uri]"http://127.0.0.1:$port/a") $dl; $h2 = Invoke-Hop ([uri]"http://127.0.0.1:$port/b") "$dl.2" }
+    catch { Write-Host "hop: $($_.Exception.Message)" }
+    Check ($h1.status -eq 302 -and $h1.location -eq 'https://example.invalid/next' -and -not (Test-Path $dl)) "real hop returns a redirect without following it"
+    Check ($h2.status -eq 200 -and (Test-Path "$dl.2") -and [IO.File]::ReadAllText("$dl.2") -eq 'body') "real hop writes a 200 body"
+} finally {
+    if ($listener) { $listener.Stop() }
+    if ($server) { $server.Dispose() }
+    Remove-Item -LiteralPath $dl, "$dl.2" -Force -ErrorAction SilentlyContinue
+}
 
 $before = UserPath
-$savedEnv = @{ Path = $env:Path; USERPROFILE = $env:USERPROFILE; CODEX_HOME = $env:CODEX_HOME }
+$savedEnv = @{ Path = $env:Path; USERPROFILE = $env:USERPROFILE; CODEX_HOME = $env:CODEX_HOME
+    OUTLOOK_INDEX_DEBUG = $env:OUTLOOK_INDEX_DEBUG }
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("outlook-cli-test-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $env:LOCALAPPDATA = $tmp
@@ -131,6 +195,40 @@ try {
     $r = Run $schedule @('-Status', '-Json')
     Check ($code -eq 0 -and $r.task.registered -and $r.last_run.exit_code -eq $last.exit_code -and $r.logs -eq 14) "status reports the task and the last run"
 
+    # Fake outlook-index: notes each launch and an inherited OUTLOOK_INDEX_DEBUG, prints an error carrying a marker.
+    $marker = 'MARKER' + [guid]::NewGuid().ToString('N')
+    $fakeExeDir = Join-Path $tmp 'fakeexe'
+    New-Item -ItemType Directory -Force -Path $fakeExeDir | Out-Null
+    $fakeExe = Join-Path $fakeExeDir 'outlook-index.cmd'
+    Set-Content -Path $fakeExe -Encoding Ascii -Value @(
+        '@echo off', 'echo x>> "%~dp0launched.txt"', 'if defined OUTLOOK_INDEX_DEBUG echo x> "%~dp0inherited.txt"',
+        'powershell -NoProfile -Command "[Diagnostics.Process]::GetCurrentProcess().PriorityClass" > "%~dp0priority.txt"',
+        "echo {`"warning`":{`"kind`":`"onedrive`",`"message`":`"$marker`"}} 1>&2",
+        "echo {`"error`":{`"kind`":`"io`",`"message`":`"$marker`",`"debug`":`"$marker`"}} 1>&2", 'exit /b 3')
+
+    # -Run -WhatIf: plan only, no launch, no log change (the plan returns before the priority change too).
+    $snap = Snapshot $logs
+    $r = Run $schedule @('-Run', '-Exe', $fakeExe, '-LogDir', $logs, '-WhatIf', '-Json')
+    Check ($code -eq 0 -and $r.what_if -eq $true -and $r.action -eq 'run' -and @($r.planned).Count -eq 1) "-Run -WhatIf returns the plan"
+    Check (-not (Test-Path "$fakeExeDir\launched.txt")) "-Run -WhatIf launches nothing"
+    Check ((Snapshot $logs) -eq $snap) "-Run -WhatIf writes, rotates and deletes no log"
+
+    # OUTLOOK_INDEX_DEBUG set in the parent: not inherited by the sync; message and debug text never kept.
+    $env:OUTLOOK_INDEX_DEBUG = '1'
+    try { $r = Run $schedule @('-Run', '-Exe', $fakeExe, '-LogDir', $logs, '-Json'); $runRaw = $script:raw }
+    finally { $env:OUTLOOK_INDEX_DEBUG = $savedEnv.OUTLOOK_INDEX_DEBUG }
+    $newest = @(Get-ChildItem $logs -Filter 'sync-*.json' | Sort-Object Name)[-1]
+    $logRaw = [IO.File]::ReadAllText($newest.FullName)
+    Check ((Test-Path "$fakeExeDir\launched.txt") -and -not (Test-Path "$fakeExeDir\inherited.txt")) "sync child does not inherit OUTLOOK_INDEX_DEBUG"
+    Check ($code -eq 3 -and $r.error.error.kind -eq 'io') "run keeps the error kind and exit code"
+    $prio = if (Test-Path "$fakeExeDir\priority.txt") { "$(Get-Content "$fakeExeDir\priority.txt")".Trim() }
+    Check ($prio -eq 'BelowNormal') "sync child runs below normal priority (got '$prio')"
+    $r = Run $schedule @('-Status', '-Json')
+    Check ($code -eq 0 -and $r.last_run.error.error.kind -eq 'io') "status reports the error kind"
+    foreach ($t in @(@('log', $logRaw), @('-Run -Json', $runRaw), @('-Status -Json', $script:raw))) {
+        Check ($t[1] -and $t[1] -notmatch $marker -and $t[1] -notmatch '"debug"' -and $t[1] -notmatch '"message"') "$($t[0]): no message, debug or marker"
+    }
+
     $r = Run $schedule @('-Remove', '-Json')
     Check ($code -eq 0 -and $r.removed -and -not (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue)) "task removed"
     $r = Run $schedule @('-Remove', '-Json')
@@ -174,12 +272,12 @@ $items = @([regex]::Matches($args[3], "'((?:[^']|'')*)'") | ForEach-Object { $_.
     Check ($code -ne 0) "unknown -Skill rejected"
     $env:Path = "$fake;$env:Path"
     $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'hermes', '-Json')
-    $d = HermesDirs
+    $d = @(HermesDirs)
     Check ($code -eq 0 -and $r.hermes_registered -eq $true -and (Test-Path "$dir\skills\outlook-cli\SKILL.md") -and
         (Test-Path "$dir\skills\outlook-cli\references\outlook-index.md")) "-Skill hermes copies the skill"
     Check ($d.Count -eq 2 -and $d[0] -eq 'C:\team skills' -and $d[1] -eq "$dir\skills") "hermes external_dirs: $($d -join ' | ')"
     $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'hermes', '-Json')
-    Check ($code -eq 0 -and $r.hermes_registered -eq $false -and (HermesDirs).Count -eq 2) "-Skill hermes is idempotent"
+    Check ($code -eq 0 -and $r.hermes_registered -eq $false -and @(HermesDirs).Count -eq 2) "-Skill hermes is idempotent"
     $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'claude', '-Json')
     Check ($code -eq 0 -and (Test-Path "$claude\outlook-cli\SKILL.md")) "-Skill claude installs in %USERPROFILE%\.claude\skills"
     New-Item -ItemType Directory -Force -Path "$claude\other" | Out-Null
@@ -193,13 +291,21 @@ $items = @([regex]::Matches($args[3], "'((?:[^']|'')*)'") | ForEach-Object { $_.
     Check ($code -eq 0 -and (Test-Path "$codex\outlook-cli\SKILL.md")) "-Skill codex installs in `$CODEX_HOME\skills"
 
     $r = Run $install @('-Uninstall', '-Json')
-    $d = HermesDirs
+    $d = @(HermesDirs)
     Check ($code -eq 0 -and (@($r.skills_removed) -join ',') -eq 'hermes,codex,claude') "uninstall removes the skills: $(@($r.skills_removed) -join ',')"
     Check ($d.Count -eq 1 -and $d[0] -eq 'C:\team skills') "hermes external_dirs back to the unrelated entry"
     Check (-not (Test-Path "$claude\outlook-cli") -and -not (Test-Path "$codex\outlook-cli") -and
         (Get-Content "$claude\other\SKILL.md") -eq 'mine') "managed copies removed, unrelated skill kept"
     $r = Run $install @('-Uninstall', '-Json')
-    Check ($code -eq 0 -and @($r.skills_removed).Count -eq 0 -and (HermesDirs).Count -eq 1) "second uninstall leaves the skills alone"
+    Check ($code -eq 0 -and @($r.skills_removed).Count -eq 0 -and @(HermesDirs).Count -eq 1) "second uninstall leaves the skills alone"
+
+    # external_dirs unset (null): 0 -> 1 entry (ours) -> 0 entries.
+    [IO.File]::WriteAllText($env:FAKE_HERMES_DIRS, 'null')
+    $r = Run $install @('-FromDir', $ExeDir, '-Skill', 'hermes', '-Json')
+    $d = @(HermesDirs)
+    Check ($code -eq 0 -and $r.hermes_registered -eq $true -and $d.Count -eq 1 -and $d[0] -eq "$dir\skills") "hermes external_dirs from none to ours: $($d -join ' | ')"
+    $r = Run $install @('-Uninstall', '-Json')
+    Check ($code -eq 0 -and (@($r.skills_removed) -join ',') -eq 'hermes' -and @(HermesDirs).Count -eq 0) "hermes external_dirs back to none"
 } finally {
     foreach ($k in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedEnv[$k]) } # $null unsets
     Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue

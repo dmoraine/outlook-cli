@@ -36,7 +36,7 @@ param(
     [switch]$Json
 )
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue' # Invoke-WebRequest is very slow with a progress bar in 5.1
+. (Join-Path $PSScriptRoot 'download.ps1') # Save-Https: https on every redirect hop
 $Cmdlet = $PSCmdlet
 $Exes = @('outlook-cli.exe', 'outlook-index.exe')
 $TaskName = 'outlook-index sync'
@@ -86,10 +86,10 @@ function Assert-NotRunning([string]$dir) {
         Where-Object { $_.Path -and (Same-Dir (Split-Path $_.Path) $dir) }
     if ($p) { throw 'outlook-cli or outlook-index is running from the install dir (a scheduled sync?); stop it first' }
 }
-# Fetches one release asset: https only, or a copy from a local directory.
+# Fetches one release asset: https only (redirects too), or a copy from a local directory.
 function Get-Asset([string]$base, [string]$path, [string]$name, [string]$dest) {
     if ($base -match '^https://') {
-        Invoke-WebRequest -UseBasicParsing -Uri "$base/$path/$name" -OutFile $dest
+        Save-Https "$base/$path/$name" $dest
     } elseif ($base -match '^[a-z][a-z0-9+.-]*://') {
         throw "-BaseUrl must be https:// or a local directory"
     } else {

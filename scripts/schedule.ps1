@@ -52,6 +52,17 @@ function Parse([string]$text) {
     try { $text | ConvertFrom-Json } catch { $null }
 }
 function Get-Task { Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }
+# The error kept in logs and shown by -Status: an allowlisted kind only (outlook-index `message` and `debug` texts may
+# carry paths or mail content), or this script's own fixed text.
+$Kinds = 'usage', 'not_found', 'io', 'format', 'inconsistent', 'upgrade_pending'
+$StartFailed = 'cannot start outlook-index.exe'
+function Project-Error($e) {
+    if ($null -eq $e) { return $null }
+    if ($e.error -is [string] -and $e.error -eq $StartFailed) { return [ordered]@{ error = $StartFailed } }
+    $k = 'unknown'
+    foreach ($x in $Kinds) { if ($e.error -isnot [string] -and $x -ceq $e.error.kind) { $k = $x } }
+    [ordered]@{ error = [ordered]@{ kind = $k } }
+}
 
 try {
     if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is not set' }
@@ -60,9 +71,16 @@ try {
 
     switch ($PSCmdlet.ParameterSetName) {
         'Run' {
-            # Children (sync, embedding workers, extractor) inherit the below-normal class.
-            [Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'BelowNormal'
             if (-not $LogDir) { $LogDir = $logs }
+            # -WhatIf: the plan only, before any priority change, launch or log write.
+            if (-not (Want $LogDir 'Run one outlook-index sync (below-normal priority), write and rotate its log in')) {
+                Finish ([ordered]@{ ok = $true; action = 'run' })
+                exit 0
+            }
+            # Children (sync, embedding workers, extractor) inherit the below-normal class and this environment:
+            # never the debug switch (its output may hold paths and mail content).
+            [Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'BelowNormal'
+            Remove-Item Env:OUTLOOK_INDEX_DEBUG -ErrorAction SilentlyContinue
             New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
             $out = Join-Path $LogDir '.sync.out'
             $err = Join-Path $LogDir '.sync.err'
@@ -72,11 +90,11 @@ try {
                     -RedirectStandardOutput $out -RedirectStandardError $err
                 $code = $p.ExitCode
                 $summary = Parse ([IO.File]::ReadAllText($out))
-                # stderr is JSON from outlook-index (sanitized); anything else is dropped.
+                # The last {"error":...} line of stderr, projected to its kind; anything else is dropped.
                 $error1 = $null
-                foreach ($l in [IO.File]::ReadAllLines($err)) { $j = Parse $l; if ($null -ne $j) { $error1 = $j } }
+                foreach ($l in [IO.File]::ReadAllLines($err)) { $j = Parse $l; if ($j -and $j.error) { $error1 = Project-Error $j } }
             } catch {
-                $code = -1; $summary = $null; $error1 = [ordered]@{ error = 'cannot start outlook-index.exe' }
+                $code = -1; $summary = $null; $error1 = [ordered]@{ error = $StartFailed }
             }
             Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
             $rec = [ordered]@{ started_at = (Utc $started); finished_at = (Utc (Get-Date)); exit_code = $code
@@ -134,6 +152,8 @@ try {
             }
             $files = @(Get-ChildItem -LiteralPath $logs -Filter 'sync-*.json' -ErrorAction SilentlyContinue | Sort-Object Name)
             $last = if ($files.Count) { Parse (Get-Content -LiteralPath $files[-1].FullName -Raw) }
+            # Logs written by an older version may hold free text: projected again.
+            if ($last -and $last.PSObject.Properties['error']) { $last.error = Project-Error $last.error }
             Finish ([ordered]@{ ok = $true; action = 'status'; task = $task; last_run = $last; logs = $files.Count })
         }
     }
